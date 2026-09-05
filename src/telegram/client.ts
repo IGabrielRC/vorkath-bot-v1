@@ -25,6 +25,33 @@ export interface AnswerCallbackOpts {
 }
 
 /**
+ * Centralized reply context: every fresh message the bot sends derives
+ * its destination from ONE context object — never from a bare chatId.
+ * `messageThreadId` is the origin topic (`message_thread_id` on the
+ * wire); when present, `sendMessage` MUST carry it or Telegram drops the
+ * reply in General. Undefined = General / non-forum chat (correct).
+ */
+export interface TelegramContext {
+  chatId: number;
+  messageThreadId?: number;
+  actorTelegramUserId?: number;
+}
+
+/** Builds a thread-safe send payload from a centralized context. */
+export function sendPayload(
+  ctx: TelegramContext,
+  text: string,
+  replyMarkup?: InlineKeyboardMarkup,
+): SendMessageOpts {
+  return {
+    chatId: ctx.chatId,
+    text,
+    ...(replyMarkup !== undefined ? { replyMarkup } : {}),
+    ...(ctx.messageThreadId !== undefined ? { messageThreadId: ctx.messageThreadId } : {}),
+  };
+}
+
+/**
  * Minimal Telegram Bot API client (send/edit/answer). HTTP only — no
  * business logic lives here; the router decides what to send.
  * See: https://core.telegram.org/bots/api#sendmessage

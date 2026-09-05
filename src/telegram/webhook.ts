@@ -24,7 +24,7 @@ import {
   withOperator,
   type CallbackAction,
 } from './keyboards';
-import type { TelegramClient } from './client';
+import type { TelegramClient, TelegramContext } from './client';
 import {
   findTopicOwner,
   type OperatorTopics,
@@ -122,7 +122,15 @@ interface TelegramUser {
 
 interface TelegramChat {
   id?: number;
+  /**
+   * Chat type (`private`, `group`, `supergroup`, `channel`). Forum groups
+   * arrive as `supergroup` (with `is_forum: true` when topics are
+   * enabled). There is intentionally NO type gate here: every authorized
+   * chat type is accepted — the topic only selects the reply thread.
+   */
   type?: string;
+  /** True for forum groups with topics enabled. Accepted like any other chat. */
+  is_forum?: boolean;
 }
 
 interface TelegramMessage {
@@ -133,6 +141,13 @@ interface TelegramMessage {
   chat?: TelegramChat;
   text?: string;
   reply_to_message?: TelegramMessage;
+  /**
+   * Group→supergroup migration markers. Telegram reassigns chat.id on
+   * migration: the old scope is dead and its interactions must never leak
+   * into the new scope (see migration guard below).
+   */
+  migrate_to_chat_id?: number;
+  migrate_from_chat_id?: number;
 }
 
 interface TelegramCallbackQuery {
@@ -199,7 +214,31 @@ export function createWebhookHandler(deps: WebhookDeps) {
     const updateId = typeof update.update_id === 'number' ? update.update_id : undefined;
     const callback = update.callback_query;
     const message = update.message;
+    /**
+     * Group→supergroup migration: Telegram delivers a service message
+     * carrying `migrate_to_chat_id` / `migrate_from_chat_id` and the chat
+     * gets a NEW id. The old chat scope (its sessions, drafts,
+     * interactions) is dead — resolving it under the new id would leak one
+     * chat's state into another. Ack without touching anything; the next
+     * real update establishes the new scope on demand. Never crashes.
+     */
+    if (
+      typeof message?.migrate_to_chat_id === 'number' ||
+      typeof message?.migrate_from_chat_id === 'number'
+    ) {
+      logger.info(
+        {
+          chatId: message?.chat?.id,
+          migrateTo: message?.migrate_to_chat_id,
+          migrateFrom: message?.migrate_from_chat_id,
+        },
+        'Ignored group migration service message',
+      );
+      return { ok: true };
+    }
     // Operator identity ALWAYS comes from `from.id` — never from chat.id.
+    // `chat.id` + `message_thread_id` + `from.id` are captured together on
+    // EVERY update: chatId alone never suffices to route a forum reply.
     const actorId = callback?.from?.id ?? message?.from?.id;
     const chatId = callback?.message?.chat?.id ?? message?.chat?.id;
     if (actorId === undefined || chatId === undefined) {
@@ -207,8 +246,30 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
     // Forum thread from the incoming message (Mode B). NEVER replaces the
     // owner — every gate below validates BOTH actorId AND thread.
+    // General has no thread id (undefined) — never hardcoded, never assumed.
     const actorThreadId =
       message?.message_thread_id ?? callback?.message?.message_thread_id;
+    /**
+     * Centralized early reply context: every rejection below answers
+     * through this ONE context so the origin topic can never be lost by a
+     * call site that only remembered chatId. Undefined thread = General
+     * (or non-forum chat) — the only case where no thread is sent.
+     */
+    const earlyCtx: TelegramContext = {
+      chatId: chatId as number,
+      ...(actorThreadId !== undefined ? { messageThreadId: actorThreadId } : {}),
+      ...(actorId !== undefined ? { actorTelegramUserId: actorId } : {}),
+    };
+    /** Early rejection send: always returns to the origin topic. */
+    async function sendEarly(text: string): Promise<void> {
+      await deps.client.sendMessage({
+        chatId: earlyCtx.chatId,
+        text,
+        ...(earlyCtx.messageThreadId !== undefined
+          ? { messageThreadId: earlyCtx.messageThreadId }
+          : {}),
+      });
+    }
     const fromUser = callback?.from ?? message?.from;
     /**
      * Display name NEVER renders empty (the empty-label fix): operator
@@ -233,7 +294,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         actionType: 'auth.rejected_user',
         ...(updateId !== undefined ? { metadata: { updateId } } : {}),
       });
-      await deps.client.sendMessage({ chatId, text: UNAUTHORIZED_TEXT });
+      await sendEarly(UNAUTHORIZED_TEXT);
       return { ok: true };
     }
 
@@ -246,7 +307,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         actionType: 'auth.rejected_chat',
         ...(updateId !== undefined ? { metadata: { updateId } } : {}),
       });
-      await deps.client.sendMessage({ chatId, text: UNAUTHORIZED_TEXT });
+      await sendEarly(UNAUTHORIZED_TEXT);
       return { ok: true };
     }
 
@@ -274,7 +335,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           actionType: 'topic.blocked_outside',
           ...(updateId !== undefined ? { metadata: { updateId } } : {}),
         });
-        await deps.client.sendMessage({ chatId, text: topicGuideText(actorName) });
+        await sendEarly(topicGuideText(actorName));
         return { ok: true };
       }
       if (actorThreadId !== assignedThread) {
@@ -327,6 +388,42 @@ export function createWebhookHandler(deps: WebhookDeps) {
     const targetActorName: string | undefined = actorName;
     /** Forum thread of this update (Mode B match, or any Mode A thread). Replies echo it. */
     const targetThreadId: number | undefined = actorThreadId;
+    /**
+     * Centralized reply context for this update: EVERY fresh message
+     * derived from it (replies, errors, ownership rejections, search
+     * results, drafts, confirmations) is sent through `sendInContext`,
+     * which carries the origin topic automatically. No handler hand-rolls
+     * `messageThreadId` per call site — the context does it once.
+     * Undefined thread = General / non-forum chat (correct, never forced).
+     */
+    const replyCtx: TelegramContext = {
+      chatId: targetChatId,
+      ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
+      actorTelegramUserId: targetActorId,
+    };
+    /**
+     * Centralized send: resolves the effective topic as
+     * `threadOverride ?? replyCtx.messageThreadId`. Callback-derived
+     * messages pass the owning interaction's stored thread as the
+     * override, so a new message born from a tap returns to the
+     * interaction's topic even when the callback payload carries no
+     * thread (legacy/stale). (answerCallbackQuery itself needs no thread.)
+     */
+    async function sendInContext(
+      text: string,
+      opts?: {
+        replyMarkup?: Parameters<TelegramClient['sendMessage']>[0]['replyMarkup'];
+        threadOverride?: number;
+      },
+    ): Promise<void> {
+      const thread = opts?.threadOverride ?? replyCtx.messageThreadId;
+      await deps.client.sendMessage({
+        chatId: replyCtx.chatId,
+        text,
+        ...(opts?.replyMarkup !== undefined ? { replyMarkup: opts.replyMarkup } : {}),
+        ...(thread !== undefined ? { messageThreadId: thread } : {}),
+      });
+    }
     const owner: DraftOwner = {
       chatId: targetChatId,
       userId: targetActorId,
@@ -365,10 +462,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
               ? { metadata: { ownerUserId: labeledOwnerId, ownerName: labelName } }
               : { metadata: { ownerName: labelName } }),
           });
-          await deps.client.sendMessage({
-            chatId: targetChatId,
-            text: replyBelongsText(labelName),
-          });
+          await sendInContext(replyBelongsText(labelName));
           return { ok: true };
         }
       }
@@ -617,7 +711,14 @@ export function createWebhookHandler(deps: WebhookDeps) {
       });
     }
 
-    /** Labeled send-or-edit: every interactive message shows its operator. */
+    /**
+     * Labeled send-or-edit: every interactive message shows its operator.
+     * Fresh messages return to the origin topic through the centralized
+     * context; `threadOverride` (the owning interaction's stored thread)
+     * wins when given, so callback-derived messages keep the
+     * interaction's topic even if the tap carried no thread. Edits stay
+     * in place (Telegram keeps the edited message in its topic).
+     */
     async function sendLabeled(
       responseText: string,
       replyMarkup:
@@ -625,6 +726,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         | ReturnType<typeof sectionKeyboard>
         | ReturnType<typeof draftKeyboard>
         | ReturnType<typeof searchResultsKeyboard>,
+      threadOverride?: number,
     ): Promise<void> {
       const labeled = withOperator(responseText, targetActorName);
       if (fromCallback && callbackMessageId !== undefined) {
@@ -635,11 +737,12 @@ export function createWebhookHandler(deps: WebhookDeps) {
           replyMarkup,
         });
       } else {
+        const thread = threadOverride ?? replyCtx.messageThreadId;
         await deps.client.sendMessage({
           chatId: targetChatId,
           text: labeled,
           replyMarkup,
-          ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
+          ...(thread !== undefined ? { messageThreadId: thread } : {}),
         });
       }
       if (callbackId !== undefined) {
@@ -743,6 +846,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await sendLabeled(
           NO_RESULTS_TEXT,
           sectionKeyboard('buscar', interaction.id),
+          interaction.messageThreadId,
         );
         return;
       }
@@ -766,6 +870,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           hasNext: safeOffset + SEARCH_PAGE_SIZE < total,
           hasPrev: safeOffset > 0,
         }),
+        interaction.messageThreadId,
       );
     }
 
@@ -790,6 +895,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       await sendLabeled(
         `👤 Cliente MOCK (${globalIndex + 1} de ${rows.length}):\n• Nombre: ${row.nombre}\n• Perfil: ${row.perfil}\n• Servicio: ${row.servicio}\n• País: ${row.pais}\n• Estatus: ${row.estatus}`,
         sectionKeyboard('buscar', interaction.id),
+        interaction.messageThreadId,
       );
     }
 
@@ -812,7 +918,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         // Navigation never touches drafts — both actors' state survives.
         const home = createInteraction('HOME');
         persistAll();
-        await sendLabeled(HOME_TEXT, homeKeyboard(home.id));
+        await sendLabeled(HOME_TEXT, homeKeyboard(home.id), interaction.messageThreadId);
         return;
       }
       if (action === 'buscar') {
@@ -821,6 +927,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await sendLabeled(
           SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR (demo)',
           sectionKeyboard('buscar', view.id),
+          interaction.messageThreadId,
         );
         return;
       }
@@ -854,7 +961,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
               targetActorName,
             ),
             replyMarkup: draftKeyboard(operation.id),
-            ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
+            ...(operation.messageThreadId !== undefined
+              ? { messageThreadId: operation.messageThreadId }
+              : {}),
           });
         }
         if (callbackId !== undefined) {
@@ -871,6 +980,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
             ? '⏰ Sin vencidos MOCK.'
             : `⏰ Vencidos MOCK (${expired.length}):\n${formatRows(expired.slice(0, 5))}`,
           sectionKeyboard('vencidos', view.id),
+          interaction.messageThreadId,
         );
         return;
       }
@@ -882,6 +992,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await sendLabeled(
           lines.length === 0 ? '📦 Inventario MOCK vacío.' : `📦 Inventario MOCK:\n${lines.join('\n')}`,
           sectionKeyboard('inventario', view.id),
+          interaction.messageThreadId,
         );
         return;
       }
@@ -897,7 +1008,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
                 : 'Sin borrador abierto que cancelar.';
           const home = createInteraction('HOME');
           persistAll();
-          await sendLabeled(text, homeKeyboard(home.id));
+          await sendLabeled(text, homeKeyboard(home.id), interaction.messageThreadId);
           return;
         }
         const result = kind === 'confirm' ? await confirmWithActivity() : cancelWithIdempotency();
@@ -911,7 +1022,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         persistAll();
         const home = createInteraction('HOME');
         persistAll();
-        await sendLabeled(result.text, homeKeyboard(home.id));
+        await sendLabeled(result.text, homeKeyboard(home.id), interaction.messageThreadId);
         return;
       }
       if (action === 'correct') {
@@ -919,12 +1030,16 @@ export function createWebhookHandler(deps: WebhookDeps) {
         if (blocked !== null) {
           const home = createInteraction('HOME');
           persistAll();
-          await sendLabeled(blocked.text, homeKeyboard(home.id));
+          await sendLabeled(blocked.text, homeKeyboard(home.id), interaction.messageThreadId);
           return;
         }
         deps.interactions.touch(interaction.id, { view: 'correct' });
         persistAll();
-        await sendLabeled(CORRECTION_PROMPT_TEXT, draftKeyboard(interaction.id));
+        await sendLabeled(
+          CORRECTION_PROMPT_TEXT,
+          draftKeyboard(interaction.id),
+          interaction.messageThreadId,
+        );
         return;
       }
       const viewIndex = viewIndexFor(action);
@@ -959,7 +1074,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const sectionText = SECTION_TEXTS[action] ?? SECTION_TEXTS['mas'] ?? '⋯ MÁS (demo)';
       const view = createInteraction('MORE');
       persistAll();
-      await sendLabeled(sectionText, sectionKeyboard(action, view.id));
+      await sendLabeled(sectionText, sectionKeyboard(action, view.id), interaction.messageThreadId);
     }
 
     if (decision.layer === 'noop') {
