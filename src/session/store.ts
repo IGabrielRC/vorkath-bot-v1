@@ -3,6 +3,8 @@ import { dirname, join } from 'node:path';
 
 export interface SessionState {
   userId: number;
+  /** Shared-group chat this session belongs to (0 = legacy private-chat key). */
+  chatId?: number;
   lastUpdateId?: number;
   updatedAt: string;
 }
@@ -23,20 +25,29 @@ interface PersistedState {
 export const MAX_SEEN_UPDATE_IDS = 1000;
 
 /**
- * Per-user in-memory store. sessions[userId]/drafts[userId] are isolated
- * Maps — never globals shared across users. update_id redelivery is
- * deduplicated through a bounded ring of the last 1000 ids.
+ * Per-actor in-memory store. Sessions are keyed by (chatId, userId) so
+ * the two owners sharing ONE group never collide; legacy single-arg
+ * callers keep working against chatId 0. Drafts stay keyed by userId
+ * for the legacy map (the live draft engine keys by chat+actor).
+ * update_id redelivery is deduplicated through a bounded ring of the
+ * last 1000 ids.
  *
  * Persistence is an atomic tmp-file + rename behind a promise queue, so
  * concurrent saves from the two owners cannot interleave partial writes.
+ * The queue self-heals: a failed write rejects only its own caller and
+ * never poisons later saves.
  */
 export class SessionStore {
-  readonly sessions = new Map<number, SessionState>();
+  readonly sessions = new Map<string, SessionState>();
   readonly drafts = new Map<number, DraftState>();
 
   private seenUpdateIds = new Set<number>();
   private seenOrder: number[] = [];
   private writeQueue: Promise<void> = Promise.resolve();
+
+  static sessionKey(chatId: number, userId: number): string {
+    return `${chatId}:${userId}`;
+  }
 
   /** Returns true when this update_id was already processed (redelivery). */
   markUpdateSeen(updateId: number): boolean {
@@ -54,20 +65,22 @@ export class SessionStore {
     return false;
   }
 
-  getSession(userId: number): SessionState | undefined {
-    return this.sessions.get(userId);
+  getSession(userId: number, chatId = 0): SessionState | undefined {
+    return this.sessions.get(SessionStore.sessionKey(chatId, userId));
   }
 
-  touchSession(userId: number, updateId?: number): SessionState {
+  touchSession(userId: number, updateId?: number, chatId = 0): SessionState {
+    const key = SessionStore.sessionKey(chatId, userId);
     const session: SessionState = {
       userId,
+      chatId,
       updatedAt: new Date().toISOString(),
     };
-    const resolvedUpdateId = updateId ?? this.sessions.get(userId)?.lastUpdateId;
+    const resolvedUpdateId = updateId ?? this.sessions.get(key)?.lastUpdateId;
     if (resolvedUpdateId !== undefined) {
       session.lastUpdateId = resolvedUpdateId;
     }
-    this.sessions.set(userId, session);
+    this.sessions.set(key, session);
     return session;
   }
 
@@ -81,7 +94,10 @@ export class SessionStore {
 
   /** Atomic persist: write to tmp file in the same directory, then rename. */
   persistTo(filePath: string): Promise<void> {
-    this.writeQueue = this.writeQueue.then(() => this.writeAtomically(filePath));
+    // Both handlers run the write: a prior failure never poisons the
+    // queue, and the current write's own failure still rejects its caller.
+    const run = (): Promise<void> => this.writeAtomically(filePath);
+    this.writeQueue = this.writeQueue.then(run, run);
     return this.writeQueue;
   }
 
@@ -99,7 +115,9 @@ export class SessionStore {
     this.sessions.clear();
     this.drafts.clear();
     for (const session of parsed.sessions ?? []) {
-      this.sessions.set(session.userId, session);
+      // Legacy snapshots lack chatId — they land on the chatId-0 key,
+      // which is exactly what single-arg getSession() reads.
+      this.sessions.set(SessionStore.sessionKey(session.chatId ?? 0, session.userId), session);
     }
     for (const draft of parsed.drafts ?? []) {
       this.drafts.set(draft.userId, draft);

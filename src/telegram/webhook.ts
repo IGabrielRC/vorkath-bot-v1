@@ -1,9 +1,10 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { IntentInterpreter } from '../ai/intentInterpreter';
-import { isAuthorized } from '../auth/allowlist';
+import { isAuthorized, isAuthorizedChat } from '../auth/allowlist';
+import { type Auditor, createAuditor } from '../audit/audit';
 import type { Env } from '../config/env';
-import { DraftEngine } from '../drafts/engine';
+import { DraftEngine, type DraftOwner, type DraftResult } from '../drafts/engine';
 import type { MockRepositories } from '../mock/repositories';
 import { route } from '../router/hybrid';
 import { SessionStore } from '../session/store';
@@ -49,19 +50,26 @@ export function isValidWebhookSecret(
 export interface WebhookDeps {
   env: Env;
   allowlist: Set<number>;
+  chatAllowlist: Set<number>;
   sessions: SessionStore;
   drafts: DraftEngine;
   interpreter: IntentInterpreter;
   repos: MockRepositories;
   client: TelegramClient;
+  auditor?: Auditor;
+  /** File path for best-effort draft persistence; undefined disables it. */
+  draftsStatePath?: string;
 }
 
 interface TelegramUser {
   id?: number;
+  first_name?: string;
+  username?: string;
 }
 
 interface TelegramChat {
   id?: number;
+  type?: string;
 }
 
 interface TelegramMessage {
@@ -85,12 +93,27 @@ interface TelegramUpdate {
 }
 
 /**
- * Full webhook pipeline: secret gate (401) → allowlist (neutral, zero
- * side-channels) → update_id idempotency → per-user session touch →
- * L1/L2/L3 cascade → Telegram reply. Secrets and MOCK credentials are
- * never logged: log lines carry user/update ids and layer/action only.
+ * Shared-group webhook pipeline.
+ *
+ * GROUP PRIVACY MODE MUST BE OFF (BotFather → Bot Settings → Group Privacy
+ * → Turn off) so the bot receives plain group messages — not only
+ * commands, replies, and mentions. With privacy ON, NORMAL group messages
+ * never reach this handler and the shared operation flow silently breaks.
+ *
+ * Identity rule: `chat.id` is the shared visible context (one private
+ * group for both owners); `from.id` is the operator identity. Every
+ * action requires BOTH an authorized chat AND an authorized operator.
+ * Drafts resolve strictly through (chatId, actorId) — never through the
+ * chat alone. Secrets and MOCK credentials are never logged: log lines
+ * carry user/update ids and layer/action only.
+ *
+ * Full pipeline: secret gate (401) → user+chat allowlist (neutral, zero
+ * side-channels) → update_id idempotency → per-actor session touch →
+ * L1/L2/L3 cascade → Telegram reply. Rejected updates touch nothing:
+ * no session, no draft, no Gemini, no MOCK.
  */
 export function createWebhookHandler(deps: WebhookDeps) {
+  const auditor = deps.auditor ?? createAuditor();
   return async function handleTelegramWebhook(
     request: FastifyRequest,
     reply: FastifyReply,
@@ -104,44 +127,140 @@ export function createWebhookHandler(deps: WebhookDeps) {
     const update = (request.body ?? {}) as TelegramUpdate;
     const updateId = typeof update.update_id === 'number' ? update.update_id : undefined;
     const callback = update.callback_query;
-    const userId = callback?.from?.id ?? update.message?.from?.id;
-    const chatId = callback?.message?.chat?.id ?? update.message?.chat?.id;
-    if (userId === undefined || chatId === undefined) {
+    const message = update.message;
+    // Operator identity ALWAYS comes from `from.id` — never from chat.id.
+    const actorId = callback?.from?.id ?? message?.from?.id;
+    const chatId = callback?.message?.chat?.id ?? message?.chat?.id;
+    if (actorId === undefined || chatId === undefined) {
+      return { ok: true };
+    }
+    const actorName =
+      callback?.from?.first_name ??
+      message?.from?.first_name ??
+      callback?.from?.username ??
+      message?.from?.username;
+
+    if (!isAuthorized(deps.allowlist, actorId)) {
+      logger.info({ userId: actorId, chatId, updateId }, 'Rejected unauthorized Telegram user');
+      auditor.record({
+        chatId,
+        actorTelegramUserId: actorId,
+        ...(actorName !== undefined ? { actorName } : {}),
+        actionType: 'auth.rejected_user',
+        ...(updateId !== undefined ? { metadata: { updateId } } : {}),
+      });
+      await deps.client.sendMessage({ chatId, text: UNAUTHORIZED_TEXT });
       return { ok: true };
     }
 
-    if (!isAuthorized(deps.allowlist, userId)) {
-      logger.info({ userId, updateId }, 'Rejected unauthorized Telegram user');
+    if (!isAuthorizedChat(deps.chatAllowlist, chatId)) {
+      logger.info({ userId: actorId, chatId, updateId }, 'Rejected unauthorized Telegram chat');
+      auditor.record({
+        chatId,
+        actorTelegramUserId: actorId,
+        ...(actorName !== undefined ? { actorName } : {}),
+        actionType: 'auth.rejected_chat',
+        ...(updateId !== undefined ? { metadata: { updateId } } : {}),
+      });
       await deps.client.sendMessage({ chatId, text: UNAUTHORIZED_TEXT });
       return { ok: true };
     }
 
     if (updateId !== undefined && deps.sessions.markUpdateSeen(updateId)) {
-      logger.info({ userId, updateId }, 'Ignored duplicate Telegram update');
+      logger.info({ userId: actorId, updateId }, 'Ignored duplicate Telegram update');
       return { ok: true };
     }
-    deps.sessions.touchSession(userId, updateId);
+    deps.sessions.touchSession(actorId, updateId, chatId);
 
-    const text = update.message?.text?.trim() ?? '';
+    const text = message?.text?.trim() ?? '';
     const callbackData = callback?.data;
     const decision = await route(
       {
-        userId,
+        userId: actorId,
+        chatId,
         ...(text.length > 0 ? { text } : {}),
         ...(callbackData !== undefined ? { callbackData } : {}),
       },
       deps.interpreter,
     );
     logger.info(
-      { userId, updateId, layer: decision.layer },
+      { userId: actorId, chatId, updateId, layer: decision.layer },
       'Routed Telegram update',
     );
 
     // Narrowed once here: closures below do not preserve outer narrowing.
     const targetChatId: number = chatId;
+    const targetActorId: number = actorId;
+    const targetActorName: string | undefined = actorName;
+    const owner: DraftOwner = {
+      chatId: targetChatId,
+      userId: targetActorId,
+      ...(targetActorName !== undefined ? { name: targetActorName } : {}),
+    };
+    const draftEntity = `draft:${targetChatId}:${targetActorId}`;
     const fromCallback = callback !== undefined;
     const callbackId = callback?.id;
     const callbackMessageId = callback?.message?.message_id;
+
+    /** Best-effort draft persist — a failed save never breaks the reply. */
+    function persistDrafts(): void {
+      if (deps.draftsStatePath === undefined) {
+        return;
+      }
+      deps.drafts.saveToFile(deps.draftsStatePath).catch((error) => {
+        logger.warn({ error }, 'Draft persist failed');
+      });
+    }
+
+    function auditDraft(
+      actionType: string,
+      metadata?: Record<string, unknown>,
+      entity: string = draftEntity,
+    ): void {
+      auditor.record({
+        chatId: targetChatId,
+        actorTelegramUserId: targetActorId,
+        ...(targetActorName !== undefined ? { actorName: targetActorName } : {}),
+        actionType,
+        entity,
+        ...(metadata !== undefined ? { metadata } : {}),
+      });
+    }
+
+    /**
+     * Cross-actor ownership guard for confirm/cancel. The action applies
+     * ONLY to the actor's own open draft. When the actor has none but a
+     * peer owns an open draft in this chat, reply with the ownership
+     * warning and modify NOTHING (the peer's draft stays open).
+     */
+    function confirmOrCancel(kind: 'confirm' | 'cancel'): DraftResult {
+      const own = deps.drafts.get(owner);
+      if (own !== undefined && own.status === 'open') {
+        const result = kind === 'confirm' ? deps.drafts.confirm(owner) : deps.drafts.cancel(owner);
+        persistDrafts();
+        auditDraft(kind === 'confirm' ? 'draft.confirmed' : 'draft.cancelled', {
+          months: own.months,
+        });
+        return result;
+      }
+      const peer = deps.drafts.findOtherOpenDraft(targetChatId, targetActorId);
+      if (peer !== undefined) {
+        auditDraft(
+          'draft.blocked_cross_actor',
+          {
+            requestedAction: kind,
+            ownerUserId: peer.userId,
+            ...(peer.ownerName !== undefined ? { ownerName: peer.ownerName } : {}),
+          },
+          `draft:${peer.chatId}:${peer.userId}`,
+        );
+        return {
+          ok: false,
+          text: `⚠️ Esta operación pertenece a ${peer.ownerName ?? 'otro operador'}.`,
+        };
+      }
+      return kind === 'confirm' ? deps.drafts.confirm(owner) : deps.drafts.cancel(owner);
+    }
 
     /** Reply in place (edit) for button taps, fresh message otherwise. */
     async function respond(responseText: string, section?: string): Promise<void> {
@@ -164,19 +283,26 @@ export function createWebhookHandler(deps: WebhookDeps) {
       }
     }
 
-    async function respondDraft(responseText: string): Promise<void> {
+    /**
+     * Draft reply. Terminal states (confirmed/cancelled/no-draft/blocked)
+     * land back on the HOME keyboard instead of re-showing draft buttons:
+     * re-attaching Confirmar/Cancelar after a dead end is what trapped
+     * users in the cancel loop (tap Cancelar → dead-end text → tap
+     * Cancelar again, forever).
+     */
+    async function respondDraft(responseText: string, terminal = false): Promise<void> {
       if (fromCallback && callbackMessageId !== undefined) {
         await deps.client.editMessageText({
           chatId: targetChatId,
           messageId: callbackMessageId,
           text: responseText,
-          replyMarkup: draftKeyboard(),
+          replyMarkup: terminal ? homeKeyboard() : draftKeyboard(),
         });
       } else {
         await deps.client.sendMessage({
           chatId: targetChatId,
           text: responseText,
-          replyMarkup: draftKeyboard(),
+          replyMarkup: terminal ? homeKeyboard() : draftKeyboard(),
         });
       }
       if (callbackId !== undefined) {
@@ -194,6 +320,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
     if (decision.layer === 'L1') {
       const action = decision.action;
       if (action === 'home' || action === 'back') {
+        // Navigation never touches drafts — both actors' state survives.
         await respond(HOME_TEXT);
         return { ok: true };
       }
@@ -202,9 +329,16 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return { ok: true };
       }
       if (action === 'operar') {
-        deps.drafts.create(userId);
+        const resumed = deps.drafts.isOpen(owner);
+        const draft = deps.drafts.create(owner, {
+          ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
+        });
+        persistDrafts();
+        auditDraft('draft.created', { months: draft.months, resumed });
         await respondDraft(
-          '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
+          resumed
+            ? `📝 Borrador retomado: ${draft.months} mes(es) (paso 2 de 2). Confirma o cancela.`
+            : '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
         );
         return { ok: true };
       }
@@ -233,13 +367,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return { ok: true };
       }
       if (action === 'confirm') {
-        const result = deps.drafts.confirm(userId);
-        await respondDraft(result.text);
+        const result = confirmOrCancel('confirm');
+        await respondDraft(result.text, true);
         return { ok: true };
       }
       if (action === 'cancel') {
-        const result = deps.drafts.cancel(userId);
-        await respondDraft(result.text);
+        const result = confirmOrCancel('cancel');
+        await respondDraft(result.text, true);
         return { ok: true };
       }
       if (action === 'correct') {
@@ -255,11 +389,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const parse = decision.parse;
       if (parse.kind === 'command') {
         if (parse.command === 'confirmar') {
-          await respondDraft(deps.drafts.confirm(userId).text);
+          const result = confirmOrCancel('confirm');
+          await respondDraft(result.text, true);
           return { ok: true };
         }
         if (parse.command === 'cancelar') {
-          await respondDraft(deps.drafts.cancel(userId).text);
+          const result = confirmOrCancel('cancel');
+          await respondDraft(result.text, true);
           return { ok: true };
         }
         if (parse.command === 'volver') {
@@ -274,7 +410,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await respond(placeholders[parse.command] ?? '⋯ MÁS (demo)', 'mas');
         return { ok: true };
       }
-      if (parse.kind === 'phone' || parse.kind === 'email') {
+      if (parse.kind === 'phone' || parse.kind === 'email' || parse.kind === 'service') {
         const rows = await deps.repos.searchAccounts(parse.value);
         if (rows.length === 0) {
           await respond(NO_RESULTS_TEXT, 'buscar');
@@ -287,11 +423,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return { ok: true };
       }
       if (parse.kind === 'months') {
-        const updated = deps.drafts.update(userId, { months: parse.months });
+        const updated = deps.drafts.update(owner, { months: parse.months });
         if (updated === undefined) {
           await respond(NO_DRAFT_TEXT);
           return { ok: true };
         }
+        persistDrafts();
+        auditDraft('draft.updated', { months: updated.months });
         await respondDraft(
           `${DRAFT_UPDATED_PREFIX} ${updated.months} mes(es) (paso 2 de 2). Confirma o cancela.`,
         );
@@ -308,17 +446,28 @@ export function createWebhookHandler(deps: WebhookDeps) {
       return { ok: true };
     }
     if (intent.name === 'CREATE_TEST_DRAFT') {
-      deps.drafts.create(userId);
-      await respondDraft('📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.');
+      const resumed = deps.drafts.isOpen(owner);
+      const draft = deps.drafts.create(owner, {
+        ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
+      });
+      persistDrafts();
+      auditDraft('draft.created', { months: draft.months, resumed });
+      await respondDraft(
+        resumed
+          ? `📝 Borrador retomado: ${draft.months} mes(es) (paso 2 de 2). Confirma o cancela.`
+          : '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
+      );
       return { ok: true };
     }
     if (intent.name === 'CORRECTION') {
       const months = typeof intent.params['months'] === 'number' ? intent.params['months'] : 1;
-      const updated = deps.drafts.update(userId, { months });
+      const updated = deps.drafts.update(owner, { months });
       if (updated === undefined) {
         await respond(NO_DRAFT_TEXT);
         return { ok: true };
       }
+      persistDrafts();
+      auditDraft('draft.updated', { months: updated.months });
       await respondDraft(
         `${DRAFT_UPDATED_PREFIX} ${updated.months} mes(es) (paso 2 de 2). Confirma o cancela.`,
       );

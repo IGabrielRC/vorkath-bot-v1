@@ -109,12 +109,12 @@ export function sectionKeyboard(section: string): InlineKeyboardMarkup {
   };
 }
 
-/** Draft actions: Confirmar / Corregir / Cancelar. */
+/** Draft actions: Confirmar / Corregir / Cancelar + ←Volver to Home. */
 export function draftKeyboard(): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
       [button('✅Confirmar', 'confirm'), button('✏️Corregir', 'correct')],
-      [button('❌Cancelar', 'cancel')],
+      [button('❌Cancelar', 'cancel'), backButton()],
     ],
   };
 }

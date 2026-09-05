@@ -6,8 +6,8 @@ import { loadFixtureAccounts, type MockAccount } from './excelLoader';
  * MOCK account store: in-memory rows loaded either from the persisted
  * `/data/mock-state.json` snapshot (when it exists) or from the read-only
  * Excel fixture (first boot). Search is a case-insensitive substring
- * match over NOMBRE/CORREO/PERFIL/PAIS/ESTATUS plus digit match over
- * NUMERO — deterministic, zero Gemini, zero Postgres.
+ * match over NOMBRE/CORREO/PERFIL/PAIS/ESTATUS/SERVICIO plus digit match
+ * over NUMERO — deterministic, zero Gemini, zero Postgres.
  *
  * Rows hold CORREO/CONTRASEÑA in memory; this module never logs them.
  * Chat-facing projections live in `repositories.ts` (`toSafeAccount`).
@@ -83,13 +83,17 @@ export class MockStore {
       return [];
     }
     const digits = q.replace(/\D/g, '');
+    // Whitespace-insensitive service comparison so "Flujo TV", "flujotv"
+    // and "FlujoTV" all match the `flujotv` service (same for Netflix).
+    const compact = q.replace(/\s+/g, '');
     const matches = this.accounts.filter((account) => {
       if (
         account.nombre.toLowerCase().includes(q) ||
         account.correo.toLowerCase().includes(q) ||
         account.perfil.toLowerCase().includes(q) ||
         account.pais.toLowerCase().includes(q) ||
-        account.estatus.toLowerCase().includes(q)
+        account.estatus.toLowerCase().includes(q) ||
+        account.servicio.toLowerCase().includes(compact)
       ) {
         return true;
       }

@@ -1,3 +1,6 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   DRAFT_CANCEL_TEXT,
@@ -43,5 +46,36 @@ describe('DraftEngine lifecycle (RED: per-user, no-expiry demo)', () => {
     const engine = new DraftEngine();
     expect(engine.confirm(999).ok).toBe(false);
     expect(engine.cancel(999).ok).toBe(false);
+  });
+
+  it('drafts never expire and survive a save/load round-trip (restart-safe)', async () => {
+    const engine = new DraftEngine();
+    const chatId = -1001234567890;
+    engine.create({ chatId, userId: 111 }, { months: 3 });
+    engine.create({ chatId, userId: 222 }, { months: 2 });
+    engine.cancel({ chatId, userId: 222 });
+
+    const filePath = join(mkdtempSync(join(tmpdir(), 'vokath-drafts-')), 'drafts.json');
+    await engine.saveToFile(filePath);
+
+    // Simulate a restart: a fresh engine restores everything, nothing lost.
+    const revived = new DraftEngine();
+    await revived.loadFromFile(filePath);
+    expect(revived.get({ chatId, userId: 111 })?.status).toBe('open');
+    expect(revived.get({ chatId, userId: 111 })?.months).toBe(3);
+    expect(revived.get({ chatId, userId: 222 })?.status).toBe('cancelled');
+    // The open draft resumes — corrections keep working after the restart.
+    revived.update({ chatId, userId: 111 }, { months: 5 });
+    expect(revived.get({ chatId, userId: 111 })?.months).toBe(5);
+  });
+
+  it('resumes an open draft instead of wiping it on duplicate create', () => {
+    const engine = new DraftEngine();
+    const owner = { chatId: -1001234567890, userId: 111 };
+    engine.create(owner, { months: 1 });
+    engine.update(owner, { months: 4 });
+    const resumed = engine.create(owner);
+    expect(resumed.months).toBe(4);
+    expect(resumed.status).toBe('open');
   });
 });

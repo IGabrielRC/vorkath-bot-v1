@@ -43,6 +43,20 @@ describe('MockStore + repositories (RED: fixture→store→safe seam)', () => {
     expect(store.search('zzz-no-such-customer-zzz')).toEqual([]);
   });
 
+  it('recognizes both services in any case/spacing (Netflix + FlujoTV)', async () => {
+    const store = await MockStore.create({ fixturePath: FIXTURE, statePath: tmpState() });
+    for (const query of ['netflix', 'Netflix', 'NETFLIX']) {
+      const rows = store.search(query);
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.every((row) => row.servicio === 'netflix')).toBe(true);
+    }
+    for (const query of ['flujotv', 'FlujoTV', 'flujo tv', 'FLUJO TV']) {
+      const rows = store.search(query);
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.every((row) => row.servicio === 'flujotv')).toBe(true);
+    }
+  });
+
   it('exposes expired rows and per-service inventory', async () => {
     const store = await MockStore.create({ fixturePath: FIXTURE, statePath: tmpState() });
     expect(store.getExpired().length).toBeGreaterThan(0);

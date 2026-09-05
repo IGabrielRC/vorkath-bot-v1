@@ -8,11 +8,13 @@ const testEnv: Env = {
   TELEGRAM_BOT_TOKEN: 'tok-test-secret',
   TELEGRAM_WEBHOOK_SECRET: 'wh-test-secret-long-enough',
   AUTHORIZED_TELEGRAM_USER_IDS: '111111111,222222222',
+  AUTHORIZED_TELEGRAM_CHAT_IDS: '-1001234567890',
   GEMINI_API_KEY: 'key-test-secret',
   GEMINI_MODEL: 'gemini-2.0-flash',
   PUBLIC_BASE_URL: 'https://example.com',
   REGISTER_TELEGRAM_WEBHOOK: 'false',
   MOCK_STATE_PATH: '/data/mock-state.json',
+  DRAFTS_STATE_PATH: '/data/drafts-state.json',
 };
 
 describe('GET /health', () => {

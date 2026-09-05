@@ -1,5 +1,5 @@
 /**
- * L2 fast parser: deterministic phone/email/command detection.
+ * L2 fast parser: deterministic phone/email/command/service detection.
  * Never calls Gemini. Guards phone-vs-months so bare counts like
  * "2" are never mistaken for a phone number (phones need >=7 digits).
  */
@@ -17,6 +17,7 @@ export type FastParseResult =
   | { kind: 'phone'; value: string }
   | { kind: 'email'; value: string }
   | { kind: 'months'; months: number }
+  | { kind: 'service'; value: 'netflix' | 'flujotv' }
   | { kind: 'none' };
 
 /** Minimum digit count for a phone match — the phone-vs-months guard. */
@@ -76,7 +77,25 @@ function parseCommand(text: string): { kind: 'command'; command: FastCommand } |
 }
 
 /**
- * Deterministic cascade: command → email → phone → months → none.
+ * Service-name recognition (Netflix + FlujoTV, case/spacing tolerant).
+ * Checked LAST before `none` so more specific kinds always win:
+ * "precio netflix" stays a `precio` command, "netflix 414..." stays a
+ * phone search, "netflix 2 meses" stays a months correction. A bare
+ * "netflix" / "flujotv" / "flujo tv" becomes a deterministic repo search
+ * (zero Gemini) instead of falling through to L3 UNKNOWN.
+ */
+export function parseService(text: string): { kind: 'service'; value: 'netflix' | 'flujotv' } | null {
+  if (/\bnetflix\b/i.test(text)) {
+    return { kind: 'service', value: 'netflix' };
+  }
+  if (/\bflujo[\s-]*tv\b/i.test(text)) {
+    return { kind: 'service', value: 'flujotv' };
+  }
+  return null;
+}
+
+/**
+ * Deterministic cascade: command → email → phone → months → service → none.
  * "none" means the router must fall through to L3 (Gemini intent-only).
  */
 export function parseFast(text: string): FastParseResult {
@@ -85,8 +104,10 @@ export function parseFast(text: string): FastParseResult {
     return { kind: 'none' };
   }
   return (
-    parseCommand(trimmed) ?? parseEmail(trimmed) ?? parsePhone(trimmed) ?? parseMonths(trimmed) ?? {
-      kind: 'none',
-    }
+    parseCommand(trimmed) ??
+    parseEmail(trimmed) ??
+    parsePhone(trimmed) ??
+    parseMonths(trimmed) ??
+    parseService(trimmed) ?? { kind: 'none' }
   );
 }

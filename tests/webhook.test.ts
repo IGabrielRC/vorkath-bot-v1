@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { describe, expect, it } from 'vitest';
 import { StubIntentInterpreter } from '../src/ai/intentInterpreter';
-import { parseAuthorizedIds } from '../src/auth/allowlist';
+import { parseAuthorizedChatIds, parseAuthorizedIds } from '../src/auth/allowlist';
 import { buildApp } from '../src/app';
 import type { Env } from '../src/config/env';
 import { DraftEngine } from '../src/drafts/engine';
@@ -19,6 +19,8 @@ import { UNAUTHORIZED_TEXT } from '../src/telegram/webhook';
 const GABRIEL = 111111111;
 const EDWARD = 222222222;
 const STRANGER = 999999999;
+/** Shared private operating group both owners see (test-only value). */
+const GROUP = -1001234567890;
 
 const testEnv: Env = {
   NODE_ENV: 'test',
@@ -26,11 +28,13 @@ const testEnv: Env = {
   TELEGRAM_BOT_TOKEN: 'tok-test-secret',
   TELEGRAM_WEBHOOK_SECRET: 'wh-test-secret-long-enough',
   AUTHORIZED_TELEGRAM_USER_IDS: `${GABRIEL},${EDWARD}`,
+  AUTHORIZED_TELEGRAM_CHAT_IDS: `${GROUP}`,
   GEMINI_API_KEY: 'key-test-secret',
   GEMINI_MODEL: 'gemini-2.0-flash',
   PUBLIC_BASE_URL: 'https://example.com',
   REGISTER_TELEGRAM_WEBHOOK: 'false',
   MOCK_STATE_PATH: '/data/mock-state.json',
+  DRAFTS_STATE_PATH: '/data/drafts-state.json',
 };
 
 class StubTelegramClient implements TelegramClient {
@@ -89,6 +93,7 @@ async function createWorld(): Promise<WebhookWorld> {
   const drafts = new DraftEngine();
   const app = buildApp(testEnv, {
     allowlist: parseAuthorizedIds(testEnv.AUTHORIZED_TELEGRAM_USER_IDS),
+    chatAllowlist: parseAuthorizedChatIds(testEnv.AUTHORIZED_TELEGRAM_CHAT_IDS),
     sessions,
     drafts,
     interpreter,
@@ -121,7 +126,7 @@ async function createWorld(): Promise<WebhookWorld> {
 function messageUpdate(updateId: number, userId: number, text: string): unknown {
   return {
     update_id: updateId,
-    message: { message_id: 1, from: { id: userId }, chat: { id: userId }, text },
+    message: { message_id: 1, from: { id: userId }, chat: { id: GROUP }, text },
   };
 }
 
@@ -131,7 +136,7 @@ function callbackUpdate(updateId: number, userId: number, data: string): unknown
     callback_query: {
       id: `cb-${updateId}`,
       from: { id: userId },
-      message: { message_id: 7, chat: { id: userId } },
+      message: { message_id: 7, chat: { id: GROUP } },
       data,
     },
   };
@@ -160,7 +165,7 @@ describe('webhook navigation: /start → Home → Buscar → volver → Home', (
     expect(start).toEqual({ status: 200, body: { ok: true } });
     expect(world.client.texts()[0]).toBe(HOME_TEXT);
     expect(world.interpreter.calls).toBe(0);
-    expect(world.sessions.getSession(GABRIEL)).toBeDefined();
+    expect(world.sessions.getSession(GABRIEL, GROUP)).toBeDefined();
 
     await world.post(callbackUpdate(world.nextUpdateId(), GABRIEL, callbackData('buscar')));
     const edits = world.client.sent.filter((entry) => entry.kind === 'edit');
@@ -253,13 +258,13 @@ describe('webhook demo draft 1 → 2 → confirm/cancel with session isolation',
     expect(world.client.texts().at(-1)).toContain('Borrador actualizado: 2 mes(es)');
 
     // Gabriel's draft still holds its own state — Edward's edits never leak.
-    expect(world.drafts.get(GABRIEL)?.status).toBe('open');
-    expect(world.drafts.get(GABRIEL)?.months).toBe(1);
-    expect(world.drafts.get(EDWARD)?.months).toBe(2);
+    expect(world.drafts.get({ chatId: GROUP, userId: GABRIEL })?.status).toBe('open');
+    expect(world.drafts.get({ chatId: GROUP, userId: GABRIEL })?.months).toBe(1);
+    expect(world.drafts.get({ chatId: GROUP, userId: EDWARD })?.months).toBe(2);
 
     await world.post(callbackUpdate(world.nextUpdateId(), EDWARD, callbackData('cancel')));
     expect(world.client.texts().at(-1)).toBe('❌ Operación cancelada');
-    expect(world.drafts.get(GABRIEL)?.status).toBe('open');
+    expect(world.drafts.get({ chatId: GROUP, userId: GABRIEL })?.status).toBe('open');
     await world.app.close();
   });
 });
@@ -270,8 +275,8 @@ describe('webhook auth + idempotency', () => {
     await world.post(messageUpdate(world.nextUpdateId(), STRANGER, '/start'));
     expect(world.interpreter.calls).toBe(0);
     expect(world.client.texts()).toEqual([UNAUTHORIZED_TEXT]);
-    expect(world.sessions.getSession(STRANGER)).toBeUndefined();
-    expect(world.drafts.get(STRANGER)).toBeUndefined();
+    expect(world.sessions.getSession(STRANGER, GROUP)).toBeUndefined();
+    expect(world.drafts.get({ chatId: GROUP, userId: STRANGER })).toBeUndefined();
     await world.app.close();
   });
 

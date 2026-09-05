@@ -11,6 +11,8 @@ import { parseCallback } from '../telegram/keyboards';
 
 export interface RouterCtx {
   userId: number;
+  /** Shared-group chat id (context only — routing never assumes private chat). */
+  chatId?: number;
   text?: string;
   callbackData?: string;
 }
@@ -35,7 +37,11 @@ export async function route(ctx: RouterCtx, interpreter: IntentInterpreter): Pro
   }
 
   const text = ctx.text?.trim() ?? '';
-  if (text === '/start') {
+  // Group commands arrive with the bot mention suffix (`/start@VokathBot`)
+  // when tapped from the command menu — strip it before matching.
+  const withoutMention =
+    text.startsWith('/') && text.includes('@') ? text.slice(0, text.indexOf('@')) : text;
+  if (withoutMention === '/start') {
     return { layer: 'L1', action: 'home' };
   }
 

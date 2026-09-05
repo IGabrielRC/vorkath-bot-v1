@@ -8,6 +8,19 @@ const csvOfTelegramIds = z
     'AUTHORIZED_TELEGRAM_USER_IDS must be a comma-separated list of numeric Telegram user ids',
   );
 
+/**
+ * Group/supergroup chat ids are NEGATIVE (e.g. -1001234567890), so the
+ * chat allowlist permits an optional leading minus per entry. Zero is
+ * never a valid Telegram id and is rejected in `parseAuthorizedChatIds`.
+ */
+const csvOfTelegramChatIds = z
+  .string()
+  .min(1, 'AUTHORIZED_TELEGRAM_CHAT_IDS must not be empty')
+  .regex(
+    /^-?[0-9]+(\s*,\s*-?[0-9]+)*\s*$/,
+    'AUTHORIZED_TELEGRAM_CHAT_IDS must be a comma-separated list of numeric Telegram chat ids (group ids are negative)',
+  );
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
@@ -16,11 +29,13 @@ const envSchema = z.object({
     .string()
     .min(16, 'TELEGRAM_WEBHOOK_SECRET must be at least 16 characters'),
   AUTHORIZED_TELEGRAM_USER_IDS: csvOfTelegramIds,
+  AUTHORIZED_TELEGRAM_CHAT_IDS: csvOfTelegramChatIds,
   GEMINI_API_KEY: z.string().min(1, 'GEMINI_API_KEY is required'),
   GEMINI_MODEL: z.string().min(1, 'GEMINI_MODEL is required'),
   PUBLIC_BASE_URL: z.string().url('PUBLIC_BASE_URL must be a valid URL'),
   REGISTER_TELEGRAM_WEBHOOK: z.enum(['true', 'false']).default('false'),
   MOCK_STATE_PATH: z.string().min(1).default('/data/mock-state.json'),
+  DRAFTS_STATE_PATH: z.string().min(1).default('/data/drafts-state.json'),
 });
 
 export type Env = z.infer<typeof envSchema>;
