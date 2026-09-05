@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { isAuthorizedChat, parseAuthorizedChatIds } from '../src/auth/allowlist';
 import { loadEnv } from '../src/config/env';
 
 const validSource: NodeJS.ProcessEnv = {
@@ -17,10 +18,24 @@ const validSource: NodeJS.ProcessEnv = {
 };
 
 describe('loadEnv fail-fast', () => {
-  it('parses the 12 required variables', () => {
+  it('parses the required variables', () => {
     const env = loadEnv({ ...validSource });
     expect(env.PORT).toBe(3000);
     expect(env.NODE_ENV).toBe('test');
+  });
+
+  it('treats AUTHORIZED_TELEGRAM_CHAT_IDS as optional', () => {
+    const { AUTHORIZED_TELEGRAM_CHAT_IDS, ...withoutChatIds } = validSource;
+    void AUTHORIZED_TELEGRAM_CHAT_IDS;
+    const missing = loadEnv({ ...withoutChatIds });
+    expect(missing.AUTHORIZED_TELEGRAM_CHAT_IDS).toBe('');
+    const empty = loadEnv({ ...validSource, AUTHORIZED_TELEGRAM_CHAT_IDS: '' });
+    expect(empty.AUTHORIZED_TELEGRAM_CHAT_IDS).toBe('');
+    expect(parseAuthorizedChatIds('')).toEqual(new Set());
+    expect(isAuthorizedChat(parseAuthorizedChatIds(''), -1001234567890)).toBe(true);
+    expect(
+      isAuthorizedChat(parseAuthorizedChatIds('-1001234567890'), -1009999999999),
+    ).toBe(false);
   });
 
   it('throws when a secret is missing or too short', () => {

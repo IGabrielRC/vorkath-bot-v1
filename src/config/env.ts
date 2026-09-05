@@ -12,13 +12,19 @@ const csvOfTelegramIds = z
  * Group/supergroup chat ids are NEGATIVE (e.g. -1001234567890), so the
  * chat allowlist permits an optional leading minus per entry. Zero is
  * never a valid Telegram id and is rejected in `parseAuthorizedChatIds`.
+ *
+ * OPTIONAL: an empty/missing value means "no chat restriction" — only
+ * AUTHORIZED_TELEGRAM_USER_IDS is enforced. When one or more ids are
+ * configured, the chat restriction applies on top of user authorization.
  */
 const csvOfTelegramChatIds = z
   .string()
-  .min(1, 'AUTHORIZED_TELEGRAM_CHAT_IDS must not be empty')
-  .regex(
-    /^-?[0-9]+(\s*,\s*-?[0-9]+)*\s*$/,
-    'AUTHORIZED_TELEGRAM_CHAT_IDS must be a comma-separated list of numeric Telegram chat ids (group ids are negative)',
+  .default('')
+  .refine(
+    (raw) =>
+      raw.trim() === '' ||
+      /^-?[0-9]+(\s*,\s*-?[0-9]+)*\s*$/.test(raw),
+    'AUTHORIZED_TELEGRAM_CHAT_IDS must be empty or a comma-separated list of numeric Telegram chat ids (group ids are negative)',
   );
 
 const envSchema = z.object({

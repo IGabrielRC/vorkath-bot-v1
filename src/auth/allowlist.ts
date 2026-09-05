@@ -29,8 +29,15 @@ export function isAuthorized(allowlist: Set<number>, userId: number): boolean {
  * Chat allowlist. IDs come exclusively from AUTHORIZED_TELEGRAM_CHAT_IDS.
  * Group/supergroup chat ids are NEGATIVE — any non-zero integer is
  * accepted; zero and non-integers are rejected.
+ *
+ * An empty raw value yields an EMPTY set meaning "no chat restriction":
+ * user authorization alone applies. `isAuthorizedChat` treats an empty
+ * set as allowing every chat.
  */
 export function parseAuthorizedChatIds(raw: string): Set<number> {
+  if (raw.trim() === '') {
+    return new Set();
+  }
   const ids = raw
     .split(',')
     .map((part) => part.trim())
@@ -49,5 +56,8 @@ export function parseAuthorizedChatIds(raw: string): Set<number> {
 }
 
 export function isAuthorizedChat(chatAllowlist: Set<number>, chatId: number): boolean {
+  if (chatAllowlist.size === 0) {
+    return true;
+  }
   return chatAllowlist.has(chatId);
 }
