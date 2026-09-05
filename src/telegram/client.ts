@@ -4,6 +4,12 @@ export interface SendMessageOpts {
   chatId: number;
   text: string;
   replyMarkup?: InlineKeyboardMarkup;
+  /**
+   * Forum topic to post into (`message_thread_id` on the wire).
+   * Replies inside a topic MUST carry the sender's thread — otherwise
+   * Telegram drops them in General.
+   */
+  messageThreadId?: number;
 }
 
 export interface EditMessageOpts {
@@ -46,6 +52,7 @@ export class HttpTelegramClient implements TelegramClient {
       chat_id: opts.chatId,
       text: opts.text,
       ...(opts.replyMarkup !== undefined ? { reply_markup: opts.replyMarkup } : {}),
+      ...(opts.messageThreadId !== undefined ? { message_thread_id: opts.messageThreadId } : {}),
     });
   }
 

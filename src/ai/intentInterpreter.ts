@@ -31,6 +31,8 @@ export type Intent = z.infer<typeof intentSchema>;
 export interface SessionCtx {
   userId: number;
   chatId?: number;
+  /** Forum topic id — actor context scope, never a substitute for userId. */
+  messageThreadId?: number;
   ownerName?: string;
 }
 

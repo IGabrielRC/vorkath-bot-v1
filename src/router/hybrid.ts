@@ -13,6 +13,8 @@ export interface RouterCtx {
   userId: number;
   /** Shared-group chat id (context only — routing never assumes private chat). */
   chatId?: number;
+  /** Forum topic id — part of the context scope, never a replacement for userId. */
+  messageThreadId?: number;
   /** Acting operator display name — forwarded to Gemini, never a peer's. */
   ownerName?: string;
   text?: string;
@@ -61,6 +63,7 @@ export async function route(ctx: RouterCtx, interpreter: IntentInterpreter): Pro
     const intent = await interpreter.interpret(text, {
       userId: ctx.userId,
       ...(ctx.chatId !== undefined ? { chatId: ctx.chatId } : {}),
+      ...(ctx.messageThreadId !== undefined ? { messageThreadId: ctx.messageThreadId } : {}),
       ...(ctx.ownerName !== undefined ? { ownerName: ctx.ownerName } : {}),
     });
     return { layer: 'L3', intent };

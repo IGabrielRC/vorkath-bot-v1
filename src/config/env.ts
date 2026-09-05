@@ -27,6 +27,34 @@ const csvOfTelegramChatIds = z
     'AUTHORIZED_TELEGRAM_CHAT_IDS must be empty or a comma-separated list of numeric Telegram chat ids (group ids are negative)',
   );
 
+/**
+ * Operator→topic mapping for forum-mode groups. OPTIONAL — empty/missing
+ * means Mode A (current group-first behavior, unchanged). When set, each
+ * entry must be `userId:threadId` (both positive integers); anything else
+ * fails fast at boot. No topic id is assumed — General included: anything
+ * outside the assigned topics is guided, never executed.
+ */
+const operatorTopicsSchema = z
+  .string()
+  .default('')
+  .refine(
+    (raw) =>
+      raw.trim() === '' ||
+      raw
+        .split(',')
+        .every((entry) => /^\d+\s*:\s*\d+$/.test(entry.trim()) && !/:\s*0\b/.test(entry)),
+    'TELEGRAM_OPERATOR_TOPICS must be empty or a comma-separated list of userId:threadId pairs (positive integers)',
+  );
+
+/** Activity-topic id for the single allowed summary event. OPTIONAL. */
+const activityTopicIdSchema = z
+  .string()
+  .default('')
+  .refine(
+    (raw) => raw.trim() === '' || (/^\d+$/.test(raw.trim()) && Number(raw.trim()) > 0),
+    'TELEGRAM_ACTIVITY_TOPIC_ID must be empty or a positive integer thread id',
+  );
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
@@ -36,6 +64,8 @@ const envSchema = z.object({
     .min(16, 'TELEGRAM_WEBHOOK_SECRET must be at least 16 characters'),
   AUTHORIZED_TELEGRAM_USER_IDS: csvOfTelegramIds,
   AUTHORIZED_TELEGRAM_CHAT_IDS: csvOfTelegramChatIds,
+  TELEGRAM_OPERATOR_TOPICS: operatorTopicsSchema,
+  TELEGRAM_ACTIVITY_TOPIC_ID: activityTopicIdSchema,
   GEMINI_API_KEY: z.string().min(1, 'GEMINI_API_KEY is required'),
   GEMINI_MODEL: z.string().min(1, 'GEMINI_MODEL is required'),
   PUBLIC_BASE_URL: z.string().url('PUBLIC_BASE_URL must be a valid URL'),

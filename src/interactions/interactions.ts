@@ -42,6 +42,12 @@ export interface Interaction {
   chatId: number;
   ownerTelegramUserId: number;
   ownerName?: string;
+  /**
+   * Forum topic this interaction was created in. Undefined = created
+   * outside forum mode (Mode A) or before topics existed — persistence
+   * and old snapshots tolerate its absence.
+   */
+  messageThreadId?: number;
   type: InteractionType;
   status: InteractionStatus;
   /** Per-interaction context: search query/offset, view, draft linkage… */
@@ -54,6 +60,8 @@ export interface InteractionCreateOpts {
   /** Injectable id for tests; production uses a random 8-hex id. */
   id?: string;
   ownerName?: string;
+  /** Forum topic the interaction belongs to; undefined in Mode A. */
+  messageThreadId?: number;
   state?: Record<string, unknown>;
 }
 
@@ -69,10 +77,16 @@ export class InteractionStore {
   private readonly interactions = new Map<string, Interaction>();
   /** chatId → (operator display name → telegram user id), for reply guards. */
   private readonly operatorNames = new Map<string, number>();
+  /** chatId → (telegram user id → operator display name), for topic mismatch labels. */
+  private readonly operatorNameById = new Map<string, string>();
   private writeQueue: Promise<void> = Promise.resolve();
 
   private static nameKey(chatId: number, name: string): string {
     return `${chatId}::${name.toLowerCase()}`;
+  }
+
+  private static idKey(chatId: number, userId: number): string {
+    return `${chatId}::${userId}`;
   }
 
   /** Remembers an operator's display name so reply guards can resolve owners. */
@@ -81,10 +95,16 @@ export class InteractionStore {
       return;
     }
     this.operatorNames.set(InteractionStore.nameKey(chatId, name), userId);
+    this.operatorNameById.set(InteractionStore.idKey(chatId, userId), name);
   }
 
   resolveUserIdByName(chatId: number, name: string): number | undefined {
     return this.operatorNames.get(InteractionStore.nameKey(chatId, name));
+  }
+
+  /** Latest remembered display name for this operator, if any. */
+  resolveNameByUserId(chatId: number, userId: number): string | undefined {
+    return this.operatorNameById.get(InteractionStore.idKey(chatId, userId));
   }
 
   create(
@@ -106,6 +126,9 @@ export class InteractionStore {
     if (opts?.ownerName !== undefined) {
       interaction.ownerName = opts.ownerName;
     }
+    if (opts?.messageThreadId !== undefined) {
+      interaction.messageThreadId = opts.messageThreadId;
+    }
     this.interactions.set(interaction.id, interaction);
     this.rememberOperator(chatId, ownerTelegramUserId, opts?.ownerName);
     return interaction;
@@ -118,14 +141,28 @@ export class InteractionStore {
   /**
    * Latest PENDING interaction for this (chatId, owner) pair — the only
    * context a text message may consult. Never returns a peer's interaction.
+   * In forum mode pass the sender's thread: only an interaction created
+   * in that same thread is returned, so text/drafts/search/Gemini-context
+   * never cross threads. Undefined threadId keeps Mode A behavior.
    */
-  getActive(chatId: number, ownerTelegramUserId: number): Interaction | undefined {
+  getActive(
+    chatId: number,
+    ownerTelegramUserId: number,
+    messageThreadId?: number,
+  ): Interaction | undefined {
     let active: Interaction | undefined;
     for (const interaction of this.interactions.values()) {
       if (
         interaction.chatId !== chatId ||
         interaction.ownerTelegramUserId !== ownerTelegramUserId ||
         interaction.status !== 'PENDING'
+      ) {
+        continue;
+      }
+      if (
+        messageThreadId !== undefined &&
+        interaction.messageThreadId !== undefined &&
+        interaction.messageThreadId !== messageThreadId
       ) {
         continue;
       }

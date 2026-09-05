@@ -11,6 +11,11 @@ import { MockAccountRepositories, type MockRepositories } from './mock/repositor
 import { SessionStore } from './session/store';
 import { HttpTelegramClient, type TelegramClient } from './telegram/client';
 import { registerWebhook } from './telegram/setWebhook';
+import {
+  parseActivityTopicId,
+  parseOperatorTopics,
+  type OperatorTopics,
+} from './telegram/topics';
 import { createWebhookHandler, isValidWebhookSecret } from './telegram/webhook';
 import { logger } from './utils/logger';
 
@@ -36,6 +41,13 @@ export interface AppDeps {
   repos?: MockRepositories;
   client?: TelegramClient;
   auditor?: Auditor;
+  /**
+   * Forum operator→topic map override (tests). Production parses
+   * TELEGRAM_OPERATOR_TOPICS fail-fast. Undefined = parse from env.
+   */
+  operatorTopics?: OperatorTopics;
+  /** Activity topic override (tests). Undefined = parse from env. */
+  activityTopicId?: number;
   /** Draft snapshot path; undefined disables best-effort persist (tests). */
   draftsStatePath?: string;
   /** Interaction snapshot path; undefined disables best-effort persist (tests). */
@@ -57,6 +69,10 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
   const repos = deps.repos ?? new MockAccountRepositories(MockStore.empty());
   const client = deps.client ?? new HttpTelegramClient(env.TELEGRAM_BOT_TOKEN);
   const auditor = deps.auditor ?? createAuditor();
+  // Fail-fast: a malformed mapping or activity id crashes boot, never
+  // a half-configured forum mode. Absent/empty = Mode A (unchanged).
+  const operatorTopics = deps.operatorTopics ?? parseOperatorTopics(env.TELEGRAM_OPERATOR_TOPICS);
+  const activityTopicId = deps.activityTopicId ?? parseActivityTopicId(env.TELEGRAM_ACTIVITY_TOPIC_ID);
   const handleWebhook = createWebhookHandler({
     env,
     allowlist,
@@ -68,6 +84,8 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
     repos,
     client,
     auditor,
+    operatorTopics,
+    ...(activityTopicId !== undefined ? { activityTopicId } : {}),
     ...(deps.draftsStatePath !== undefined ? { draftsStatePath: deps.draftsStatePath } : {}),
     ...(deps.interactionsStatePath !== undefined
       ? { interactionsStatePath: deps.interactionsStatePath }

@@ -25,6 +25,13 @@ import {
   type CallbackAction,
 } from './keyboards';
 import type { TelegramClient } from './client';
+import {
+  findTopicOwner,
+  type OperatorTopics,
+  resolveDisplayName,
+  topicGuideText,
+  topicMismatchText,
+} from './topics';
 
 export const SECRET_HEADER = 'x-telegram-bot-api-secret-token';
 
@@ -92,6 +99,14 @@ export interface WebhookDeps {
   repos: MockRepositories;
   client: TelegramClient;
   auditor?: Auditor;
+  /**
+   * Forum operator→topic map. Empty/undefined = Mode A (current
+   * group-first behavior, unchanged). Configured = Mode B: mapped
+   * operators may only act inside their assigned topic.
+   */
+  operatorTopics?: OperatorTopics;
+  /** Forum topic receiving the single allowed activity summary. Undefined = disabled. */
+  activityTopicId?: number;
   /** File path for best-effort draft persistence; undefined disables it. */
   draftsStatePath?: string;
   /** File path for best-effort interaction persistence; undefined disables it. */
@@ -101,6 +116,7 @@ export interface WebhookDeps {
 interface TelegramUser {
   id?: number;
   first_name?: string;
+  last_name?: string;
   username?: string;
 }
 
@@ -111,6 +127,8 @@ interface TelegramChat {
 
 interface TelegramMessage {
   message_id?: number;
+  /** Forum topic id (`message_thread_id` on the wire). Absent in Mode A. */
+  message_thread_id?: number;
   from?: TelegramUser;
   chat?: TelegramChat;
   text?: string;
@@ -187,11 +205,24 @@ export function createWebhookHandler(deps: WebhookDeps) {
     if (actorId === undefined || chatId === undefined) {
       return { ok: true };
     }
-    const actorName =
-      callback?.from?.first_name ??
-      message?.from?.first_name ??
-      callback?.from?.username ??
-      message?.from?.username;
+    // Forum thread from the incoming message (Mode B). NEVER replaces the
+    // owner — every gate below validates BOTH actorId AND thread.
+    const actorThreadId =
+      message?.message_thread_id ?? callback?.message?.message_thread_id;
+    const fromUser = callback?.from ?? message?.from;
+    /**
+     * Display name NEVER renders empty (the empty-label fix): operator
+     * alias/config when one exists → first_name + last_name → username →
+     * `Usuario <id>`. `last_name` was previously dropped entirely.
+     */
+    const storedAlias = deps.interactions.resolveNameByUserId(chatId, actorId);
+    const actorName = resolveDisplayName({
+      ...(storedAlias !== undefined ? { alias: storedAlias } : {}),
+      ...(fromUser?.first_name !== undefined ? { firstName: fromUser.first_name } : {}),
+      ...(fromUser?.last_name !== undefined ? { lastName: fromUser.last_name } : {}),
+      ...(fromUser?.username !== undefined ? { username: fromUser.username } : {}),
+      userId: actorId,
+    });
 
     if (!isAuthorized(deps.allowlist, actorId)) {
       logger.info({ userId: actorId, chatId, updateId }, 'Rejected unauthorized Telegram user');
@@ -223,12 +254,79 @@ export function createWebhookHandler(deps: WebhookDeps) {
       logger.info({ userId: actorId, updateId }, 'Ignored duplicate Telegram update');
       return { ok: true };
     }
+
+    /**
+     * Forum topic gate (Mode B only — skipped when no mapping is
+     * configured). Mapped operators may act ONLY inside their assigned
+     * topic. Rejections execute NOTHING: no session, no draft, no
+     * interaction, no Gemini, no MOCK — just the guide reply.
+     */
+    const operatorTopics: OperatorTopics = deps.operatorTopics ?? new Map();
+    const assignedThread = operatorTopics.get(actorId);
+    if (assignedThread !== undefined) {
+      if (actorThreadId === undefined) {
+        // Outside every assigned topic (General included — its id is
+        // never assumed): guide, never operate.
+        auditor.record({
+          chatId,
+          actorTelegramUserId: actorId,
+          actorName,
+          actionType: 'topic.blocked_outside',
+          ...(updateId !== undefined ? { metadata: { updateId } } : {}),
+        });
+        await deps.client.sendMessage({ chatId, text: topicGuideText(actorName) });
+        return { ok: true };
+      }
+      if (actorThreadId !== assignedThread) {
+        const threadOwnerId = findTopicOwner(operatorTopics, actorThreadId);
+        if (threadOwnerId !== undefined) {
+          const storedThreadOwner = deps.interactions.resolveNameByUserId(chatId, threadOwnerId);
+          const threadOwnerName = resolveDisplayName({
+            ...(storedThreadOwner !== undefined ? { alias: storedThreadOwner } : {}),
+            userId: threadOwnerId,
+          });
+          auditor.record({
+            chatId,
+            actorTelegramUserId: actorId,
+            actorName,
+            actionType: 'topic.blocked_cross_thread',
+            metadata: {
+              threadId: actorThreadId,
+              ownerUserId: threadOwnerId,
+              ownerName: threadOwnerName,
+            },
+          });
+          await deps.client.sendMessage({
+            chatId,
+            text: topicMismatchText(threadOwnerName),
+            messageThreadId: actorThreadId,
+          });
+          return { ok: true };
+        }
+        auditor.record({
+          chatId,
+          actorTelegramUserId: actorId,
+          actorName,
+          actionType: 'topic.blocked_outside',
+          ...(updateId !== undefined ? { metadata: { threadId: actorThreadId, updateId } } : { metadata: { threadId: actorThreadId } }),
+        });
+        await deps.client.sendMessage({
+          chatId,
+          text: topicGuideText(actorName),
+          messageThreadId: actorThreadId,
+        });
+        return { ok: true };
+      }
+    }
+
     deps.sessions.touchSession(actorId, updateId, chatId);
 
     // Narrowed once here: closures below do not preserve outer narrowing.
     const targetChatId: number = chatId;
     const targetActorId: number = actorId;
     const targetActorName: string | undefined = actorName;
+    /** Forum thread of this update (Mode B match, or any Mode A thread). Replies echo it. */
+    const targetThreadId: number | undefined = actorThreadId;
     const owner: DraftOwner = {
       chatId: targetChatId,
       userId: targetActorId,
@@ -282,6 +380,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       {
         userId: actorId,
         chatId,
+        ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
         ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
         ...(text.length > 0 ? { text } : {}),
         ...(callbackData !== undefined ? { callbackData } : {}),
@@ -353,6 +452,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         type,
         {
           ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
+          ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
           ...(state !== undefined ? { state } : {}),
         },
       );
@@ -406,6 +506,40 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return { ok: false, text: CANCELLED_TEXT };
       }
       return confirmOrCancel('cancel');
+    }
+
+    /**
+     * The ONE allowed activity event: a secrets-free summary of a
+     * confirmed operation, published into the optional activity topic.
+     * Name + month count only — NEVER passwords, PINs, or credentials.
+     * Disabled when no activity topic is configured. Navigation,
+     * per-message noise, and every other event stay out of the topic.
+     */
+    async function publishConfirmedActivity(): Promise<void> {
+      if (deps.activityTopicId === undefined) {
+        return;
+      }
+      const confirmed = deps.drafts.get(owner);
+      const months = confirmed?.months;
+      const summary =
+        months !== undefined
+          ? `✅ Operación confirmada — ${actorName} (${months} mes(es)).`
+          : `✅ Operación confirmada — ${actorName}.`;
+      await deps.client.sendMessage({
+        chatId: targetChatId,
+        text: summary,
+        messageThreadId: deps.activityTopicId,
+      });
+      auditDraft('activity.published', { ...(months !== undefined ? { months } : {}) });
+    }
+
+    /** Confirm path that also emits the activity summary on success. */
+    async function confirmWithActivity(): Promise<DraftResult> {
+      const result = confirmOrCancel('confirm');
+      if (result.ok) {
+        await publishConfirmedActivity();
+      }
+      return result;
     }
 
     /** Cross-actor guard for Corregir: blocked when only a peer owns a draft. */
@@ -505,6 +639,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           chatId: targetChatId,
           text: labeled,
           replyMarkup,
+          ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
         });
       }
       if (callbackId !== undefined) {
@@ -534,6 +669,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           chatId: targetChatId,
           text: withOperator(responseText, targetActorName),
           replyMarkup: markup,
+          ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
         });
       }
       if (callbackId !== undefined) {
@@ -560,9 +696,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
       await sendLabeled(responseText, draftKeyboard(interaction.id));
     }
 
-    /** Actor's latest PENDING OPERATION/DRAFT interaction, if any. */
+    /** Actor's latest PENDING OPERATION/DRAFT interaction in this thread, if any. */
     function activeOperationInteraction(): Interaction | undefined {
-      const active = deps.interactions.getActive(targetChatId, targetActorId);
+      const active = deps.interactions.getActive(targetChatId, targetActorId, targetThreadId);
       if (
         active !== undefined &&
         (active.type === 'OPERATION' || active.type === 'DRAFT')
@@ -718,6 +854,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
               targetActorName,
             ),
             replyMarkup: draftKeyboard(operation.id),
+            ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
           });
         }
         if (callbackId !== undefined) {
@@ -763,7 +900,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           await sendLabeled(text, homeKeyboard(home.id));
           return;
         }
-        const result = kind === 'confirm' ? confirmOrCancel('confirm') : cancelWithIdempotency();
+        const result = kind === 'confirm' ? await confirmWithActivity() : cancelWithIdempotency();
         if (result.ok) {
           if (kind === 'confirm') {
             deps.interactions.confirm(interaction.id);
@@ -852,6 +989,27 @@ export function createWebhookHandler(deps: WebhookDeps) {
           await rejectTap(interaction, action);
           return { ok: true };
         }
+        if (
+          targetThreadId !== undefined &&
+          interaction.messageThreadId !== undefined &&
+          interaction.messageThreadId !== targetThreadId
+        ) {
+          // Cross-thread tap: the interaction belongs to another topic.
+          // Owner already matches, so this is forged/stale — reject with
+          // the toast and mutate NOTHING. Legacy thread-less
+          // interactions stay usable (migration-safe).
+          if (callbackId !== undefined) {
+            await deps.client.answerCallbackQuery(callbackId, {
+              text: crossActionText(interaction.ownerName),
+            });
+          }
+          auditInteraction('interaction.blocked_cross_thread', interaction, {
+            requestedAction: action,
+            threadId: targetThreadId,
+            expectedThreadId: interaction.messageThreadId,
+          });
+          return { ok: true };
+        }
         await executeOwned(action, interaction);
         return { ok: true };
       }
@@ -904,7 +1062,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return { ok: true };
       }
       if (action === 'confirm') {
-        const result = confirmOrCancel('confirm');
+        const result = await confirmWithActivity();
         await respondDraft(result.text, true);
         return { ok: true };
       }
@@ -931,7 +1089,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const parse = decision.parse;
       if (parse.kind === 'command') {
         if (parse.command === 'confirmar') {
-          const result = confirmOrCancel('confirm');
+          const result = await confirmWithActivity();
           await respondDraft(result.text, true);
           return { ok: true };
         }
