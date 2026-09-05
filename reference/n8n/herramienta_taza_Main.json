@@ -1,0 +1,408 @@
+{
+  "name": "herramienta_taza_Main",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -224,
+        128
+      ],
+      "id": "40707b00-8a1f-486f-9050-ac9abe1050eb",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1ftO8Zs4o6Xw6GzkIelMF7eD4aashkZscYTD881UEAsc",
+          "mode": "list",
+          "cachedResultName": "CLIENTES ",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1ftO8Zs4o6Xw6GzkIelMF7eD4aashkZscYTD881UEAsc/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 2020405582,
+          "mode": "list",
+          "cachedResultName": "Tasas_Bot",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1ftO8Zs4o6Xw6GzkIelMF7eD4aashkZscYTD881UEAsc/edit#gid=2020405582"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Dia": "={{ $json.fecha }}",
+            "Tasa USDT": "={{ $json.mi_p2p_final }}",
+            "Tasa EUR": "={{ $json.oficial_bcv_eur }}",
+            "Tasa USD": "={{ $json.oficial_bcv_usd }}",
+            "Promedio Tasa": "={{ $json.tasa_promedio_mix }}",
+            "Tasa 5$": "={{ $json.valor_5_usd }}",
+            "Tasa 7$": "={{ $json.valor_7_usd }}",
+            "Tasa 9$": "={{ $json.valor_9_usd }}",
+            "Tasa 4$": "={{ $json.valor_4_usd }}",
+            "Tasa 15$": "={{ $json.valor_15_usd }}",
+            "Tasa 3,5$": "={{ $json.valor_3_5usd }}",
+            "Tasa 5,5$": "={{ $json.valor_5_5usd }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Dia",
+              "displayName": "Dia",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Tasa USD",
+              "displayName": "Tasa USD",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tasa EUR",
+              "displayName": "Tasa EUR",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tasa USDT",
+              "displayName": "Tasa USDT",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Promedio Tasa",
+              "displayName": "Promedio Tasa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tasa 3,5$",
+              "displayName": "Tasa 3,5$",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tasa 5$",
+              "displayName": "Tasa 5$",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tasa 5,5$",
+              "displayName": "Tasa 5,5$",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tasa 7$",
+              "displayName": "Tasa 7$",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tasa 9$",
+              "displayName": "Tasa 9$",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tasa 4$",
+              "displayName": "Tasa 4$",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tasa 15$",
+              "displayName": "Tasa 15$",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        976,
+        112
+      ],
+      "id": "70134539-5e27-4ac3-86ae-78c398d5dd24",
+      "name": "tasas_promedio_registro",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "h8q6Kl3uFfVltYoV",
+          "name": "Google Sheets - Gabriel"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const fecha_hoy = new Date().toISOString().split('T')[0];\n\nlet bcv_dolar = 0.0;\nlet bcv_euro = 0.0;\nlet p2p_usdt = 0.0;\n\nfor (const item of items) {\n  const datos = item.json;\n\n  // --- PROCESAR DATOS BCV ---\n  if ('tasa_dolar' in datos) {\n    const txt_dolar = datos['tasa_dolar'].replace(',', '.').trim();\n    bcv_dolar = parseFloat(txt_dolar);\n\n    const txt_euro = datos['tasa_euro'].replace(',', '.').trim();\n    bcv_euro = parseFloat(txt_euro);\n  }\n\n  // --- PROCESAR DATOS API (P2P) ---\n  if ('promedio' in datos) {\n    p2p_usdt = parseFloat(datos['promedio']);\n  }\n}\n\n// --- CÁLCULOS ---\nconst p2p_con_aumento = p2p_usdt * 1.05;\n\nreturn [{\n  json: {\n    fecha: fecha_hoy,\n    oficial_bcv_usd: Math.round(bcv_dolar * 100) / 100,\n    oficial_bcv_eur: Math.round(bcv_euro * 100) / 100,\n    mi_p2p_final: Math.round(p2p_con_aumento * 100) / 100,\n    mercado_p2p_base: Math.round(p2p_usdt * 100) / 100\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        112
+      ],
+      "id": "8d2b14df-4431-4649-9042-2ecb25bc4640",
+      "name": "limpia_entrega_datos"
+    },
+    {
+      "parameters": {
+        "operation": "extractHtmlContent",
+        "extractionValues": {
+          "values": [
+            {
+              "key": "tasa_dolar",
+              "cssSelector": "#dolar strong"
+            },
+            {
+              "key": "tasa_euro",
+              "cssSelector": "#euro strong"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.html",
+      "typeVersion": 1.2,
+      "position": [
+        176,
+        0
+      ],
+      "id": "669ff8d6-be77-455c-8dba-e0f8307c55ef",
+      "name": "HTML"
+    },
+    {
+      "parameters": {
+        "url": "https://www.bcv.org.ve/glosario/cambio-oficial",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+          ]
+        },
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        0,
+        0
+      ],
+      "id": "3af72e72-47e5-4700-b03e-f5f45d53a7da",
+      "name": "BCV - v2 - HTTP Request",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "https://ve.dolarapi.com/v1/dolares/paralelo",
+        "options": {
+          "allowUnauthorizedCerts": false
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        0,
+        208
+      ],
+      "id": "c44ea145-0db9-4ad3-a0f2-9e3ffaa953eb",
+      "name": "USDT - v2 - HTTP Request1",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        432,
+        112
+      ],
+      "id": "d3581178-46bd-4df0-8ab1-eb4c61211cc1",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "for (const item of items) {\n  const datos = item.json;\n\n  // 1. RECUPERAMOS LOS 4 VALORES QUE QUIERES CONSERVAR\n  const fecha = datos['fecha'];\n  const bcv_usd = datos['oficial_bcv_usd'];\n  const bcv_eur = datos['oficial_bcv_eur'];\n  const p2p_final = datos['mi_p2p_final'];\n\n  // 2. CÁLCULO DE LA TASA PROMEDIO (Euro + Tu P2P / 2)\n  const promedio_calculado = (bcv_eur + p2p_final) / 2;\n\n  // 3. CÁLCULOS DE LOS PACKS\n  const valor_5_5 = promedio_calculado * 5.5;\n  const valor_3_5 = promedio_calculado * 3.5;\n  const valor_5 = promedio_calculado * 5;\n  const valor_7 = promedio_calculado * 7;\n  const valor_9 = promedio_calculado * 9;\n  const valor_4 = promedio_calculado * 4;\n  const valor_15 = promedio_calculado * 15;\n\n  // 4. LIMPIEZA Y ENTREGA FINAL\n  item.json = {\n    fecha: fecha,\n    oficial_bcv_usd: bcv_usd,\n    oficial_bcv_eur: bcv_eur,\n    mi_p2p_final: p2p_final,\n    tasa_promedio_mix: Math.round(promedio_calculado * 100) / 100,\n    valor_5_5usd: Math.round(valor_5_5 * 100) / 100,\n    valor_3_5usd: Math.round(valor_3_5 * 100) / 100,\n    valor_5_usd: Math.round(valor_5 * 100) / 100,\n    valor_7_usd: Math.round(valor_7 * 100) / 100,\n    valor_9_usd: Math.round(valor_9 * 100) / 100,\n    valor_4_usd: Math.round(valor_4 * 100) / 100,\n    valor_15_usd: Math.round(valor_15 * 100) / 100\n  };\n}\n\nreturn items;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        816,
+        112
+      ],
+      "id": "b998e091-de6c-4485-8d1c-92cd560979d4",
+      "name": "calculo_promedio"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "USDT - v2 - HTTP Request1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "BCV - v2 - HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "limpia_entrega_datos": {
+      "main": [
+        [
+          {
+            "node": "calculo_promedio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BCV - v2 - HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "USDT - v2 - HTTP Request1": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "HTML": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "limpia_entrega_datos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "calculo_promedio": {
+      "main": [
+        [
+          {
+            "node": "tasas_promedio_registro",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "dde5b065-6f43-478e-ae77-8351f33bcf6f",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "c8869a2545940b63bcc7e27c1e887019ceb0649bcaee3ff24fb6506e7689e0b5"
+  },
+  "id": "wlvYLNfP2bXaErO5",
+  "tags": [
+    {
+      "updatedAt": "2026-08-04T19:29:40.396Z",
+      "createdAt": "2026-08-04T19:29:40.396Z",
+      "id": "m61nG5GllhrvBKMY",
+      "name": "Flujo TV"
+    }
+  ]
+}

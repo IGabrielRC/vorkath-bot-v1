@@ -1,0 +1,29 @@
+{
+  "name": "vokath-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vokath Bot v1 — Telegram-first MOCK-first live shell (Fase 1)",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/app.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/app.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "fastify": "^5.0.0",
+    "pino": "^10.1.0",
+    "xlsx": "^0.18.5",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}
