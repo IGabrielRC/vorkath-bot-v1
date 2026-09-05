@@ -18,6 +18,7 @@ export type FastParseResult =
   | { kind: 'email'; value: string }
   | { kind: 'months'; months: number }
   | { kind: 'service'; value: 'netflix' | 'flujotv' }
+  | { kind: 'account'; value: string }
   | { kind: 'none' };
 
 /** Minimum digit count for a phone match — the phone-vs-months guard. */
@@ -95,8 +96,44 @@ export function parseService(text: string): { kind: 'service'; value: 'netflix' 
 }
 
 /**
- * Deterministic cascade: command → email → phone → months → service → none.
- * "none" means the router must fall through to L3 (Gemini intent-only).
+ * Neutral account-identifier recognition (the FlujoTV root-cause fix).
+ *
+ * FlujoTV CORREO values are bare usernames WITHOUT '@' (`cmaxnet001`,
+ * `maxnet001`, … — zero '@' in the whole FlujoTV sheet), while Netflix
+ * CORREO values are real emails. The old cascade only knew `email`
+ * (requires '@'), so a FlujoTV username fell through to `none` → L3
+ * UNKNOWN and was never searched — even though the store matches CORREO
+ * substrings. This kind closes that gap WITHOUT assuming email=Netflix:
+ * any single-token identifier (username, account, email without '@')
+ * becomes a deterministic repo search, and the returned `servicio` comes
+ * from the data row itself.
+ *
+ * Guarded to avoid stealing conversational text: single token only (no
+ * whitespace, so "quiero buscar un cliente" stays `none`), 3–64 chars,
+ * identifier charset, and MUST contain a digit (plain words like "hola"
+ * or "buscar" keep falling through to L3). Every real FlujoTV username
+ * in the fixture contains digits.
+ */
+export function parseAccountIdentifier(
+  text: string,
+): { kind: 'account'; value: string } | null {
+  const token = text.trim();
+  if (token.length < 3 || token.length > 64 || /\s/.test(token)) {
+    return null;
+  }
+  if (!/\d/.test(token)) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9._%+-]+$/.test(token)) {
+    return null;
+  }
+  return { kind: 'account', value: token.toLowerCase() };
+}
+
+/**
+ * Deterministic cascade: command → email → phone → months → service →
+ * account → none. "none" means the router must fall through to L3
+ * (Gemini intent-only).
  */
 export function parseFast(text: string): FastParseResult {
   const trimmed = text.trim();
@@ -108,6 +145,7 @@ export function parseFast(text: string): FastParseResult {
     parseEmail(trimmed) ??
     parsePhone(trimmed) ??
     parseMonths(trimmed) ??
-    parseService(trimmed) ?? { kind: 'none' }
+    parseService(trimmed) ??
+    parseAccountIdentifier(trimmed) ?? { kind: 'none' }
   );
 }

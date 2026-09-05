@@ -1,6 +1,6 @@
 import type { Intent, IntentInterpreter } from '../ai/intentInterpreter';
 import { type FastParseResult, parseFast } from '../parser/fast';
-import { parseCallback } from '../telegram/keyboards';
+import { parseCallbackData } from '../telegram/keyboards';
 
 /**
  * Hybrid router cascade: L1 exact-callback → L2 fast-parser → L3 Gemini.
@@ -13,12 +13,14 @@ export interface RouterCtx {
   userId: number;
   /** Shared-group chat id (context only — routing never assumes private chat). */
   chatId?: number;
+  /** Acting operator display name — forwarded to Gemini, never a peer's. */
+  ownerName?: string;
   text?: string;
   callbackData?: string;
 }
 
 export type RouterDecision =
-  | { layer: 'L1'; action: string }
+  | { layer: 'L1'; action: string; interactionId?: string }
   | { layer: 'L2'; parse: FastParseResult }
   | { layer: 'L3'; intent: Intent }
   | { layer: 'noop'; reason: string };
@@ -26,12 +28,18 @@ export type RouterDecision =
 /**
  * Routes one update. The interpreter is invoked only when L1 and L2
  * both miss — pass a StubIntentInterpreter in tests to prove it.
+ * L1 callbacks resolve through interaction-bound data when present
+ * (`v1:<short>:<interactionId>`); legacy unbound buttons carry no id.
  */
 export async function route(ctx: RouterCtx, interpreter: IntentInterpreter): Promise<RouterDecision> {
   if (ctx.callbackData !== undefined) {
-    const action = parseCallback(ctx.callbackData);
-    if (action !== null) {
-      return { layer: 'L1', action };
+    const parsed = parseCallbackData(ctx.callbackData);
+    if (parsed !== null) {
+      return {
+        layer: 'L1',
+        action: parsed.action,
+        ...(parsed.interactionId !== undefined ? { interactionId: parsed.interactionId } : {}),
+      };
     }
     return { layer: 'noop', reason: 'stale-callback' };
   }
@@ -50,7 +58,11 @@ export async function route(ctx: RouterCtx, interpreter: IntentInterpreter): Pro
     if (parse.kind !== 'none') {
       return { layer: 'L2', parse };
     }
-    const intent = await interpreter.interpret(text, { userId: ctx.userId });
+    const intent = await interpreter.interpret(text, {
+      userId: ctx.userId,
+      ...(ctx.chatId !== undefined ? { chatId: ctx.chatId } : {}),
+      ...(ctx.ownerName !== undefined ? { ownerName: ctx.ownerName } : {}),
+    });
     return { layer: 'L3', intent };
   }
 

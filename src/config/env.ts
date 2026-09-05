@@ -42,6 +42,7 @@ const envSchema = z.object({
   REGISTER_TELEGRAM_WEBHOOK: z.enum(['true', 'false']).default('false'),
   MOCK_STATE_PATH: z.string().min(1).default('/data/mock-state.json'),
   DRAFTS_STATE_PATH: z.string().min(1).default('/data/drafts-state.json'),
+  INTERACTIONS_STATE_PATH: z.string().min(1).default('/data/interactions-state.json'),
 });
 
 export type Env = z.infer<typeof envSchema>;

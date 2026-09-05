@@ -163,7 +163,8 @@ describe('webhook navigation: /start → Home → Buscar → volver → Home', (
 
     const start = await world.post(messageUpdate(world.nextUpdateId(), GABRIEL, '/start'));
     expect(start).toEqual({ status: 200, body: { ok: true } });
-    expect(world.client.texts()[0]).toBe(HOME_TEXT);
+    expect(world.client.texts()[0]).toContain(HOME_TEXT);
+    expect(world.client.texts()[0]).toContain('👤 Operador:');
     expect(world.interpreter.calls).toBe(0);
     expect(world.sessions.getSession(GABRIEL, GROUP)).toBeDefined();
 
@@ -174,7 +175,7 @@ describe('webhook navigation: /start → Home → Buscar → volver → Home', (
     expect(world.interpreter.calls).toBe(0);
 
     await world.post(callbackUpdate(world.nextUpdateId(), GABRIEL, callbackData('back')));
-    expect(world.client.texts().at(-1)).toBe(HOME_TEXT);
+    expect(world.client.texts().at(-1)).toContain(HOME_TEXT);
     expect(world.interpreter.calls).toBe(0);
 
     await world.app.close();
@@ -237,10 +238,10 @@ describe('webhook demo draft 1 → 2 → confirm/cancel with session isolation',
     expect(world.client.texts().at(-1)).toContain('Borrador actualizado: 2 mes(es)');
 
     await world.post(callbackUpdate(world.nextUpdateId(), GABRIEL, callbackData('confirm')));
-    expect(world.client.texts().at(-1)).toBe('✅ Operación MOCK confirmada');
+    expect(world.client.texts().at(-1)).toContain('✅ Operación MOCK confirmada');
 
     await world.post(messageUpdate(world.nextUpdateId(), GABRIEL, 'cancelar'));
-    expect(world.client.texts().at(-1)).toBe('Sin borrador abierto que cancelar.');
+    expect(world.client.texts().at(-1)).toContain('Sin borrador abierto que cancelar.');
     await world.app.close();
   });
 
@@ -249,7 +250,7 @@ describe('webhook demo draft 1 → 2 → confirm/cancel with session isolation',
 
     await world.post(callbackUpdate(world.nextUpdateId(), GABRIEL, callbackData('operar')));
     await world.post(messageUpdate(world.nextUpdateId(), EDWARD, 'mejor hazlo 3 meses'));
-    expect(world.client.texts().at(-1)).toBe(
+    expect(world.client.texts().at(-1)).toContain(
       'No hay borrador abierto. Usa ⚡OPERAR para crear uno.',
     );
 
@@ -263,7 +264,7 @@ describe('webhook demo draft 1 → 2 → confirm/cancel with session isolation',
     expect(world.drafts.get({ chatId: GROUP, userId: EDWARD })?.months).toBe(2);
 
     await world.post(callbackUpdate(world.nextUpdateId(), EDWARD, callbackData('cancel')));
-    expect(world.client.texts().at(-1)).toBe('❌ Operación cancelada');
+    expect(world.client.texts().at(-1)).toContain('❌ Operación cancelada');
     expect(world.drafts.get({ chatId: GROUP, userId: GABRIEL })?.status).toBe('open');
     await world.app.close();
   });

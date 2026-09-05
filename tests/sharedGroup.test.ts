@@ -288,7 +288,8 @@ describe('shared group operation (chat.id = context, from.id = operator)', () =>
     const world = await createGroupWorld();
     await world.post(groupCallback(world.nextUpdateId(), GABRIEL, callbackData('operar')));
     await world.post(groupCallback(world.nextUpdateId(), EDWARD, callbackData('confirm')));
-    expect(world.client.texts().at(-1)).toBe('⚠️ Esta operación pertenece a Gabriel.');
+    expect(world.client.texts().at(-1)).toContain('⚠️ Esta operación pertenece a Gabriel.');
+    expect(world.client.texts().at(-1)).toContain('👤 Operador: Edward');
     expect(gabrielDraft(world)?.status).toBe('open');
     expect(edwardDraft(world)).toBeUndefined();
     await world.app.close();
@@ -298,7 +299,8 @@ describe('shared group operation (chat.id = context, from.id = operator)', () =>
     const world = await createGroupWorld();
     await world.post(groupCallback(world.nextUpdateId(), EDWARD, callbackData('operar')));
     await world.post(groupCallback(world.nextUpdateId(), GABRIEL, callbackData('cancel')));
-    expect(world.client.texts().at(-1)).toBe('⚠️ Esta operación pertenece a Edward.');
+    expect(world.client.texts().at(-1)).toContain('⚠️ Esta operación pertenece a Edward.');
+    expect(world.client.texts().at(-1)).toContain('👤 Operador: Gabriel');
     expect(edwardDraft(world)?.status).toBe('open');
     expect(gabrielDraft(world)).toBeUndefined();
     await world.app.close();
@@ -317,7 +319,8 @@ describe('shared group operation (chat.id = context, from.id = operator)', () =>
     await world.post(groupMessage(world.nextUpdateId(), EDWARD, 'volver'));
     expect(gabrielDraft(world)?.status).toBe('open');
     expect(gabrielDraft(world)?.months).toBe(3);
-    expect(world.client.texts().at(-1)).toBe(HOME_TEXT);
+    expect(world.client.texts().at(-1)).toContain(HOME_TEXT);
+    expect(world.client.texts().at(-1)).toContain('👤 Operador: Edward');
     await world.app.close();
   });
 
@@ -396,14 +399,14 @@ describe('shared group Fase 1 fixes (cancel loop, volver, FlujoTV)', () => {
     const world = await createGroupWorld();
     await world.post(groupCallback(world.nextUpdateId(), GABRIEL, callbackData('operar')));
     await world.post(groupCallback(world.nextUpdateId(), GABRIEL, callbackData('cancel')));
-    expect(world.client.texts().at(-1)).toBe('❌ Operación cancelada');
+    expect(world.client.texts().at(-1)).toContain('❌ Operación cancelada');
     const afterCancel = world.client.lastPayloadJson();
     expect(afterCancel).toContain('OPERAR');
     expect(afterCancel).not.toContain('Confirmar');
     expect(afterCancel).not.toContain('Cancelar');
-    // Tapping cancel again is a dead end on Home, never a loop.
+    // Tapping cancel again is idempotent — no loop, no recreation.
     await world.post(groupMessage(world.nextUpdateId(), GABRIEL, 'cancelar'));
-    expect(world.client.texts().at(-1)).toBe('Sin borrador abierto que cancelar.');
+    expect(world.client.texts().at(-1)).toContain('Esta operación ya fue cancelada.');
     expect(world.client.lastPayloadJson()).toContain('OPERAR');
     await world.app.close();
   });
@@ -413,7 +416,8 @@ describe('shared group Fase 1 fixes (cancel loop, volver, FlujoTV)', () => {
     await world.post(groupCallback(world.nextUpdateId(), GABRIEL, callbackData('operar')));
     await world.post(groupMessage(world.nextUpdateId(), GABRIEL, 'hazlo 2 meses'));
     await world.post(groupCallback(world.nextUpdateId(), GABRIEL, callbackData('back')));
-    expect(world.client.texts().at(-1)).toBe(HOME_TEXT);
+    expect(world.client.texts().at(-1)).toContain(HOME_TEXT);
+    expect(world.client.texts().at(-1)).toContain('👤 Operador: Gabriel');
     expect(gabrielDraft(world)?.status).toBe('open');
     expect(gabrielDraft(world)?.months).toBe(2);
     await world.app.close();

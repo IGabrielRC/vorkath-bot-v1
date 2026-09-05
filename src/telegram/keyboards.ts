@@ -22,7 +22,14 @@ export type CallbackAction =
   | 'back'
   | 'confirm'
   | 'correct'
-  | 'cancel';
+  | 'cancel'
+  | 'view0'
+  | 'view1'
+  | 'view2'
+  | 'view3'
+  | 'view4'
+  | 'next'
+  | 'prev';
 
 const SHORT_IDS: Record<CallbackAction, string> = {
   home: 'home',
@@ -36,6 +43,13 @@ const SHORT_IDS: Record<CallbackAction, string> = {
   confirm: 'ok',
   correct: 'fix',
   cancel: 'no',
+  view0: 'w0',
+  view1: 'w1',
+  view2: 'w2',
+  view3: 'w3',
+  view4: 'w4',
+  next: 'nx',
+  prev: 'pv',
 };
 
 export interface InlineKeyboardButton {
@@ -52,6 +66,22 @@ export function callbackData(action: CallbackAction): string {
   return `${CALLBACK_VERSION}:${SHORT_IDS[action]}`;
 }
 
+/**
+ * Interaction-bound callback_data (`v1:<short>:<interactionId>`). Every
+ * interactive button carries its interaction id so the server can resolve
+ * ownership (chat → owner → state) before executing anything. The 8-hex
+ * interaction ids keep every variant far below the 64-byte cap.
+ */
+export function callbackDataFor(action: CallbackAction, interactionId: string): string {
+  return `${CALLBACK_VERSION}:${SHORT_IDS[action]}:${interactionId}`;
+}
+
+export interface ParsedCallback {
+  action: CallbackAction;
+  /** Present on interaction-bound buttons; absent on legacy buttons. */
+  interactionId?: string;
+}
+
 /** Every callback_data this shell can route. Unknown ids are stale → safe no-op. */
 export const KNOWN_CALLBACK_IDS: readonly string[] = (
   Object.keys(SHORT_IDS) as CallbackAction[]
@@ -63,10 +93,46 @@ const idToAction = new Map<string, CallbackAction>(
 
 /** Resolves callback_data to an action, or null for stale/unknown data. */
 export function parseCallback(data: string | undefined): CallbackAction | null {
+  return parseCallbackData(data)?.action ?? null;
+}
+
+/**
+ * Resolves callback_data to action + optional interaction id. Legacy
+ * unbound buttons (`v1:<short>`) yield no interactionId; bound buttons
+ * (`v1:<short>:<id>`) yield it. Anything else is stale → null.
+ */
+export function parseCallbackData(data: string | undefined): ParsedCallback | null {
   if (typeof data !== 'string' || data.length === 0) {
     return null;
   }
-  return idToAction.get(data) ?? null;
+  const direct = idToAction.get(data);
+  if (direct !== undefined) {
+    return { action: direct };
+  }
+  const parts = data.split(':');
+  if (parts.length === 3 && parts[0] === CALLBACK_VERSION) {
+    const action = idToAction.get(`${parts[0]}:${parts[1]}`);
+    const interactionId = parts[2];
+    if (action !== undefined && interactionId !== undefined && interactionId.length > 0) {
+      return { action, interactionId };
+    }
+  }
+  return null;
+}
+
+/**
+ * Visual ownership label. Backend enforcement is the real security; this
+ * line only shows who owns the interaction. Every button-bearing message
+ * (or message expecting continuation) carries it via `withOperator`.
+ */
+export function operatorLabel(name: string | undefined): string {
+  const display = name !== undefined && name.trim() !== '' ? name : 'Operador';
+  return `👤 Operador: ${display}`;
+}
+
+/** Appends the ownership label line to an interactive message. */
+export function withOperator(text: string, name: string | undefined): string {
+  return `${text}\n${operatorLabel(name)}`;
 }
 
 export const HOME_TEXT = '🏠 Vokath — ¿qué hacemos hoy?';
@@ -86,35 +152,101 @@ function button(text: string, action: CallbackAction): InlineKeyboardButton {
   return { text, callback_data: callbackData(action) };
 }
 
-export function backButton(): InlineKeyboardButton {
-  return button('←Volver', 'back');
+function ownedButton(
+  text: string,
+  action: CallbackAction,
+  interactionId: string | undefined,
+): InlineKeyboardButton {
+  if (interactionId === undefined) {
+    return { text, callback_data: callbackData(action) };
+  }
+  return { text, callback_data: callbackDataFor(action, interactionId) };
 }
 
-/** /start Home keyboard: six spec buttons. */
-export function homeKeyboard(): InlineKeyboardMarkup {
+export function backButton(interactionId?: string): InlineKeyboardButton {
+  return ownedButton('←Volver', 'back', interactionId);
+}
+
+/** /start Home keyboard: six spec buttons (owned when interactionId set). */
+export function homeKeyboard(interactionId?: string): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [button('⚡OPERAR', 'operar'), button('🔎BUSCAR', 'buscar')],
-      [button('⏰VENCIDOS', 'vencidos'), button('📦INVENTARIO', 'inventario')],
-      [button('💰CAJA', 'caja'), button('⋯MÁS', 'mas')],
+      [
+        ownedButton('⚡OPERAR', 'operar', interactionId),
+        ownedButton('🔎BUSCAR', 'buscar', interactionId),
+      ],
+      [
+        ownedButton('⏰VENCIDOS', 'vencidos', interactionId),
+        ownedButton('📦INVENTARIO', 'inventario', interactionId),
+      ],
+      [
+        ownedButton('💰CAJA', 'caja', interactionId),
+        ownedButton('⋯MÁS', 'mas', interactionId),
+      ],
     ],
   };
 }
 
 /** Section placeholder keyboard: contextual text + ←Volver to Home. */
-export function sectionKeyboard(section: string): InlineKeyboardMarkup {
+export function sectionKeyboard(section: string, interactionId?: string): InlineKeyboardMarkup {
   void section;
   return {
-    inline_keyboard: [[backButton()]],
+    inline_keyboard: [[backButton(interactionId)]],
   };
 }
 
 /** Draft actions: Confirmar / Corregir / Cancelar + ←Volver to Home. */
-export function draftKeyboard(): InlineKeyboardMarkup {
+export function draftKeyboard(interactionId?: string): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [button('✅Confirmar', 'confirm'), button('✏️Corregir', 'correct')],
-      [button('❌Cancelar', 'cancel'), backButton()],
+      [
+        ownedButton('✅Confirmar', 'confirm', interactionId),
+        ownedButton('✏️Corregir', 'correct', interactionId),
+      ],
+      [ownedButton('❌Cancelar', 'cancel', interactionId), backButton(interactionId)],
     ],
   };
+}
+
+const VIEW_ACTIONS: CallbackAction[] = ['view0', 'view1', 'view2', 'view3', 'view4'];
+
+/**
+ * Search-result keyboard: one owned "Ver cliente" button per shown row
+ * (index within the page), plus Siguiente/Anterior pagination when the
+ * interaction has more pages, plus ←Volver. Every button carries the
+ * SEARCH interaction id — a peer tapping them is rejected by owner.
+ */
+export function searchResultsKeyboard(
+  shown: number,
+  opts?: { interactionId?: string; hasNext?: boolean; hasPrev?: boolean },
+): InlineKeyboardMarkup {
+  const interactionId = opts?.interactionId;
+  const rows: InlineKeyboardButton[][] = [];
+  const numerals = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+  const viewRow: InlineKeyboardButton[] = [];
+  for (let index = 0; index < shown && index < VIEW_ACTIONS.length; index += 1) {
+    const action = VIEW_ACTIONS[index];
+    if (action === undefined) {
+      continue;
+    }
+    viewRow.push(ownedButton(`${numerals[index] ?? '•'} Ver cliente`, action, interactionId));
+    if (viewRow.length === 2) {
+      rows.push(viewRow.splice(0, 2));
+    }
+  }
+  if (viewRow.length > 0) {
+    rows.push(viewRow.splice(0, 2));
+  }
+  const navRow: InlineKeyboardButton[] = [];
+  if (opts?.hasPrev === true) {
+    navRow.push(ownedButton('←Anterior', 'prev', interactionId));
+  }
+  if (opts?.hasNext === true) {
+    navRow.push(ownedButton('Siguiente→', 'next', interactionId));
+  }
+  if (navRow.length > 0) {
+    rows.push(navRow);
+  }
+  rows.push([backButton(interactionId)]);
+  return { inline_keyboard: rows };
 }

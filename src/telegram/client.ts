@@ -13,15 +13,21 @@ export interface EditMessageOpts {
   replyMarkup?: InlineKeyboardMarkup;
 }
 
+export interface AnswerCallbackOpts {
+  /** Shown as a toast on ownership rejections (e.g. cross-actor taps). */
+  text?: string;
+}
+
 /**
  * Minimal Telegram Bot API client (send/edit/answer). HTTP only — no
  * business logic lives here; the router decides what to send.
  * See: https://core.telegram.org/bots/api#sendmessage
+ * See: https://core.telegram.org/bots/api#answercallbackquery
  */
 export interface TelegramClient {
   sendMessage(opts: SendMessageOpts): Promise<unknown>;
   editMessageText(opts: EditMessageOpts): Promise<unknown>;
-  answerCallbackQuery(callbackQueryId: string): Promise<unknown>;
+  answerCallbackQuery(callbackQueryId: string, opts?: AnswerCallbackOpts): Promise<unknown>;
 }
 
 type FetchFn = typeof globalThis.fetch;
@@ -52,8 +58,11 @@ export class HttpTelegramClient implements TelegramClient {
     });
   }
 
-  async answerCallbackQuery(callbackQueryId: string): Promise<unknown> {
-    return this.call('answerCallbackQuery', { callback_query_id: callbackQueryId });
+  async answerCallbackQuery(callbackQueryId: string, opts?: AnswerCallbackOpts): Promise<unknown> {
+    return this.call('answerCallbackQuery', {
+      callback_query_id: callbackQueryId,
+      ...(opts?.text !== undefined ? { text: opts.text } : {}),
+    });
   }
 
   private async call(method: string, payload: Record<string, unknown>): Promise<unknown> {

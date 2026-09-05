@@ -22,8 +22,16 @@ export const intentSchema = z.object({
 
 export type Intent = z.infer<typeof intentSchema>;
 
+/**
+ * Per-actor context for Gemini. The interpreter receives ONLY the acting
+ * operator's identity (chatId + userId + display name) — never the shared
+ * group's mutable session, never a peer's draft/search state. Intent-only:
+ * the model classifies, the app executes deterministically.
+ */
 export interface SessionCtx {
   userId: number;
+  chatId?: number;
+  ownerName?: string;
 }
 
 export interface IntentInterpreter {
@@ -119,7 +127,12 @@ export class GenaiIntentInterpreter implements IntentInterpreter {
   }
 
   async interpret(text: string, ctx: SessionCtx): Promise<Intent> {
-    const prompt = `${SYSTEM_PROMPT}\nUser ${ctx.userId} says: ${text}`;
+    const who =
+      ctx.ownerName !== undefined
+        ? `User ${ctx.userId} (${ctx.ownerName})`
+        : `User ${ctx.userId}`;
+    const where = ctx.chatId !== undefined ? ` in chat ${ctx.chatId}` : '';
+    const prompt = `${SYSTEM_PROMPT}\n${who}${where} says: ${text}`;
     try {
       const raw = await this.withTimeout(this.generate(prompt));
       const parsedJson: unknown = JSON.parse(raw);

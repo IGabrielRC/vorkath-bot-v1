@@ -5,6 +5,7 @@ import { parseAuthorizedChatIds, parseAuthorizedIds } from './auth/allowlist';
 import { type Auditor, createAuditor } from './audit/audit';
 import { loadEnv, type Env } from './config/env';
 import { DraftEngine } from './drafts/engine';
+import { InteractionStore } from './interactions/interactions';
 import { MockStore } from './mock/mockStore';
 import { MockAccountRepositories, type MockRepositories } from './mock/repositories';
 import { SessionStore } from './session/store';
@@ -30,12 +31,15 @@ export interface AppDeps {
   chatAllowlist?: Set<number>;
   sessions?: SessionStore;
   drafts?: DraftEngine;
+  interactions?: InteractionStore;
   interpreter?: IntentInterpreter;
   repos?: MockRepositories;
   client?: TelegramClient;
   auditor?: Auditor;
   /** Draft snapshot path; undefined disables best-effort persist (tests). */
   draftsStatePath?: string;
+  /** Interaction snapshot path; undefined disables best-effort persist (tests). */
+  interactionsStatePath?: string;
 }
 
 export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInstance {
@@ -46,6 +50,7 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
     deps.chatAllowlist ?? parseAuthorizedChatIds(env.AUTHORIZED_TELEGRAM_CHAT_IDS);
   const sessions = deps.sessions ?? new SessionStore();
   const drafts = deps.drafts ?? new DraftEngine();
+  const interactions = deps.interactions ?? new InteractionStore();
   const interpreter =
     deps.interpreter ??
     new GenaiIntentInterpreter({ apiKey: env.GEMINI_API_KEY, model: env.GEMINI_MODEL });
@@ -58,11 +63,15 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
     chatAllowlist,
     sessions,
     drafts,
+    interactions,
     interpreter,
     repos,
     client,
     auditor,
     ...(deps.draftsStatePath !== undefined ? { draftsStatePath: deps.draftsStatePath } : {}),
+    ...(deps.interactionsStatePath !== undefined
+      ? { interactionsStatePath: deps.interactionsStatePath }
+      : {}),
   });
 
   app.get('/health', async () => {
@@ -109,9 +118,10 @@ export async function startApp(): Promise<void> {
     }
   }
 
-  // Drafts never expire: restore the snapshot so a restart loses nothing.
-  // Missing file = first boot. A corrupt/failed load boots empty rather
-  // than crashing — the group flow recreates drafts on demand.
+  // Drafts + interactions never expire: restore both snapshots so a
+  // restart loses nothing. Missing files = first boot. A corrupt/failed
+  // load boots empty rather than crashing — the group flow recreates
+  // state on demand.
   const drafts = new DraftEngine();
   try {
     await drafts.loadFromFile(env.DRAFTS_STATE_PATH);
@@ -120,7 +130,24 @@ export async function startApp(): Promise<void> {
     logger.error(error, 'Failed to load draft snapshot — booting with empty drafts');
   }
 
-  const app = buildApp(env, { repos, drafts, draftsStatePath: env.DRAFTS_STATE_PATH });
+  const interactions = new InteractionStore();
+  try {
+    await interactions.loadFromFile(env.INTERACTIONS_STATE_PATH);
+    logger.info(
+      { interactions: interactions.snapshot().length },
+      'Interaction snapshot loaded',
+    );
+  } catch (error) {
+    logger.error(error, 'Failed to load interaction snapshot — booting with empty interactions');
+  }
+
+  const app = buildApp(env, {
+    repos,
+    drafts,
+    interactions,
+    draftsStatePath: env.DRAFTS_STATE_PATH,
+    interactionsStatePath: env.INTERACTIONS_STATE_PATH,
+  });
   await app.listen({ host: '0.0.0.0', port: env.PORT });
   logger.info({ port: env.PORT }, 'Vokath bot listening');
 }
