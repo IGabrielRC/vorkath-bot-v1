@@ -1,3 +1,5 @@
+import type { ServiceAccount } from './accounts';
+import { groupRowsIntoAccounts } from './accounts';
 import type { Customer } from './customers';
 import { groupRowsIntoCustomers } from './customers';
 import type { MockAccount, MockService } from './excelLoader';
@@ -39,6 +41,7 @@ export interface MockRepositories {
    * no CORREO/CONTRASEÑA/PIN.
    */
   searchCustomersByPhone(query: string): Promise<Customer[]>;
+  searchServiceAccounts(identifier: string): Promise<ServiceAccount[]>;
   getExpiredAccounts(): Promise<SafeAccount[]>;
   getInventorySummary(): Promise<InventorySummary[]>;
 }
@@ -63,6 +66,18 @@ export class MockAccountRepositories implements MockRepositories {
 
   async searchCustomersByPhone(query: string): Promise<Customer[]> {
     return groupRowsIntoCustomers(this.store.searchByPhone(query));
+  }
+
+  /**
+   * Read-only neutral account search: exact-identifier row matching
+   * (`MockStore.searchByAccountIdentifier`, both services, no service
+   * question) grouped into accounts HERE (domain layer — one account
+   * per service+identifier, rows = profiles/slots). Safe by
+   * construction: accounts carry derived status + PAIS_CUENTA only,
+   * no CORREO-adjacent secrets (no CONTRASEÑA/PIN).
+   */
+  async searchServiceAccounts(identifier: string): Promise<ServiceAccount[]> {
+    return groupRowsIntoAccounts(this.store.searchByAccountIdentifier(identifier));
   }
 
   async getExpiredAccounts(): Promise<SafeAccount[]> {

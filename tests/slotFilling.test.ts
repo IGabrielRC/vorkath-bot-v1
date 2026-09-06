@@ -19,7 +19,6 @@ import {
 import { route } from '../src/router/hybrid';
 import { SessionStore } from '../src/session/store';
 import type { TelegramClient } from '../src/telegram/client';
-import { callbackDataFor } from '../src/telegram/keyboards';
 import {
   pickSearchIdentifier,
   resolveMissingFields,
@@ -310,12 +309,12 @@ describe('slot filling: router priority (unit)', () => {
 describe('slot filling: search with identifier (webhook)', () => {
   it('(1) "revísame una cuenta maxnet050" searches directly, no phone prompt', async () => {
     const world = await createSlotWorld();
-    const searchSpy = vi.spyOn(world.repos, 'searchAccounts');
+    const searchSpy = vi.spyOn(world.repos, 'searchServiceAccounts');
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'revísame una cuenta maxnet050'));
     expect(world.interpreter.calls).toBe(0);
     expect(searchSpy).toHaveBeenCalledWith('maxnet050');
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('resultado(s) MOCK');
+    expect(last).toContain('📺 FlujoTV · maxnet050');
     expect(last).toContain('Jackson Amaya');
     expect(last).not.toMatch(/teléfono/i);
     expect(last).not.toMatch(SERVICE_QUESTION_RE);
@@ -324,7 +323,7 @@ describe('slot filling: search with identifier (webhook)', () => {
 
   it('(2) "busca maxnet050" searches directly', async () => {
     const world = await createSlotWorld();
-    const searchSpy = vi.spyOn(world.repos, 'searchAccounts');
+    const searchSpy = vi.spyOn(world.repos, 'searchServiceAccounts');
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'busca maxnet050'));
     expect(world.interpreter.calls).toBe(0);
     expect(searchSpy).toHaveBeenCalledWith('maxnet050');
@@ -334,10 +333,10 @@ describe('slot filling: search with identifier (webhook)', () => {
 
   it('(3) "qué pasa con maxnet050" attempts the deterministic search', async () => {
     const world = await createSlotWorld();
-    const searchSpy = vi.spyOn(world.repos, 'searchAccounts');
+    const searchSpy = vi.spyOn(world.repos, 'searchServiceAccounts');
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'qué pasa con maxnet050'));
     expect(searchSpy).toHaveBeenCalledWith('maxnet050');
-    expect(world.client.texts().at(-1)).toContain('resultado(s) MOCK');
+    expect(world.client.texts().at(-1)).toContain('Jackson Amaya');
     await world.app.close();
   });
 
@@ -353,16 +352,16 @@ describe('slot filling: search with identifier (webhook)', () => {
 
   it('(5) email NL searches directly; unknown email reports not-found without offering creation', async () => {
     const world = await createSlotWorld();
-    const searchSpy = vi.spyOn(world.repos, 'searchAccounts');
+    const searchSpy = vi.spyOn(world.repos, 'searchServiceAccounts');
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'busca dasdsadasda@gmail.com'));
     expect(world.interpreter.calls).toBe(0);
     expect(searchSpy).toHaveBeenCalledWith('dasdsadasda@gmail.com');
-    expect(world.client.texts().at(-1)).toContain('resultado(s) MOCK');
+    expect(world.client.texts().at(-1)).toContain('📺 Netflix · dasdsadasda@gmail.com');
 
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'busca usuario@gmail.com'));
     expect(searchSpy).toHaveBeenCalledWith('usuario@gmail.com');
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('Sin resultados');
+    expect(last).toContain('Cuenta no encontrada');
     expect(last).toMatch(/reintentar|Volver/);
     expect(last).not.toMatch(CREATE_CLIENT_RE);
     await world.app.close();
@@ -422,7 +421,7 @@ describe('slot filling: buttons, shared tool, disambiguation (webhook)', () => {
 
   it('(9) button flow input and parameterized NL end in the SAME search tool', async () => {
     const world = await createSlotWorld();
-    const searchSpy = vi.spyOn(world.repos, 'searchAccounts');
+    const searchSpy = vi.spyOn(world.repos, 'searchServiceAccounts');
     // Parameterized NL first.
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'revísame maxnet050'));
     expect(searchSpy).toHaveBeenCalledWith('maxnet050');
@@ -444,24 +443,16 @@ describe('slot filling: buttons, shared tool, disambiguation (webhook)', () => {
     const world = await createSlotWorld();
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'revísame maxnet050'));
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('resultado(s) MOCK');
+    expect(last).toContain('📺 FlujoTV · maxnet050');
     expect(last).not.toMatch(SERVICE_QUESTION_RE);
     await world.app.close();
   });
 
-  it('(11) a FlujoTV-only account returns FlujoTV unprompted', async () => {
+  it('(11) a FlujoTV-only account returns its FlujoTV card unprompted', async () => {
     const world = await createSlotWorld();
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'revísame maxnet050'));
-    const search = world.interactions
-      .snapshot()
-      .find(
-        (interaction) =>
-          interaction.ownerTelegramUserId === GABRIEL && interaction.type === 'SEARCH',
-      );
-    if (search === undefined) {
-      throw new Error('SEARCH interaction missing');
-    }
-    await world.post(slotCallback(world.nextUpdateId(), GABRIEL, callbackDataFor('view0', search.id)));
+    // A single account opens its card directly — no disambiguation tap
+    // needed; the servicio comes from the data row itself.
     const last = world.client.texts().at(-1) ?? '';
     expect(last).toMatch(/flujotv/i);
     expect(last).toContain('Jackson Amaya');
@@ -471,14 +462,17 @@ describe('slot filling: buttons, shared tool, disambiguation (webhook)', () => {
     await world.app.close();
   });
 
-  it('(12) real ambiguity yields minimal disambiguation only', async () => {
+  it('(12) grouped rows open one card with no service question', async () => {
     const world = await createSlotWorld();
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'cmaxnet001'));
+    // Three rows grouped into ONE FlujoTV account → direct card, never a
+    // row list or a "Ver cliente" button.
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('resultado(s) MOCK');
+    expect(last).toContain('📺 FlujoTV · cmaxnet001');
+    expect(last).toContain('Anny Tovar');
     expect(last).not.toMatch(SERVICE_QUESTION_RE);
     expect(last).not.toMatch(CREATE_CLIENT_RE);
-    expect(world.client.findButton('1️⃣ Ver cliente')).toBeDefined();
+    expect(world.client.findButton('1️⃣ Ver cliente')).toBeUndefined();
     await world.app.close();
   });
 });
@@ -488,7 +482,7 @@ describe('slot filling: reads vs drafts (webhook)', () => {
     const world = await createSlotWorld();
     const draftSpy = vi.spyOn(world.drafts, 'create');
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'revísame maxnet050'));
-    expect(world.client.texts().at(-1)).toContain('resultado(s) MOCK');
+    expect(world.client.texts().at(-1)).toContain('📺 FlujoTV · maxnet050');
     expect(draftSpy).not.toHaveBeenCalled();
     expect(world.client.findButton('✅Confirmar')).toBeUndefined();
     await world.app.close();
@@ -559,7 +553,7 @@ describe('slot filling: guards and isolation (webhook)', () => {
       slotMessage(world.nextUpdateId(), GABRIEL, 'esa misma, revísame cuándo vence'),
     );
     const gabrielReply = world.client.texts().at(-1) ?? '';
-    expect(gabrielReply).toContain('resultado(s) MOCK');
+    expect(gabrielReply).toContain('📺 FlujoTV · maxnet050');
     expect(gabrielReply).toContain('Jackson Amaya');
     await world.app.close();
   });

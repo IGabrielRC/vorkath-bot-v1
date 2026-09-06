@@ -7,6 +7,18 @@
  * See: https://core.telegram.org/bots/api#inlinekeyboardbutton
  */
 
+/** Display name for a stored service id (`netflix` → `Netflix`). */
+function prettyService(servicio: string): string {
+  const compact = servicio.replace(/\s+/g, '').toLowerCase();
+  if (compact === 'flujotv') {
+    return 'FlujoTV';
+  }
+  if (compact === 'netflix') {
+    return 'Netflix';
+  }
+  return servicio;
+}
+
 export const CALLBACK_VERSION = 'v1';
 /** Telegram hard limit for InlineKeyboardButton.callback_data, in bytes. */
 export const CALLBACK_MAX_BYTES = 64;
@@ -209,6 +221,58 @@ export function phoneSearchKeyboard(interactionId?: string): InlineKeyboardMarku
       [ownedButton('🔎Buscar otro', 'buscar', interactionId), backButton(interactionId)],
     ],
   };
+}
+
+/**
+ * Account-search keyboard: [🔎Buscar otra] re-opens the SAME guided
+ * wizard the BUSCAR button opens (same `buscar` action/handler), and
+ * [←Volver] returns Home. Used by the read-only account UX
+ * (not-found, single-card, account detail). NEVER a "Crear cliente"
+ * button here — creation belongs exclusively to the explicit
+ * new-sale flow (BR-CUS-009).
+ */
+export function accountSearchKeyboard(interactionId?: string): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [ownedButton('🔎Buscar otra', 'buscar', interactionId), backButton(interactionId)],
+    ],
+  };
+}
+
+/**
+ * Minimal multi-service disambiguation: one owned button per matched
+ * account (`Netflix · <id>`, `FlujoTV · <id>`), reusing the view0–4
+ * actions so ownership, stale-callback and cross-thread guards apply
+ * unchanged, plus ←Volver. Shown only when ONE identifier resolves
+ * to N real accounts (e.g. the same identifier in Netflix AND
+ * FlujoTV) — never a service question up front.
+ */
+export function accountDisambiguationKeyboard(
+  accounts: Array<{ servicio: string; identifier: string }>,
+  opts?: { interactionId?: string },
+): InlineKeyboardMarkup {
+  const interactionId = opts?.interactionId;
+  const numerals = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+  const rows: InlineKeyboardButton[][] = [];
+  const choiceRow: InlineKeyboardButton[] = [];
+  const shown = Math.min(accounts.length, VIEW_ACTIONS.length);
+  for (let index = 0; index < shown; index += 1) {
+    const account = accounts[index];
+    const action = VIEW_ACTIONS[index];
+    if (account === undefined || action === undefined) {
+      continue;
+    }
+    const label = `${numerals[index] ?? '•'} ${prettyService(account.servicio)} · ${account.identifier}`;
+    choiceRow.push(ownedButton(label, action, interactionId));
+    if (choiceRow.length === 2) {
+      rows.push(choiceRow.splice(0, 2));
+    }
+  }
+  if (choiceRow.length > 0) {
+    rows.push(choiceRow.splice(0, 2));
+  }
+  rows.push([backButton(interactionId)]);
+  return { inline_keyboard: rows };
 }
 
 /** Draft actions: Confirmar / Corregir / Cancelar + ←Volver to Home. */

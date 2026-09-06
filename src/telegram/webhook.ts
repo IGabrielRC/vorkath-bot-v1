@@ -7,6 +7,11 @@ import { AlertService } from '../alerts/alerts';
 import type { Env } from '../config/env';
 import { DraftEngine, type DraftOwner, type DraftResult } from '../drafts/engine';
 import {
+  AccountSelectionStore,
+  formatAccountCard,
+  type ServiceAccount,
+} from '../mock/accounts';
+import {
   CustomerSelectionStore,
   formatCustomerCard,
   type Customer,
@@ -29,6 +34,8 @@ import { logger } from '../utils/logger';
 import {
   HOME_TEXT,
   SECTION_TEXTS,
+  accountDisambiguationKeyboard,
+  accountSearchKeyboard,
   draftKeyboard,
   homeKeyboard,
   phoneSearchKeyboard,
@@ -60,6 +67,13 @@ export const NO_RESULTS_TEXT = '🔎 Sin resultados MOCK.';
  */
 export const PHONE_NOT_FOUND_TEXT =
   '🔎 No encontrado\nNo encontramos ningún cliente asociado a ese número.';
+/**
+ * Read-only account not-found (BR-ACC-004): report + offer retry/volver.
+ * NEVER anything else — unknown identifiers are reported, never
+ * created, and searches never touch drafts.
+ */
+export const ACCOUNT_NOT_FOUND_TEXT =
+  '🔎 Cuenta no encontrada\nNo encontramos esa cuenta. Escribe otra cuenta para reintentar o pulsa Volver.';
 export const NO_DRAFT_TEXT = 'No hay borrador abierto. Usa ⚡OPERAR para crear uno.';
 export const DRAFT_UPDATED_PREFIX = '📝 Borrador actualizado:';
 export const CORRECTION_PROMPT_TEXT = '✏️ Envía la corrección (ej. «hazlo 2 meses»).';
@@ -1064,15 +1078,22 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * interaction per request, then the repo seam). Complete reads
      * execute immediately with NO confirmation. Phone-like identifiers
      * take the read-only customer UX (card/list/not-found, drafts
-     * untouched); every other identifier keeps the legacy account-row
-     * flow.
+     * untouched); neutral account identifiers (email/username/code)
+     * take the read-only account UX (grouped card/disambiguation/
+     * not-found, drafts untouched); bare service words keep the
+     * legacy service-row browse.
      */
-    async function runDirectSearch(identifier: string): Promise<void> {
+    async function runDirectSearch(identifier: string, serviceBrowse = false): Promise<void> {
       // Per-requester search interaction: result buttons reject the peer;
       // the peer starts their own search. Both coexist.
-      if (containsPhoneCandidate(identifier)) {
+      if (!serviceBrowse && containsPhoneCandidate(identifier)) {
         const interaction = createInteraction('SEARCH', { view: 'customer-list', offset: 0 });
         await renderCustomerSearch(interaction, identifier);
+        return;
+      }
+      if (!serviceBrowse) {
+        const interaction = createInteraction('SEARCH', { view: 'account-list', offset: 0 });
+        await renderAccountSearch(interaction, identifier);
         return;
       }
       const interaction = createInteraction('SEARCH', { view: 'list', offset: 0 });
@@ -1084,6 +1105,107 @@ export function createWebhookHandler(deps: WebhookDeps) {
 
     function rememberCustomerSelection(customer: Customer): void {
       selections.select(targetChatId, targetActorId, customer);
+    }
+
+    /** Last-selected account per actor (future "esa cuenta" reference). */
+    const accountSelections = new AccountSelectionStore();
+
+    function rememberAccountSelection(account: ServiceAccount): void {
+      accountSelections.select(targetChatId, targetActorId, account);
+    }
+
+    /**
+     * Read-only neutral account search UX (BR-ACC-004): 0 → not-found +
+     * [Buscar otra][Volver] (never anything created); 1 → direct
+     * grouped card; N (same identifier in Netflix AND FlujoTV) →
+     * minimal owned disambiguation (`Netflix · x` / `FlujoTV · x`),
+     * then the selected card. Read-only: drafts are never created,
+     * updated, or cancelled here.
+     */
+    async function renderAccountSearch(interaction: Interaction, query: string): Promise<void> {
+      const accounts = await deps.repos.searchServiceAccounts(query);
+      const total = accounts.length;
+      if (total === 0) {
+        deps.interactions.touch(interaction.id, { query, offset: 0, view: 'account-list' });
+        persistAll();
+        await sendLabeled(
+          ACCOUNT_NOT_FOUND_TEXT,
+          accountSearchKeyboard(interaction.id),
+          interaction.messageThreadId,
+        );
+        return;
+      }
+      if (total === 1) {
+        const only = accounts[0] as ServiceAccount;
+        rememberAccountSelection(only);
+        deps.interactions.touch(interaction.id, {
+          query,
+          view: 'account-detail',
+          selectedAccount: {
+            id: only.id,
+            servicio: only.servicio,
+            identifier: only.identifier,
+          },
+        });
+        persistAll();
+        await sendLabeled(
+          formatAccountCard(only),
+          accountSearchKeyboard(interaction.id),
+          interaction.messageThreadId,
+        );
+        return;
+      }
+      const offset =
+        typeof interaction.state['offset'] === 'number'
+          ? (interaction.state['offset'] as number)
+          : 0;
+      const safeOffset = Math.min(Math.max(offset, 0), Math.max(total - 1, 0));
+      const page = accounts.slice(safeOffset, safeOffset + SEARCH_PAGE_SIZE);
+      deps.interactions.touch(interaction.id, {
+        query,
+        offset: safeOffset,
+        view: 'account-list',
+        total,
+      });
+      persistAll();
+      await sendLabeled(
+        `🔎 ${total} cuentas comparten ese identificador. Elige una:`,
+        accountDisambiguationKeyboard(
+          page.map((account) => ({ servicio: account.servicio, identifier: account.identifier })),
+          { interactionId: interaction.id },
+        ),
+        interaction.messageThreadId,
+      );
+    }
+
+    /** Account card from the owned disambiguation list (stores selection). */
+    async function renderAccountCard(
+      interaction: Interaction,
+      query: string,
+      accountIndex: number,
+    ): Promise<void> {
+      const accounts = await deps.repos.searchServiceAccounts(query);
+      const account = accounts[accountIndex];
+      if (account === undefined) {
+        await ackStale('view');
+        return;
+      }
+      rememberAccountSelection(account);
+      deps.interactions.touch(interaction.id, {
+        query,
+        view: 'account-detail',
+        selectedAccount: {
+          id: account.id,
+          servicio: account.servicio,
+          identifier: account.identifier,
+        },
+      });
+      persistAll();
+      await sendLabeled(
+        formatAccountCard(account),
+        accountSearchKeyboard(interaction.id),
+        interaction.messageThreadId,
+      );
     }
 
     /**
@@ -1359,7 +1481,27 @@ export function createWebhookHandler(deps: WebhookDeps) {
       interaction: Interaction,
     ): Promise<void> {
       if (action === 'home' || action === 'back') {
-        if (interaction.type === 'SEARCH' && interaction.state['view'] === 'customer-detail') {
+        if (interaction.type === 'SEARCH' && interaction.state['view'] === 'account-detail') {
+          // Volver from an account card: back to the owned
+          // disambiguation list when one exists (N accounts), Home for
+          // a direct single-card (no list to return to) — drafts and
+          // persistent requirements are never deleted either way.
+          const query =
+            typeof interaction.state['query'] === 'string'
+              ? (interaction.state['query'] as string)
+              : '';
+          const total =
+            typeof interaction.state['total'] === 'number'
+              ? (interaction.state['total'] as number)
+              : 0;
+          if (total > 1) {
+            await renderAccountSearch(interaction, query);
+            return;
+          }
+        } else if (
+          interaction.type === 'SEARCH' &&
+          interaction.state['view'] === 'customer-detail'
+        ) {
           // Volver from a customer card: back to the owned
           // disambiguation list when one exists (N results), Home for a
           // direct single-card (no list to return to) — drafts and
@@ -1485,6 +1627,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
           await renderCustomerDetail(interaction, query, offset + viewIndex);
           return;
         }
+        if (
+          interaction.state['view'] === 'account-list' ||
+          interaction.state['view'] === 'account-detail'
+        ) {
+          await renderAccountCard(interaction, query, offset + viewIndex);
+          return;
+        }
         await renderAccountDetail(interaction, query, offset + viewIndex);
         return;
       }
@@ -1504,6 +1653,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
         const target = deps.interactions.get(interaction.id) ?? interaction;
         if (target.state['view'] === 'customer-list') {
           await renderCustomerSearch(target, query);
+          return;
+        }
+        if (target.state['view'] === 'account-list') {
+          await renderAccountSearch(target, query);
           return;
         }
         await renderSearchPage(target, query);
@@ -1654,18 +1807,25 @@ export function createWebhookHandler(deps: WebhookDeps) {
       if (
         parse.kind === 'phone' ||
         parse.kind === 'email' ||
-        parse.kind === 'service' ||
         parse.kind === 'account'
       ) {
         // Per-requester search interaction: result buttons reject the peer;
         // the peer starts their own search. Both coexist.
-        // The `account` kind is the neutral ACCOUNT_IDENTIFIER — the
-        // returned servicio comes from the data row, never assumed.
-        // L2 carries the identifier, so missingFields is empty and the
-        // read executes immediately (no confirmation, no follow-up).
-        // Phone identifiers travel `+`-preserving (`raw`) so explicit
-        // +CC keeps absolute priority in the domain layer.
+        // Phone identifiers travel the customer seam; the neutral
+        // ACCOUNT_IDENTIFIER (email/username/code) travels the account
+        // seam — the returned servicio comes from the data row, never
+        // assumed. L2 carries the identifier, so missingFields is empty
+        // and the read executes immediately (no confirmation, no
+        // follow-up). Phone identifiers travel `+`-preserving (`raw`)
+        // so explicit +CC keeps absolute priority in the domain layer.
         await runDirectSearch(parse.kind === 'phone' ? parse.raw : parse.value);
+        return { ok: true };
+      }
+      if (parse.kind === 'service') {
+        // Bare service words keep the legacy service-row browse (zero
+        // Gemini) — they are a service listing, not an account
+        // identifier, so they never enter the account card flow.
+        await runDirectSearch(parse.value, true);
         return { ok: true };
       }
       if (parse.kind === 'section') {

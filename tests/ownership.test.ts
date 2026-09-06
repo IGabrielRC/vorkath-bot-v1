@@ -901,7 +901,7 @@ describe('H. FlujoTV account identifiers (35–39)', () => {
       groupMessage(world.nextUpdateId(), GABRIEL, 'dasdsadasda@gmail.com'),
     );
     expect(world.interpreter.calls).toBe(0);
-    expect(world.client.texts().at(-1)).toContain('resultado(s) MOCK');
+    expect(world.client.texts().at(-1)).toContain('📺 Netflix · dasdsadasda@gmail.com');
     await world.app.close();
   });
 
@@ -910,7 +910,7 @@ describe('H. FlujoTV account identifiers (35–39)', () => {
     await world.post(groupMessage(world.nextUpdateId(), GABRIEL, 'cmaxnet001'));
     expect(world.interpreter.calls).toBe(0);
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('resultado(s) MOCK');
+    expect(last).toContain('📺 FlujoTV · cmaxnet001');
     expect(last).toContain('Anny Tovar');
     await world.app.close();
   });
@@ -929,7 +929,7 @@ describe('H. FlujoTV account identifiers (35–39)', () => {
     const world = await createOwnerWorld();
     await world.post(groupMessage(world.nextUpdateId(), GABRIEL, 'cmaxnet001'));
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('resultado(s) MOCK');
+    expect(last).toContain('📺 FlujoTV · cmaxnet001');
     // Plain words still fall through to L3 — the account guard is tight.
     expect(parseFast('quiero buscar un cliente')).toEqual({ kind: 'none' });
     expect(parseFast('buscar')).toEqual({ kind: 'none' });
@@ -940,7 +940,7 @@ describe('H. FlujoTV account identifiers (35–39)', () => {
     const world = await createOwnerWorld();
     await world.post(groupMessage(world.nextUpdateId(), EDWARD, 'maxnet001'));
     expect(world.interpreter.calls).toBe(0);
-    expect(world.client.texts().at(-1)).toContain('resultado(s) MOCK');
+    expect(world.client.texts().at(-1)).toContain('📺 FlujoTV · maxnet001');
     await world.app.close();
   });
 });

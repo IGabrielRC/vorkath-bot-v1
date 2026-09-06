@@ -212,7 +212,7 @@ describe('webhook MOCK search via L2 (zero Gemini, secret-free replies)', () => 
       messageUpdate(world.nextUpdateId(), EDWARD, 'dasdsadasda@gmail.com'),
     );
     expect(world.interpreter.calls).toBe(0);
-    expect(world.client.texts().at(-1)).toContain('resultado(s) MOCK');
+    expect(world.client.texts().at(-1)).toContain('📺 Netflix · dasdsadasda@gmail.com');
     expect(JSON.stringify(world.client.sent)).not.toContain('simara23075');
     await world.app.close();
   });

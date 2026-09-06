@@ -144,6 +144,28 @@ export class MockStore {
     return matches.slice(0, MAX_SEARCH_RESULTS);
   }
 
+  /**
+   * Neutral account-identifier row search (Slice B): deterministic
+   * lookup across BOTH repositories (both sheets live in this one
+   * store) WITHOUT asking the service first — the caller reads
+   * `servicio` from the matched rows. Matching is exact on the
+   * normalized CORREO (`trim().toLowerCase()`), case-insensitive;
+   * nothing is ever appended (`cmaxnet001` never becomes
+   * `cmaxnet001@gmail.com`) and substrings never bleed (`maxnet001`
+   * never matches `cmaxnet001`). Empty queries match nothing and the
+   * store is never mutated (unknown identifiers report, never create).
+   */
+  searchByAccountIdentifier(query: string): MockAccount[] {
+    const key = query.trim().toLowerCase();
+    if (key === '') {
+      return [];
+    }
+    const matches = this.accounts.filter(
+      (account) => account.correo.trim().toLowerCase() === key,
+    );
+    return matches.slice(0, MAX_SEARCH_RESULTS);
+  }
+
   /** Every row whose ESTATUS is not VIGENTE (POR VENCER, VENCIDO, …). */
   getExpired(): MockAccount[] {
     return this.accounts.filter(

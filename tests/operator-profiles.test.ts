@@ -363,13 +363,13 @@ describe('conversational contract: buttons ≡ NL (1-8)', () => {
     await world.post(profileMessage(world.nextUpdateId(), GABRIEL, '4145460657'));
     expect(world.client.texts().at(-1)).toContain('Anny Tovar');
     await world.post(profileMessage(world.nextUpdateId(), GABRIEL, 'dasdsadasda@gmail.com'));
-    expect(world.client.texts().at(-1)).toContain('resultado(s) MOCK');
+    expect(world.client.texts().at(-1)).toContain('📺 Netflix · dasdsadasda@gmail.com');
     await world.post(profileMessage(world.nextUpdateId(), GABRIEL, 'hazlo 2 meses'));
     expect(world.client.texts().at(-1)).toContain('Borrador actualizado');
     await world.post(profileMessage(world.nextUpdateId(), GABRIEL, 'netflix'));
     expect(world.client.texts().at(-1)).toContain('resultado(s) MOCK');
     await world.post(profileMessage(world.nextUpdateId(), GABRIEL, 'cmaxnet001'));
-    expect(world.client.texts().at(-1)).toContain('resultado(s) MOCK');
+    expect(world.client.texts().at(-1)).toContain('📺 FlujoTV · cmaxnet001');
     expect(world.interpreter.calls).toBe(0);
     await world.app.close();
   });
@@ -433,7 +433,7 @@ describe('conversational contract: buttons ≡ NL (1-8)', () => {
     // account identifiers via the account seam — no duplicated logic).
     const searchWorld = await createProfileWorld();
     const customerSpy = vi.spyOn(searchWorld.repos, 'searchCustomersByPhone');
-    const accountSpy = vi.spyOn(searchWorld.repos, 'searchAccounts');
+    const accountSpy = vi.spyOn(searchWorld.repos, 'searchServiceAccounts');
     await searchWorld.post(profileMessage(searchWorld.nextUpdateId(), GABRIEL, '4145460657'));
     await searchWorld.post(profileMessage(searchWorld.nextUpdateId(), GABRIEL, 'cmaxnet001'));
     expect(customerSpy).toHaveBeenCalledWith('4145460657');

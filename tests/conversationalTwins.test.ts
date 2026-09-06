@@ -361,7 +361,7 @@ describe('twins: button≈NL equivalence per section (webhook, same handler/tool
 
   it('BUSCAR ≡ "revisame maxnet050 a ver como esta" + international phone', async () => {
     const world = await createTwinWorld();
-    const searchSpy = vi.spyOn(world.repos, 'searchAccounts');
+    const searchSpy = vi.spyOn(world.repos, 'searchServiceAccounts');
     const customerSpy = vi.spyOn(world.repos, 'searchCustomersByPhone');
     await world.post(
       twinMessage(world.nextUpdateId(), GABRIEL, 'revisame maxnet050 a ver como esta'),

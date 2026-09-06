@@ -113,7 +113,7 @@ export function groupRowsIntoCustomers(rows: MockAccount[]): Customer[] {
   return [...byName.values()];
 }
 
-function serviceLabel(servicio: string): string {
+export function serviceLabel(servicio: string): string {
   const compact = servicio.replace(/\s+/g, '').toLowerCase();
   if (compact === 'flujotv') {
     return 'FlujoTV';
