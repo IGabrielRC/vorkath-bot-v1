@@ -24,6 +24,32 @@ import { parseCallbackData } from '../telegram/keyboards';
  * - Button↔NL equivalence is locked by tests asserting shared entry
  *   points (spies on the tool/registry layer) and Gemini-call counting.
  *
+ * TRANSVERSAL 10-POINT DEFINITION OF DONE (every future feature is
+ * INCOMPLETE if button-only — no exceptions, no Fase 2+ work starts
+ * without it):
+ *  1. NL twin: every button has ≥1 conversational equivalent phrase.
+ *  2. Params: identifiers/options stated in one phrase are preserved
+ *     (never re-asked, never dropped).
+ *  3. Ask-only-missing: partial NL asks ONLY the missing fields
+ *     (ToolRequirementResolver → missingFields).
+ *  4. Parser/Gemini split: L2 resolves clear patterns over NORMALIZED
+ *     text (lowercase + accent folding) with zero Gemini; L3 (Gemini)
+ *     only interprets ambiguous text into intent+params.
+ *  5. Same deterministic tool: button and NL call the SAME handler/
+ *     tool (shared entry point, asserted with spies).
+ *  6. Guards: the central topic-ownership guard runs BEFORE parser,
+ *     Gemini, router and tools; read-vs-write rules hold (reads
+ *     execute, writes build drafts).
+ *  7. Confirmations: every WRITE ends in draft + summary +
+ *     Confirm/Correct/Cancel — never direct execution.
+ *  8. Per-actor isolation: context resolves from the actor's own
+ *     state only (numeric telegramUserId key, never names, never peers).
+ *  9. Button↔NL tests: equivalence (same handler/tool spy), zero-Gemini
+ *     where L2 resolves, Gemini-invoked for semantic cases.
+ * 10. Future verbs ship as CONTRACT first: tool spec + stub exist, NL
+ *     stays guarded (UNKNOWN) until the feature phase implements them.
+ * No future features are implemented here — this contract only.
+ *
  * ASK ONLY WHAT IS MISSING (transversal, phases 2-15):
  * - Complete NL → direct result/draft: a READ with its identifier
  *   executes the SAME deterministic search tool the Buscar flow uses

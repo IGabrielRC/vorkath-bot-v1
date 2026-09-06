@@ -17,10 +17,33 @@ export type FastParseResult =
   | { kind: 'email'; value: string }
   | { kind: 'phone'; value: string }
   | { kind: 'createTest'; months: number }
+  | { kind: 'section'; section: FastSection }
   | { kind: 'months'; months: number }
   | { kind: 'service'; value: 'netflix' | 'flujotv' }
   | { kind: 'account'; value: string }
   | { kind: 'none' };
+
+/**
+ * Home-section NL twins: every home button (OPERAR/VENCIDOS/INVENTARIO/
+ * CAJA/MÁS) has a conversational equivalent resolving here, so the tap
+ * and the phrase end in the SAME handler. BUSCAR needs no section value:
+ * its NL twin is the identifier search (phone/email/account kinds).
+ */
+export type FastSection = 'operar' | 'vencidos' | 'inventario' | 'caja' | 'mas';
+
+/**
+ * Normalizes free text for deterministic matching: lowercase + accent
+ * folding, so "qué se me venció", "QUE SE ME VENCIO" and "muéstrame"
+ * all hit the same patterns. Keyword-ifs are NOT the primary NL
+ * mechanism — this only resolves CLEAR section phrases; everything
+ * ambiguous falls through to L3 (Gemini semantic interpretation).
+ */
+export function normalizeText(text: string): string {
+  return text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
 
 /** Minimum digit count for a phone match — the phone-vs-months guard. */
 export const MIN_PHONE_DIGITS = 7;
@@ -88,6 +111,57 @@ export function parseCreateTest(text: string): { kind: 'createTest'; months: num
   }
   return { kind: 'createTest', months: months.months };
 }
+
+/**
+ * Home-section recognition over NORMALIZED text (clear phrases only).
+ *
+ * Priority notes (all locked by tests):
+ * - "hay <servicio>" (availability question) is inventario and is
+ *   checked BEFORE the `service` kind wins — a bare "netflix" still
+ *   searches, but "hay Netflix" asks what is available.
+ * - Vencidos cues are SKIPPED when a service token is present, so the
+ *   filtered search "busca cuentas NETFLIX vencidas" keeps routing to
+ *   the `service` kind (future phases own filtered search).
+ * - A bare "vence" NEVER matches (it belongs to conversational
+ *   references like "esa misma, revísame cuándo vence", which stay L3).
+ * - Generic "buscar …" prose is NOT a section: identifier-less search
+ *   requests ("quiero buscar un cliente") keep falling through to L3,
+ *   which asks only for the missing identifier.
+ */
+export function parseSection(text: string): { kind: 'section'; section: FastSection } | null {
+  const n = normalizeText(text);
+  // Availability question beats the bare-service search.
+  if (/\bhay\s+(netflix|flujo)/.test(n)) {
+    return { kind: 'section', section: 'inventario' };
+  }
+  const hasService = /\bnetflix\b/.test(n) || /\bflujo/.test(n);
+  if (!hasService) {
+    if (/\bvencid|\bpor vencer\b|se me venci|vencimiento/.test(n)) {
+      return { kind: 'section', section: 'vencidos' };
+    }
+  }
+  if (/\binventario\b|\bdisponible(s)?\b|\bexistencias?\b|\bstock\b/.test(n)) {
+    return { kind: 'section', section: 'inventario' };
+  }
+  if (/\bcaja\b|entro hoy|\bcuadre\b/.test(n)) {
+    return { kind: 'section', section: 'caja' };
+  }
+  if (/que mas puedo hacer|otras opciones|muestrame|que mas hay|\bayuda\b/.test(n)) {
+    return { kind: 'section', section: 'mas' };
+  }
+  if (/\boperar\b|\boperacion(es)?\b/.test(n)) {
+    return { kind: 'section', section: 'operar' };
+  }
+  return null;
+}
+
+/**
+ * Sell/renew verbs are CONTRACT-ONLY (future prepareSale/prepareRenewal
+ * — tool specs + stubs exist, implementation does not). Until their
+ * phase, L2 declines them as `none` so they can never become a search,
+ * a draft, or a mutation: L3 maps them to guarded UNKNOWN.
+ */
+const SELL_RENEW_RE = /(vend|renov)/;
 
 function parseCommand(text: string): { kind: 'command'; command: FastCommand } | null {  for (const { command, re } of COMMAND_PATTERNS) {
     if (re.test(text)) {
@@ -192,17 +266,23 @@ export function extractEmbeddedAccount(text: string): { kind: 'account'; value: 
 
 /**
  * Deterministic cascade: command → email → phone → createTest →
- * embeddedAccount → months → service → account → none. "none" means
- * the router must fall through to L3 (Gemini intent-only).
+ * section → embeddedAccount → months → service → account → none. "none"
+ * means the router must fall through to L3 (Gemini intent-only).
  *
  * `createTest` sits BEFORE `months` so "crea una prueba de 2 meses"
  * opens a draft with months=2 instead of hitting the months-correction
  * branch with no draft open; bare corrections ("hazlo 2 meses", no
- * create verb) still fall through to `months`.
+ * create verb) still fall through to `months`. `section` sits BEFORE
+ * identifier extraction so a section phrase ("qué se me venció") never
+ * becomes a stray account/phone search, while identifier-bearing text
+ * ("revisame maxnet050…") matches no section cue and flows on.
  */
 export function parseFast(text: string): FastParseResult {
   const trimmed = text.trim();
   if (trimmed.length === 0) {
+    return { kind: 'none' };
+  }
+  if (SELL_RENEW_RE.test(normalizeText(trimmed))) {
     return { kind: 'none' };
   }
   return (
@@ -210,6 +290,7 @@ export function parseFast(text: string): FastParseResult {
     parseEmail(trimmed) ??
     parsePhone(trimmed) ??
     parseCreateTest(trimmed) ??
+    parseSection(trimmed) ??
     extractEmbeddedAccount(trimmed) ??
     parseMonths(trimmed) ??
     parseService(trimmed) ??

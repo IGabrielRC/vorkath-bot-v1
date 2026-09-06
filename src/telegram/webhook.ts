@@ -1041,6 +1041,78 @@ export function createWebhookHandler(deps: WebhookDeps) {
         .join('\n');
     }
 
+    /**
+     * THE shared section handlers — button taps (L1 bound + legacy),
+     * section NL (L2) and semantic intents (L3) ALL converge here, so a
+     * button and its conversational twin end in the SAME handler, the
+     * SAME deterministic repo/draft call and the SAME reply. `thread`
+     * carries the owning interaction's topic for callback-derived
+     * messages; fresh NL uses the update's own topic.
+     */
+    async function openOperateDraft(thread?: number): Promise<void> {
+      const resumed = deps.drafts.isOpen(owner);
+      const draft = deps.drafts.create(owner, {
+        ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
+      });
+      const operation = activeOperationInteraction() ?? createInteraction('OPERATION');
+      persistAll();
+      auditDraft('draft.created', { months: draft.months, resumed });
+      await sendLabeled(
+        resumed
+          ? `📝 Borrador retomado: ${draft.months} mes(es) (paso 2 de 2). Confirma o cancela.`
+          : '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
+        draftKeyboard(operation.id),
+        thread ?? operation.messageThreadId,
+      );
+    }
+
+    async function showExpired(thread?: number): Promise<void> {
+      const expired = await deps.repos.getExpiredAccounts();
+      const view = createInteraction('EXPIRED');
+      persistAll();
+      await sendLabeled(
+        expired.length === 0
+          ? '⏰ Sin vencidos MOCK.'
+          : `⏰ Vencidos MOCK (${expired.length}):\n${formatRows(expired.slice(0, 5))}`,
+        sectionKeyboard('vencidos', view.id),
+        thread ?? view.messageThreadId,
+      );
+    }
+
+    async function showInventory(thread?: number): Promise<void> {
+      const summary = await deps.repos.getInventorySummary();
+      const lines = summary.map((row) => `• ${row.servicio}: ${row.total}`);
+      const view = createInteraction('INVENTORY');
+      persistAll();
+      await sendLabeled(
+        lines.length === 0 ? '📦 Inventario MOCK vacío.' : `📦 Inventario MOCK:\n${lines.join('\n')}`,
+        sectionKeyboard('inventario', view.id),
+        thread ?? view.messageThreadId,
+      );
+    }
+
+    /** CAJA placeholder (same text as the 💰CAJA button — real logic is Fase 2+). */
+    async function showCash(thread?: number): Promise<void> {
+      const view = createInteraction('CASH');
+      persistAll();
+      await sendLabeled(
+        SECTION_TEXTS['caja'] ?? '💰 CAJA (demo) — resumen MOCK.',
+        sectionKeyboard('caja', view.id),
+        thread ?? view.messageThreadId,
+      );
+    }
+
+    /** MÁS placeholder (same text as the ⋯MÁS button). */
+    async function showMore(thread?: number): Promise<void> {
+      const view = createInteraction('MORE');
+      persistAll();
+      await sendLabeled(
+        SECTION_TEXTS['mas'] ?? '⋯ MÁS (demo)',
+        sectionKeyboard('mas', view.id),
+        thread ?? view.messageThreadId,
+      );
+    }
+
     /** Renders one SEARCH page; state stays on the owned interaction. */
     async function renderSearchPage(interaction: Interaction, query: string): Promise<void> {
       const offset =
@@ -1144,68 +1216,23 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return;
       }
       if (action === 'operar') {
-        const resumed = deps.drafts.isOpen(owner);
-        const draft = deps.drafts.create(owner, {
-          ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
-        });
-        const operation = createInteraction('OPERATION');
-        persistAll();
-        auditDraft('draft.created', { months: draft.months, resumed });
-        if (fromCallback && callbackMessageId !== undefined) {
-          await deps.client.editMessageText({
-            chatId: targetChatId,
-            messageId: callbackMessageId,
-            text: withOperator(
-              resumed
-                ? `📝 Borrador retomado: ${draft.months} mes(es) (paso 2 de 2). Confirma o cancela.`
-                : '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
-              targetActorName,
-            ),
-            replyMarkup: draftKeyboard(operation.id),
-          });
-        } else {
-          await deps.client.sendMessage({
-            chatId: targetChatId,
-            text: withOperator(
-              resumed
-                ? `📝 Borrador retomado: ${draft.months} mes(es) (paso 2 de 2). Confirma o cancela.`
-                : '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
-              targetActorName,
-            ),
-            replyMarkup: draftKeyboard(operation.id),
-            ...(operation.messageThreadId !== undefined
-              ? { messageThreadId: operation.messageThreadId }
-              : {}),
-          });
-        }
-        if (callbackId !== undefined) {
-          await deps.client.answerCallbackQuery(callbackId);
-        }
+        await openOperateDraft(interaction.messageThreadId);
         return;
       }
       if (action === 'vencidos') {
-        const expired = await deps.repos.getExpiredAccounts();
-        const view = createInteraction('EXPIRED');
-        persistAll();
-        await sendLabeled(
-          expired.length === 0
-            ? '⏰ Sin vencidos MOCK.'
-            : `⏰ Vencidos MOCK (${expired.length}):\n${formatRows(expired.slice(0, 5))}`,
-          sectionKeyboard('vencidos', view.id),
-          interaction.messageThreadId,
-        );
+        await showExpired(interaction.messageThreadId);
         return;
       }
       if (action === 'inventario') {
-        const summary = await deps.repos.getInventorySummary();
-        const lines = summary.map((row) => `• ${row.servicio}: ${row.total}`);
-        const view = createInteraction('INVENTORY');
-        persistAll();
-        await sendLabeled(
-          lines.length === 0 ? '📦 Inventario MOCK vacío.' : `📦 Inventario MOCK:\n${lines.join('\n')}`,
-          sectionKeyboard('inventario', view.id),
-          interaction.messageThreadId,
-        );
+        await showInventory(interaction.messageThreadId);
+        return;
+      }
+      if (action === 'caja') {
+        await showCash(interaction.messageThreadId);
+        return;
+      }
+      if (action === 'mas') {
+        await showMore(interaction.messageThreadId);
         return;
       }
       if (action === 'confirm' || action === 'cancel') {
@@ -1351,41 +1378,23 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return { ok: true };
       }
       if (action === 'operar') {
-        const resumed = deps.drafts.isOpen(owner);
-        const draft = deps.drafts.create(owner, {
-          ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
-        });
-        persistAll();
-        auditDraft('draft.created', { months: draft.months, resumed });
-        await respondDraft(
-          resumed
-            ? `📝 Borrador retomado: ${draft.months} mes(es) (paso 2 de 2). Confirma o cancela.`
-            : '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
-        );
+        await openOperateDraft();
         return { ok: true };
       }
       if (action === 'vencidos') {
-        const expired = await deps.repos.getExpiredAccounts();
-        const lines = expired
-          .slice(0, 5)
-          .map((row) => `• ${row.nombre} — ${row.perfil} (${row.pais}, ${row.estatus})`);
-        await respond(
-          expired.length === 0
-            ? '⏰ Sin vencidos MOCK.'
-            : `⏰ Vencidos MOCK (${expired.length}):\n${lines.join('\n')}`,
-          'vencidos',
-        );
+        await showExpired();
         return { ok: true };
       }
       if (action === 'inventario') {
-        const summary = await deps.repos.getInventorySummary();
-        const lines = summary.map((row) => `• ${row.servicio}: ${row.total}`);
-        await respond(
-          lines.length === 0
-            ? '📦 Inventario MOCK vacío.'
-            : `📦 Inventario MOCK:\n${lines.join('\n')}`,
-          'inventario',
-        );
+        await showInventory();
+        return { ok: true };
+      }
+      if (action === 'caja') {
+        await showCash();
+        return { ok: true };
+      }
+      if (action === 'mas') {
+        await showMore();
         return { ok: true };
       }
       if (action === 'confirm') {
@@ -1452,8 +1461,29 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await runDirectSearch(parse.value);
         return { ok: true };
       }
+      if (parse.kind === 'section') {
+        // Home-section NL twin (L2, zero Gemini): the SAME shared
+        // handler the button tap runs — button≡NL by construction.
+        if (parse.section === 'operar') {
+          await openOperateDraft();
+          return { ok: true };
+        }
+        if (parse.section === 'vencidos') {
+          await showExpired();
+          return { ok: true };
+        }
+        if (parse.section === 'inventario') {
+          await showInventory();
+          return { ok: true };
+        }
+        if (parse.section === 'caja') {
+          await showCash();
+          return { ok: true };
+        }
+        await showMore();
+        return { ok: true };
+      }
       if (parse.kind === 'createTest') {
-        // Complete mutation stated up front: draft + summary +
         // Confirm/Correct/Cancel — never executes directly.
         const resumed = deps.drafts.isOpen(owner);
         const draft = deps.drafts.create(owner, {
@@ -1555,6 +1585,28 @@ export function createWebhookHandler(deps: WebhookDeps) {
           ? `📝 Borrador retomado: ${draft.months} mes(es) (paso 2 de 2). Confirma o cancela.`
           : '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
       );
+      return { ok: true };
+    }
+    if (intent.name === 'OPEN_OPERATE') {
+      // Generic operate NL (no months): the SAME draft shell the OPERAR
+      // button opens — button≡NL by construction, no redundant question.
+      await openOperateDraft();
+      return { ok: true };
+    }
+    if (intent.name === 'OPEN_EXPIRED') {
+      await showExpired();
+      return { ok: true };
+    }
+    if (intent.name === 'OPEN_INVENTORY') {
+      await showInventory();
+      return { ok: true };
+    }
+    if (intent.name === 'OPEN_CASH') {
+      await showCash();
+      return { ok: true };
+    }
+    if (intent.name === 'OPEN_MORE') {
+      await showMore();
       return { ok: true };
     }
     if (intent.name === 'CORRECTION') {

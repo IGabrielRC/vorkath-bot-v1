@@ -12,7 +12,17 @@ import { extractEmbeddedAccount, parseEmail, parseMonths, parsePhone } from '../
  * `config.responseMimeType: "application/json"` + `responseJsonSchema`.
  */
 
-export const INTENT_NAMES = ['OPEN_SEARCH', 'CREATE_TEST_DRAFT', 'CORRECTION', 'UNKNOWN'] as const;
+export const INTENT_NAMES = [
+  'OPEN_SEARCH',
+  'CREATE_TEST_DRAFT',
+  'CORRECTION',
+  'OPEN_OPERATE',
+  'OPEN_EXPIRED',
+  'OPEN_INVENTORY',
+  'OPEN_CASH',
+  'OPEN_MORE',
+  'UNKNOWN',
+] as const;
 
 export type IntentName = (typeof INTENT_NAMES)[number];
 
@@ -86,10 +96,16 @@ const INTENT_JSON_SCHEMA = {
 
 const SYSTEM_PROMPT =
   'You classify Telegram bot messages into intents. ' +
-  'Reply with JSON only: {"name": <OPEN_SEARCH|CREATE_TEST_DRAFT|CORRECTION|UNKNOWN>, "params": {...}}. ' +
+  'Reply with JSON only: {"name": <OPEN_SEARCH|CREATE_TEST_DRAFT|CORRECTION|OPEN_OPERATE|OPEN_EXPIRED|OPEN_INVENTORY|OPEN_CASH|OPEN_MORE|UNKNOWN>, "params": {...}}. ' +
   'OPEN_SEARCH: user wants to search a customer/account. ' +
-  'CREATE_TEST_DRAFT: user wants to create a test/demo operation. ' +
+  'CREATE_TEST_DRAFT: user wants to create a test/demo operation (params.months when stated). ' +
   'CORRECTION: user corrects an open draft (params.months = month count when mentioned). ' +
+  'OPEN_OPERATE: generic operate request with no months ("quiero hacer una operación", "necesito operar") — same draft shell as the OPERAR button. ' +
+  'OPEN_EXPIRED: expired/expiring accounts ("qué se me venció", "cuáles están vencidos", "algo por vencer") — same placeholder as the VENCIDOS button. ' +
+  'OPEN_INVENTORY: availability/stock ("qué tengo disponible", "cómo está el inventario", "hay Netflix") — same placeholder as the INVENTARIO button. ' +
+  'OPEN_CASH: cash register ("cómo está la caja", "qué entró hoy") — same placeholder as the CAJA button. ' +
+  'OPEN_MORE: help/other options ("qué más puedo hacer", "muéstrame otras opciones") — same placeholder as the MÁS button. ' +
+  'Sell/renew verbs (vender, renovar) map to the future prepareSale/prepareRenewal CONTRACTS ONLY: no implementation exists, so return UNKNOWN and the app stays guarded. ' +
   'Otherwise UNKNOWN. ' +
   'Interpretation ONLY: never execute, never mutate, never skip guards. ' +
   'Extract intent/params/references/corrections verbatim from the text: ' +
@@ -106,9 +122,21 @@ export class StubIntentInterpreter implements IntentInterpreter {
   async interpret(text: string, _ctx: SessionCtx): Promise<Intent> {
     this.calls += 1;
     const lowered = text.toLowerCase();
+    // Accent-folded copy: the stub plays Gemini's semantic role, so it
+    // tolerates accents/case/typos the deterministic L2 leaves behind.
+    const folded = text
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
     const monthsMatch = /(\d{1,2})\s*mes(?:es)?\b/.exec(lowered);
     if (/(mejor|cambia|hazlo|corrige|correcci)/.test(lowered) && monthsMatch?.[1] !== undefined) {
       return { name: 'CORRECTION', params: { months: Number(monthsMatch[1]) }, confidence: 1 };
+    }
+    // Sell/renew verbs are CONTRACT-ONLY (future prepareSale/
+    // prepareRenewal): no implementation exists, so they stay UNKNOWN
+    // and the app executes nothing — never a search, never a draft.
+    if (/(vend|renov)/.test(folded)) {
+      return { name: 'UNKNOWN', params: {}, confidence: 1 };
     }
     // Identifier found verbatim in the text → the app searches it
     // directly (ask-only-what-is-missing: nothing is missing).
@@ -120,6 +148,36 @@ export class StubIntentInterpreter implements IntentInterpreter {
     // it from the actor's own context, never a peer's.
     if (/(esa|ese|eso|misma|mismo|esta|este|anterior|última|ultima)\b/.test(lowered)) {
       return { name: 'OPEN_SEARCH', params: { reference: 'last' }, confidence: 1 };
+    }
+    // Section twins (same handlers as the home buttons — checked BEFORE
+    // the generic search verbs so "dime cuáles están vencidos" reaches
+    // the vencidos placeholder instead of the search wizard).
+    if (/vencid|por vencer|se me venci|vencimiento|por venser|vensid|bencid/.test(folded)) {
+      return { name: 'OPEN_EXPIRED', params: {}, confidence: 1 };
+    }
+    if (
+      /inventario|imventario|inbentario|disponible|existencia|stock|hay (netflix|flujo)|queda.*netflix/.test(
+        folded,
+      )
+    ) {
+      return { name: 'OPEN_INVENTORY', params: {}, confidence: 1 };
+    }
+    if (/caja|kaja|entro hoy|cuadre/.test(folded)) {
+      return { name: 'OPEN_CASH', params: {}, confidence: 1 };
+    }
+    if (/que mas|otras opciones|muestrame|ayuda/.test(folded)) {
+      return { name: 'OPEN_MORE', params: {}, confidence: 1 };
+    }
+    // Generic operate WITHOUT months → same draft shell as the OPERAR
+    // button. With months stated → full CREATE_TEST_DRAFT (params
+    // preserved, never invented).
+    if (/operar|operacion/.test(folded)) {
+      const months = parseMonths(text);
+      return {
+        name: months === null ? 'OPEN_OPERATE' : 'CREATE_TEST_DRAFT',
+        params: months === null ? {} : { months: months.months },
+        confidence: 1,
+      };
     }
     if (/\b(busc|revis|consult|mir|ficha|cliente|cuenta|vence|vencim|pasa con|dime|averigua)\w*\b/.test(lowered)) {
       return { name: 'OPEN_SEARCH', params: {}, confidence: 1 };

@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadFixtureAccounts, type MockAccount } from './excelLoader';
+import { normalizePhoneKeys, phonesMatch, splitStoredNumbers } from './phone';
 
 /**
  * MOCK account store: in-memory rows loaded either from the persisted
@@ -76,13 +77,24 @@ export class MockStore {
     }
   }
 
-  /** Deterministic substring search (max MAX_SEARCH_RESULTS, stable order). */
+  /**
+   * Deterministic substring search (max MAX_SEARCH_RESULTS, stable order).
+   *
+   * Phone matching goes through THE one normalizer (`./phone`): both the
+   * query and every stored NUMERO cell (multi-number cells split on `/`)
+   * become canonical key sets, matched by E.164 equality or digit-suffix
+   * overlap — so `4145460657`, `0414-5460657` and `+58 414-5460657` all
+   * hit the same row with no hardcoded prefix stripping. A legacy
+   * digit-substring fallback (>=3 digits) keeps short/partial entry
+   * working exactly as before.
+   */
   search(query: string): MockAccount[] {
     const q = query.toLowerCase().trim();
     if (q === '') {
       return [];
     }
     const digits = q.replace(/\D/g, '');
+    const queryKeys = normalizePhoneKeys(q);
     // Whitespace-insensitive service comparison so "Flujo TV", "flujotv"
     // and "FlujoTV" all match the `flujotv` service (same for Netflix).
     const compact = q.replace(/\s+/g, '');
@@ -96,6 +108,12 @@ export class MockStore {
         account.servicio.toLowerCase().includes(compact)
       ) {
         return true;
+      }
+      if (queryKeys.length > 0) {
+        const cells = splitStoredNumbers(account.numero);
+        if (cells.some((cell) => phonesMatch(queryKeys, normalizePhoneKeys(cell)))) {
+          return true;
+        }
       }
       return digits.length >= 3 && account.numero.replace(/\D/g, '').includes(digits);
     });
