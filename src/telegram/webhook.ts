@@ -7,11 +7,17 @@ import { AlertService } from '../alerts/alerts';
 import type { Env } from '../config/env';
 import { DraftEngine, type DraftOwner, type DraftResult } from '../drafts/engine';
 import {
+  CustomerSelectionStore,
+  formatCustomerCard,
+  type Customer,
+} from '../mock/customers';
+import {
   InteractionStore,
   type Interaction,
   type InteractionType,
 } from '../interactions/interactions';
 import type { MockRepositories, SafeAccount } from '../mock/repositories';
+import { containsPhoneCandidate } from '../parser/fast';
 import { route } from '../router/hybrid';
 import { SessionStore } from '../session/store';
 import {
@@ -25,6 +31,7 @@ import {
   SECTION_TEXTS,
   draftKeyboard,
   homeKeyboard,
+  phoneSearchKeyboard,
   searchResultsKeyboard,
   sectionKeyboard,
   withOperator,
@@ -46,6 +53,13 @@ export const SECRET_HEADER = 'x-telegram-bot-api-secret-token';
 export const UNAUTHORIZED_TEXT = '⛔ No tienes acceso a Vokath.';
 export const UNKNOWN_TEXT = '❓ No entendí — usa los botones o /start.';
 export const NO_RESULTS_TEXT = '🔎 Sin resultados MOCK.';
+/**
+ * Read-only phone not-found (BR-CUS-008): report + offer retry/volver.
+ * NEVER "Crear cliente" — creation belongs exclusively to the explicit
+ * new-sale flow (BR-CUS-009).
+ */
+export const PHONE_NOT_FOUND_TEXT =
+  '🔎 No encontrado\nNo encontramos ningún cliente asociado a ese número.';
 export const NO_DRAFT_TEXT = 'No hay borrador abierto. Usa ⚡OPERAR para crear uno.';
 export const DRAFT_UPDATED_PREFIX = '📝 Borrador actualizado:';
 export const CORRECTION_PROMPT_TEXT = '✏️ Envía la corrección (ej. «hazlo 2 meses»).';
@@ -1048,13 +1062,132 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * THE shared deterministic search entry: parameterized NL and the
      * guided wizard's eventual input converge here (one SEARCH
      * interaction per request, then the repo seam). Complete reads
-     * execute immediately with NO confirmation.
+     * execute immediately with NO confirmation. Phone-like identifiers
+     * take the read-only customer UX (card/list/not-found, drafts
+     * untouched); every other identifier keeps the legacy account-row
+     * flow.
      */
     async function runDirectSearch(identifier: string): Promise<void> {
       // Per-requester search interaction: result buttons reject the peer;
       // the peer starts their own search. Both coexist.
+      if (containsPhoneCandidate(identifier)) {
+        const interaction = createInteraction('SEARCH', { view: 'customer-list', offset: 0 });
+        await renderCustomerSearch(interaction, identifier);
+        return;
+      }
       const interaction = createInteraction('SEARCH', { view: 'list', offset: 0 });
       await renderSearchPage(interaction, identifier);
+    }
+
+    /** Last-selected customer per actor (future "ese cliente" reference). */
+    const selections = new CustomerSelectionStore();
+
+    function rememberCustomerSelection(customer: Customer): void {
+      selections.select(targetChatId, targetActorId, customer);
+    }
+
+    /**
+     * Read-only phone search UX (BR-CUS-005/008/009): 0 → not-found +
+     * [Buscar otro][Volver] (never "Crear cliente"); 1 → direct summary
+     * card; N → owner-bound disambiguation list. Read-only: drafts are
+     * never created, updated, or cancelled here.
+     */
+    async function renderCustomerSearch(interaction: Interaction, query: string): Promise<void> {
+      const customers = await deps.repos.searchCustomersByPhone(query);
+      const total = customers.length;
+      if (total === 0) {
+        deps.interactions.touch(interaction.id, { query, offset: 0, view: 'customer-list' });
+        persistAll();
+        await sendLabeled(
+          `${PHONE_NOT_FOUND_TEXT} Escribe otro número para reintentar o pulsa Volver.`,
+          phoneSearchKeyboard(interaction.id),
+          interaction.messageThreadId,
+        );
+        return;
+      }
+      if (total === 1) {
+        const only = customers[0] as Customer;
+        rememberCustomerSelection(only);
+        deps.interactions.touch(interaction.id, {
+          query,
+          view: 'customer-detail',
+          selectedCustomer: { id: only.id, nombre: only.nombre },
+        });
+        persistAll();
+        await sendLabeled(
+          formatCustomerCard(only),
+          phoneSearchKeyboard(interaction.id),
+          interaction.messageThreadId,
+        );
+        return;
+      }
+      const offset =
+        typeof interaction.state['offset'] === 'number'
+          ? (interaction.state['offset'] as number)
+          : 0;
+      const safeOffset = Math.min(Math.max(offset, 0), Math.max(total - 1, 0));
+      const page = customers.slice(safeOffset, safeOffset + SEARCH_PAGE_SIZE);
+      const lines = page.map(
+        (customer, index) =>
+          `${safeOffset + index + 1}. ${customer.nombre} — ${customer.phones.join(' / ')}`,
+      );
+      deps.interactions.touch(interaction.id, {
+        query,
+        offset: safeOffset,
+        view: 'customer-list',
+        total,
+      });
+      persistAll();
+      await sendLabeled(
+        `🔎 ${total} clientes comparten ese número. Elige uno:\n${lines.join('\n')}`,
+        searchResultsKeyboard(page.length, {
+          interactionId: interaction.id,
+          hasNext: safeOffset + SEARCH_PAGE_SIZE < total,
+          hasPrev: safeOffset > 0,
+        }),
+        interaction.messageThreadId,
+      );
+    }
+
+    /** Customer detail from the owned disambiguation list (stores selection). */
+    async function renderCustomerDetail(
+      interaction: Interaction,
+      query: string,
+      customerIndex: number,
+    ): Promise<void> {
+      const customers = await deps.repos.searchCustomersByPhone(query);
+      const customer = customers[customerIndex];
+      if (customer === undefined) {
+        await ackStale('view');
+        return;
+      }
+      rememberCustomerSelection(customer);
+      deps.interactions.touch(interaction.id, {
+        query,
+        view: 'customer-detail',
+        selectedCustomer: { id: customer.id, nombre: customer.nombre },
+      });
+      persistAll();
+      await sendLabeled(
+        formatCustomerCard(customer),
+        phoneSearchKeyboard(interaction.id),
+        interaction.messageThreadId,
+      );
+    }
+
+    /**
+     * Dataless buscar prompt — the SAME wizard the BUSCAR button opens.
+     * Serves the L2 `buscar` section (dataless re-entry: "buscar otro
+     * número", "otra cuenta") so button≡NL with zero Gemini.
+     */
+    async function showSearchPrompt(thread?: number): Promise<void> {
+      const view = createInteraction('SEARCH', { view: 'prompt' });
+      persistAll();
+      await sendLabeled(
+        SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR (demo)',
+        sectionKeyboard('buscar', view.id),
+        thread ?? view.messageThreadId,
+      );
     }
 
     function sectionInteractionType(section: string | undefined): InteractionType {
@@ -1226,7 +1359,24 @@ export function createWebhookHandler(deps: WebhookDeps) {
       interaction: Interaction,
     ): Promise<void> {
       if (action === 'home' || action === 'back') {
-        if (interaction.type === 'SEARCH' && interaction.state['view'] === 'detail') {
+        if (interaction.type === 'SEARCH' && interaction.state['view'] === 'customer-detail') {
+          // Volver from a customer card: back to the owned
+          // disambiguation list when one exists (N results), Home for a
+          // direct single-card (no list to return to) — drafts and
+          // persistent requirements are never deleted either way.
+          const query =
+            typeof interaction.state['query'] === 'string'
+              ? (interaction.state['query'] as string)
+              : '';
+          const total =
+            typeof interaction.state['total'] === 'number'
+              ? (interaction.state['total'] as number)
+              : 0;
+          if (total > 1) {
+            await renderCustomerSearch(interaction, query);
+            return;
+          }
+        } else if (interaction.type === 'SEARCH' && interaction.state['view'] === 'detail') {
           // Volver belongs to the interaction: back to the owned list,
           // never deleting drafts or persistent requirements.
           const query =
@@ -1328,6 +1478,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
           typeof interaction.state['offset'] === 'number'
             ? (interaction.state['offset'] as number)
             : 0;
+        if (
+          interaction.state['view'] === 'customer-list' ||
+          interaction.state['view'] === 'customer-detail'
+        ) {
+          await renderCustomerDetail(interaction, query, offset + viewIndex);
+          return;
+        }
         await renderAccountDetail(interaction, query, offset + viewIndex);
         return;
       }
@@ -1344,7 +1501,12 @@ export function createWebhookHandler(deps: WebhookDeps) {
           offset:
             action === 'next' ? offset + SEARCH_PAGE_SIZE : offset - SEARCH_PAGE_SIZE,
         });
-        await renderSearchPage(deps.interactions.get(interaction.id) ?? interaction, query);
+        const target = deps.interactions.get(interaction.id) ?? interaction;
+        if (target.state['view'] === 'customer-list') {
+          await renderCustomerSearch(target, query);
+          return;
+        }
+        await renderSearchPage(target, query);
         return;
       }
       const sectionText = SECTION_TEXTS[action] ?? SECTION_TEXTS['mas'] ?? '⋯ MÁS (demo)';
@@ -1501,12 +1663,18 @@ export function createWebhookHandler(deps: WebhookDeps) {
         // returned servicio comes from the data row, never assumed.
         // L2 carries the identifier, so missingFields is empty and the
         // read executes immediately (no confirmation, no follow-up).
-        await runDirectSearch(parse.value);
+        // Phone identifiers travel `+`-preserving (`raw`) so explicit
+        // +CC keeps absolute priority in the domain layer.
+        await runDirectSearch(parse.kind === 'phone' ? parse.raw : parse.value);
         return { ok: true };
       }
       if (parse.kind === 'section') {
         // Home-section NL twin (L2, zero Gemini): the SAME shared
         // handler the button tap runs — button≡NL by construction.
+        if (parse.section === 'buscar') {
+          await showSearchPrompt();
+          return { ok: true };
+        }
         if (parse.section === 'operar') {
           await openOperateDraft();
           return { ok: true };

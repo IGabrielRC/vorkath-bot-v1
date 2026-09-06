@@ -90,12 +90,29 @@ describe('phone identity: E.164-first, never last-7', () => {
     ]);
   });
 
-  it('ambiguity returns ALL candidates, never one arbitrary pick', async () => {
+  it('short shared tails are NOT an identity: no contains/suffix match', async () => {
     const store = await twinStore();
-    const rows = store.search('5460657');
-    expect(rows.map((account) => account.nombre).sort()).toEqual([
-      'Ana Torres',
-      'Bruno Diaz',
+    // `5460657` is a 7-digit tail shared by both rows — under the old
+    // digit-substring fallback it returned both; exact-key identity
+    // matches nothing (BR-CUS-007: a partial tail is not an identity).
+    expect(store.search('5460657')).toEqual([]);
+  });
+
+  it('ambiguity returns ALL candidates, never one arbitrary pick', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vokath-phone-shared-'));
+    const statePath = join(dir, 'mock-state.json');
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        accounts: [row('Stefania Marmai (Gian)', '4141294973'), row('Iliana Rodriguez', '4141294973')],
+      }),
+      'utf8',
+    );
+    const store = await MockStore.create({ fixturePath: FIXTURE, statePath });
+    // One shared phone, two customers: both surface for disambiguation.
+    expect(store.search('4141294973').map((account) => account.nombre).sort()).toEqual([
+      'Iliana Rodriguez',
+      'Stefania Marmai (Gian)',
     ]);
   });
 });

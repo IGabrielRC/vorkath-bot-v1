@@ -362,6 +362,7 @@ describe('twins: button≈NL equivalence per section (webhook, same handler/tool
   it('BUSCAR ≡ "revisame maxnet050 a ver como esta" + international phone', async () => {
     const world = await createTwinWorld();
     const searchSpy = vi.spyOn(world.repos, 'searchAccounts');
+    const customerSpy = vi.spyOn(world.repos, 'searchCustomersByPhone');
     await world.post(
       twinMessage(world.nextUpdateId(), GABRIEL, 'revisame maxnet050 a ver como esta'),
     );
@@ -370,7 +371,7 @@ describe('twins: button≈NL equivalence per section (webhook, same handler/tool
     expect(world.client.texts().at(-1)).toContain('Jackson Amaya');
 
     await world.post(twinMessage(world.nextUpdateId(), GABRIEL, '+58 414-5460657'));
-    expect(searchSpy).toHaveBeenCalledWith('584145460657');
+    expect(customerSpy).toHaveBeenCalledWith('+584145460657');
     expect(world.client.texts().at(-1)).toContain('Anny Tovar');
     await world.app.close();
   });

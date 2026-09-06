@@ -377,7 +377,7 @@ describe('B. Search isolation (5–10)', () => {
 
   it('(7) Edward tapping Gabriel Ver-cliente button is cross-rejected', async () => {
     const world = await createOwnerWorld();
-    await world.post(groupMessage(world.nextUpdateId(), GABRIEL, '4145460657'));
+    await world.post(groupMessage(world.nextUpdateId(), GABRIEL, '4141294973'));
     const gabrielView = world.client.findButton('1️⃣ Ver cliente');
     if (gabrielView === undefined) {
       throw new Error('Gabriel result button missing');
@@ -394,14 +394,14 @@ describe('B. Search isolation (5–10)', () => {
 
   it('(8) Gabriel tapping his own Ver-cliente button opens the detail', async () => {
     const world = await createOwnerWorld();
-    await world.post(groupMessage(world.nextUpdateId(), GABRIEL, '4145460657'));
+    await world.post(groupMessage(world.nextUpdateId(), GABRIEL, '4141294973'));
     const gabrielView = world.client.findButton('1️⃣ Ver cliente');
     if (gabrielView === undefined) {
       throw new Error('Gabriel result button missing');
     }
     await world.post(groupCallback(world.nextUpdateId(), GABRIEL, gabrielView));
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('Anny Tovar');
+    expect(last).toMatch(/Stefania Marmai \(Gian\)|Iliana Rodriguez/);
     expect(last).toContain('👤 Operador: Gabriel');
     await world.app.close();
   });

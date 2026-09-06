@@ -195,6 +195,22 @@ export function sectionKeyboard(section: string, interactionId?: string): Inline
   };
 }
 
+/**
+ * Phone-search keyboard: [🔎Buscar otro] re-opens the SAME guided
+ * wizard the BUSCAR button opens (same `buscar` action/handler), and
+ * [←Volver] returns Home. Used by the read-only phone UX (not-found,
+ * single-card, customer detail). NEVER a "Crear cliente" button here —
+ * creation belongs exclusively to the explicit new-sale flow
+ * (BR-CUS-009).
+ */
+export function phoneSearchKeyboard(interactionId?: string): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [ownedButton('🔎Buscar otro', 'buscar', interactionId), backButton(interactionId)],
+    ],
+  };
+}
+
 /** Draft actions: Confirmar / Corregir / Cancelar + ←Volver to Home. */
 export function draftKeyboard(interactionId?: string): InlineKeyboardMarkup {
   return {

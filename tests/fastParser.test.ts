@@ -3,7 +3,11 @@ import { parseEmail, parseFast, parseMonths, parsePhone, parseService } from '..
 
 describe('fast parser L2 (RED: zero Gemini — deterministic only)', () => {
   it('detects phone numbers with >=7 digits', () => {
-    expect(parsePhone('+58 412 123 4567')).toEqual({ kind: 'phone', value: '584121234567' });
+    expect(parsePhone('+58 412 123 4567')).toEqual({
+      kind: 'phone',
+      value: '584121234567',
+      raw: '+584121234567',
+    });
     expect(parsePhone('llámame al 0412-000-1111 porfa')).toMatchObject({ kind: 'phone' });
   });
 

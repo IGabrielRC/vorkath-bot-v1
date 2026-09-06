@@ -224,7 +224,7 @@ describe('slot filling: L2 extraction (unit)', () => {
   });
 
   it('keeps phone/email priority anywhere in the text', () => {
-    expect(parseFast('busca 4145460657')).toEqual({ kind: 'phone', value: '4145460657' });
+    expect(parseFast('busca 4145460657')).toEqual({ kind: 'phone', value: '4145460657', raw: '4145460657' });
     expect(parseFast('busca usuario@gmail.com')).toMatchObject({ kind: 'email' });
   });
 
@@ -343,7 +343,7 @@ describe('slot filling: search with identifier (webhook)', () => {
 
   it('(4) "busca 4145460657" extracts the phone and searches directly', async () => {
     const world = await createSlotWorld();
-    const searchSpy = vi.spyOn(world.repos, 'searchAccounts');
+    const searchSpy = vi.spyOn(world.repos, 'searchCustomersByPhone');
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'busca 4145460657'));
     expect(world.interpreter.calls).toBe(0);
     expect(searchSpy).toHaveBeenCalledWith('4145460657');

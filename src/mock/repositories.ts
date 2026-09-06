@@ -1,3 +1,5 @@
+import type { Customer } from './customers';
+import { groupRowsIntoCustomers } from './customers';
 import type { MockAccount, MockService } from './excelLoader';
 import type { MockStore } from './mockStore';
 
@@ -30,6 +32,13 @@ export interface InventorySummary {
 
 export interface MockRepositories {
   searchAccounts(query: string): Promise<SafeAccount[]>;
+  /**
+   * Read-only phone search: phone-identity row matching
+   * (`MockStore.searchByPhone`) grouped into customers HERE (domain
+   * layer — CLIENTE ≠ TELÉFONO). Safe by construction: customers carry
+   * no CORREO/CONTRASEÑA/PIN.
+   */
+  searchCustomersByPhone(query: string): Promise<Customer[]>;
   getExpiredAccounts(): Promise<SafeAccount[]>;
   getInventorySummary(): Promise<InventorySummary[]>;
 }
@@ -50,6 +59,10 @@ export class MockAccountRepositories implements MockRepositories {
 
   async searchAccounts(query: string): Promise<SafeAccount[]> {
     return this.store.search(query).map(toSafeAccount);
+  }
+
+  async searchCustomersByPhone(query: string): Promise<Customer[]> {
+    return groupRowsIntoCustomers(this.store.searchByPhone(query));
   }
 
   async getExpiredAccounts(): Promise<SafeAccount[]> {

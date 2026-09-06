@@ -15,7 +15,7 @@ export type FastCommand =
 export type FastParseResult =
   | { kind: 'command'; command: FastCommand }
   | { kind: 'email'; value: string }
-  | { kind: 'phone'; value: string }
+  | { kind: 'phone'; value: string; raw: string }
   | { kind: 'createTest'; months: number }
   | { kind: 'section'; section: FastSection }
   | { kind: 'months'; months: number }
@@ -29,7 +29,7 @@ export type FastParseResult =
  * and the phrase end in the SAME handler. BUSCAR needs no section value:
  * its NL twin is the identifier search (phone/email/account kinds).
  */
-export type FastSection = 'operar' | 'vencidos' | 'inventario' | 'caja' | 'mas';
+export type FastSection = 'operar' | 'vencidos' | 'inventario' | 'caja' | 'mas' | 'buscar';
 
 /**
  * Normalizes free text for deterministic matching: lowercase + accent
@@ -71,12 +71,61 @@ export function parseEmail(text: string): { kind: 'email'; value: string } | nul
 }
 
 /** Returns digits-only phone when >=7 digits exist, else null. */
-export function parsePhone(text: string): { kind: 'phone'; value: string } | null {
-  const digits = text.replace(/\D/g, '');
-  if (digits.length < MIN_PHONE_DIGITS) {
+export function parsePhone(text: string): { kind: 'phone'; value: string; raw: string } | null {
+  const candidates = extractPhoneCandidates(text);
+  const first = candidates[0];
+  if (first === undefined) {
     return null;
   }
-  return { kind: 'phone', value: digits };
+  return { kind: 'phone', value: first.digits, raw: first.raw };
+}
+
+/**
+ * WhatsApp-paste extraction (PARSER layer only — never Telegram
+ * handlers, never external services/APIs).
+ *
+ * Free text pasted from WhatsApp carries numbers with `+`, spaces,
+ * dashes, dots and parens (`+58 414-5460657`, `(0424) 203-9835`,
+ * `escríbeme al 414 546 0657 o al 4242039835`). Each run with >=7
+ * digits becomes a candidate in typed order: `digits` is the bare
+ * digit run, `raw` keeps the explicit `+` when present (plus-first
+ * runs only) so the domain layer can give `+CC` absolute priority via
+ * libphonenumber metadata instead of VE-defaulting it. The FIRST
+ * candidate wins for single-identifier search; stored multi-number
+ * cells split on the repository side.
+ */
+export interface PhoneCandidate {
+  /** Bare digits, e.g. `584145460657`. */
+  digits: string;
+  /** `+`-preserving form, e.g. `+584145460657` (or bare digits). */
+  raw: string;
+}
+
+const PASTE_CANDIDATE_RE = /\+?[\d][\d\s\-.()]{5,}[\d]/g;
+
+export function extractPhoneCandidates(text: string): PhoneCandidate[] {
+  const found: PhoneCandidate[] = [];
+  PASTE_CANDIDATE_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = PASTE_CANDIDATE_RE.exec(text)) !== null) {
+    const chunk = match[0] ?? '';
+    const digits = chunk.replace(/\D/g, '');
+    if (digits.length < MIN_PHONE_DIGITS) {
+      continue;
+    }
+    const explicitPlus = chunk.trimStart().startsWith('+');
+    const raw = `${explicitPlus ? '+' : ''}${digits}`;
+    if (found.some((candidate) => candidate.raw === raw)) {
+      continue;
+    }
+    found.push({ digits, raw });
+  }
+  return found;
+}
+
+/** True when the text carries at least one >=7-digit phone candidate. */
+export function containsPhoneCandidate(text: string): boolean {
+  return extractPhoneCandidates(text).length > 0;
 }
 
 /** Returns month count for "N mes(es)" (anywhere in the text), else null. */
@@ -127,6 +176,11 @@ export function parseCreateTest(text: string): { kind: 'createTest'; months: num
  * - Generic "buscar …" prose is NOT a section: identifier-less search
  *   requests ("quiero buscar un cliente") keep falling through to L3,
  *   which asks only for the missing identifier.
+ * - Dataless re-entry ("buscar otro número", "otra cuenta", "otro
+ *   número") IS the `buscar` section: no identifier is stated, so it
+ *   opens the SAME guided wizard the BUSCAR button opens (button≡NL).
+ *   Identifier-bearing text never matches (it resolves to `phone`/
+ *   `email`/`account` earlier in the cascade).
  */
 export function parseSection(text: string): { kind: 'section'; section: FastSection } | null {
   const n = normalizeText(text);
@@ -151,6 +205,9 @@ export function parseSection(text: string): { kind: 'section'; section: FastSect
   }
   if (/\boperar\b|\boperacion(es)?\b/.test(n)) {
     return { kind: 'section', section: 'operar' };
+  }
+  if (/busca\w*\s+otro|otro\s+numero|otra\s+cuenta/.test(n)) {
+    return { kind: 'section', section: 'buscar' };
   }
   return null;
 }

@@ -197,7 +197,8 @@ describe('webhook MOCK search via L2 (zero Gemini, secret-free replies)', () => 
     expect(world.interpreter.calls).toBe(0);
     const last = world.client.texts().at(-1) ?? '';
     expect(last).toContain('Anny Tovar');
-    expect(last).toContain('resultado(s) MOCK');
+    expect(last).toContain('4145460657');
+    expect(last).not.toContain('resultado(s) MOCK');
     const payload = JSON.stringify(world.client.sent);
     expect(payload).not.toContain('ncsa909');
     expect(payload).not.toContain('contrasena');

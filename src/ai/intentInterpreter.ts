@@ -207,7 +207,7 @@ function extractStubIdentifier(text: string): string | undefined {
   }
   const phone = parsePhone(text);
   if (phone !== null) {
-    return phone.value;
+    return phone.raw;
   }
   const account = extractEmbeddedAccount(text);
   if (account !== null) {

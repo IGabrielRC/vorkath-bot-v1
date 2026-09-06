@@ -87,16 +87,15 @@ export class MockStore {
    * region metadata proves sameness, identical digit strings otherwise —
    * so `4145460657`, `0414-5460657` and `+58 414-5460657` all hit the
    * same row with no hardcoded prefix stripping and no suffix rule.
-   * Distinct numbers sharing trailing digits never collide; a legacy
-   * digit-substring fallback (>=3 digits) keeps short/partial entry
-   * working exactly as before, returning every candidate row.
+   * Distinct numbers sharing trailing digits never collide. There is NO
+   * digit-substring/contains fallback: a partial tail is not an identity
+   * (BR-CUS-007).
    */
   search(query: string): MockAccount[] {
     const q = query.toLowerCase().trim();
     if (q === '') {
       return [];
     }
-    const digits = q.replace(/\D/g, '');
     const queryKeys = normalizePhoneKeys(q);
     // Whitespace-insensitive service comparison so "Flujo TV", "flujotv"
     // and "FlujoTV" all match the `flujotv` service (same for Netflix).
@@ -118,7 +117,29 @@ export class MockStore {
           return true;
         }
       }
-      return digits.length >= 3 && account.numero.replace(/\D/g, '').includes(digits);
+      return false;
+    });
+    return matches.slice(0, MAX_SEARCH_RESULTS);
+  }
+
+  /**
+   * Phone-identity row search: the SAME exact-key matching as `search`
+   * but restricted to NUMERO cells (no name/email/service substrings).
+   * Backs the read-only phone UX (`searchCustomersByPhone`), which
+   * groups these rows into customers in the domain layer.
+   */
+  searchByPhone(query: string): MockAccount[] {
+    const q = query.trim();
+    if (q === '') {
+      return [];
+    }
+    const queryKeys = normalizePhoneKeys(q);
+    if (queryKeys.length === 0) {
+      return [];
+    }
+    const matches = this.accounts.filter((account) => {
+      const cells = splitStoredNumbers(account.numero);
+      return cells.some((cell) => phonesMatch(queryKeys, normalizePhoneKeys(cell)));
     });
     return matches.slice(0, MAX_SEARCH_RESULTS);
   }

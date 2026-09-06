@@ -428,12 +428,16 @@ describe('conversational contract: buttons ≡ NL (1-8)', () => {
     });
     expect(nlDraftSpy.mock.calls[0]?.[0]).toEqual(buttonDraftSpy.mock.calls[0]?.[0]);
 
-    // Search entry shared between phone-shaped and account-shaped NL.
+    // Search entry shared between phone-shaped and account-shaped NL
+    // (one entry point; phone identifiers resolve via the customer seam,
+    // account identifiers via the account seam — no duplicated logic).
     const searchWorld = await createProfileWorld();
-    const searchSpy = vi.spyOn(searchWorld.repos, 'searchAccounts');
+    const customerSpy = vi.spyOn(searchWorld.repos, 'searchCustomersByPhone');
+    const accountSpy = vi.spyOn(searchWorld.repos, 'searchAccounts');
     await searchWorld.post(profileMessage(searchWorld.nextUpdateId(), GABRIEL, '4145460657'));
     await searchWorld.post(profileMessage(searchWorld.nextUpdateId(), GABRIEL, 'cmaxnet001'));
-    expect(searchSpy).toHaveBeenCalledTimes(2);
+    expect(customerSpy).toHaveBeenCalledWith('4145460657');
+    expect(accountSpy).toHaveBeenCalledWith('cmaxnet001');
     expect(searchWorld.interpreter.calls).toBe(0);
     await buttonWorld.app.close();
     await nlWorld.app.close();
