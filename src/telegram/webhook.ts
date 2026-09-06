@@ -118,6 +118,8 @@ export interface WebhookDeps {
   draftsStatePath?: string;
   /** File path for best-effort interaction persistence; undefined disables it. */
   interactionsStatePath?: string;
+  /** File path for best-effort OperatorProfile persistence; undefined disables it. */
+  operatorProfilesStatePath?: string;
 }
 
 interface TelegramUser {
@@ -281,12 +283,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
     const fromUser = callback?.from ?? message?.from;
     /**
-     * Display name NEVER renders empty (the empty-label fix): operator
-     * alias/config when one exists → first_name + last_name → username →
-     * `Usuario <id>`. `last_name` was previously dropped entirely.
+     * Pre-auth display name: READ-ONLY (touches nothing — rejected updates
+     * leave zero trace: no session, no draft, no interaction, no profile,
+     * no Gemini, no MOCK). Operator alias when one exists → live
+     * first_name + last_name → @username → `Usuario <id>`: never empty.
      */
     const storedAlias = deps.interactions.resolveNameByUserId(chatId, actorId);
-    const actorName = resolveDisplayName({
+    const preAuthName = resolveDisplayName({
       ...(storedAlias !== undefined ? { alias: storedAlias } : {}),
       ...(fromUser?.first_name !== undefined ? { firstName: fromUser.first_name } : {}),
       ...(fromUser?.last_name !== undefined ? { lastName: fromUser.last_name } : {}),
@@ -299,7 +302,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       auditor.record({
         chatId,
         actorTelegramUserId: actorId,
-        ...(actorName !== undefined ? { actorName } : {}),
+        actorName: preAuthName,
         actionType: 'auth.rejected_user',
         ...(updateId !== undefined ? { metadata: { updateId } } : {}),
       });
@@ -312,13 +315,29 @@ export function createWebhookHandler(deps: WebhookDeps) {
       auditor.record({
         chatId,
         actorTelegramUserId: actorId,
-        ...(actorName !== undefined ? { actorName } : {}),
+        actorName: preAuthName,
         actionType: 'auth.rejected_chat',
         ...(updateId !== undefined ? { metadata: { updateId } } : {}),
       });
       await sendEarly(UNAUTHORIZED_TEXT);
       return { ok: true };
     }
+
+    /**
+     * OperatorProfile upsert: EVERY authorized update (message AND
+     * callback_query.from) creates-or-refreshes the profile from live
+     * Telegram `from` fields. userId stays the ONLY security/ownership
+     * key; the profile only feeds display names. From here on, actorName
+     * is the central resolution used by EVERY render (labels, toasts,
+     * guides, alerts, topic names) — never empty, never id-leaking.
+     */
+    const profile = deps.interactions.upsertOperatorProfile(chatId, {
+      id: actorId,
+      ...(fromUser?.first_name !== undefined ? { first_name: fromUser.first_name } : {}),
+      ...(fromUser?.last_name !== undefined ? { last_name: fromUser.last_name } : {}),
+      ...(fromUser?.username !== undefined ? { username: fromUser.username } : {}),
+    });
+    const actorName: string = profile?.displayName ?? preAuthName;
 
     const operatorTopics: OperatorTopics = deps.operatorTopics ?? new Map();
     const modeB = operatorTopics.size > 0;
@@ -625,6 +644,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
       if (deps.interactionsStatePath !== undefined) {
         deps.interactions.saveToFile(deps.interactionsStatePath).catch((error) => {
           logger.warn({ error }, 'Interaction persist failed');
+        });
+      }
+      if (deps.operatorProfilesStatePath !== undefined) {
+        deps.interactions.saveProfilesToFile(deps.operatorProfilesStatePath).catch((error) => {
+          logger.warn({ error }, 'OperatorProfile persist failed');
         });
       }
     }

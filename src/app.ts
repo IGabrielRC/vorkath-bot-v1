@@ -55,6 +55,8 @@ export interface AppDeps {
   draftsStatePath?: string;
   /** Interaction snapshot path; undefined disables best-effort persist (tests). */
   interactionsStatePath?: string;
+  /** OperatorProfile snapshot path; undefined disables best-effort persist (tests). */
+  operatorProfilesStatePath?: string;
 }
 
 export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInstance {
@@ -94,6 +96,9 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
     ...(deps.draftsStatePath !== undefined ? { draftsStatePath: deps.draftsStatePath } : {}),
     ...(deps.interactionsStatePath !== undefined
       ? { interactionsStatePath: deps.interactionsStatePath }
+      : {}),
+    ...(deps.operatorProfilesStatePath !== undefined
+      ? { operatorProfilesStatePath: deps.operatorProfilesStatePath }
       : {}),
   });
 
@@ -164,12 +169,25 @@ export async function startApp(): Promise<void> {
     logger.error(error, 'Failed to load interaction snapshot — booting with empty interactions');
   }
 
+  // OperatorProfiles survive redeploys via their own snapshot: a restart
+  // keeps every auto-learned display name. Missing file = first boot.
+  try {
+    await interactions.loadProfilesFromFile(env.OPERATOR_PROFILES_STATE_PATH);
+    logger.info(
+      { profiles: interactions.profiles.snapshot().length },
+      'OperatorProfile snapshot loaded',
+    );
+  } catch (error) {
+    logger.error(error, 'Failed to load OperatorProfile snapshot — booting with empty profiles');
+  }
+
   const app = buildApp(env, {
     repos,
     drafts,
     interactions,
     draftsStatePath: env.DRAFTS_STATE_PATH,
     interactionsStatePath: env.INTERACTIONS_STATE_PATH,
+    operatorProfilesStatePath: env.OPERATOR_PROFILES_STATE_PATH,
   });
   await app.listen({ host: '0.0.0.0', port: env.PORT });
   logger.info({ port: env.PORT }, 'Vokath bot listening');

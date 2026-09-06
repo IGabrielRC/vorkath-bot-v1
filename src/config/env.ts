@@ -88,6 +88,11 @@ const envSchema = z.object({
   MOCK_STATE_PATH: z.string().min(1).default('/data/mock-state.json'),
   DRAFTS_STATE_PATH: z.string().min(1).default('/data/drafts-state.json'),
   INTERACTIONS_STATE_PATH: z.string().min(1).default('/data/interactions-state.json'),
+  /**
+   * OperatorProfile snapshot. Defaults to /data so EasyPanel persists
+   * profiles across redeploys with no new variable.
+   */
+  OPERATOR_PROFILES_STATE_PATH: z.string().min(1).default('/data/operator-profiles-state.json'),
 });
 
 export type Env = z.infer<typeof envSchema>;

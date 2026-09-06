@@ -1,7 +1,7 @@
 /**
  * Owner allowlist. IDs come exclusively from the
- * AUTHORIZED_TELEGRAM_USER_IDS environment variable (Gabriel + Edward,
- * equal owners). Nothing is hardcoded here by design.
+ * AUTHORIZED_TELEGRAM_USER_IDS environment variable (equal owners).
+ * Nothing is hardcoded here by design.
  */
 export function parseAuthorizedIds(raw: string): Set<number> {
   const ids = raw

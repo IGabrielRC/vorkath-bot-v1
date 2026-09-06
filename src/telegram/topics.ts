@@ -14,6 +14,8 @@
  * the guide reply instead of starting any operation.
  */
 
+import { buildDisplayName } from '../operators/operatorProfiles';
+
 /** operatorTelegramUserId → messageThreadId. Empty = Mode A. */
 export type OperatorTopics = Map<number, number>;
 
@@ -110,23 +112,17 @@ export interface DisplayNameInput {
  * Display-name resolution chain — NEVER returns an empty string:
  * 1) operator alias/config when one exists,
  * 2) Telegram first_name + last_name,
- * 3) username,
+ * 3) @username,
  * 4) `Usuario <id>` fallback.
+ * Delegates to the central OperatorProfile builder so every render
+ * shares one chain (one place, not two parallel systems).
  */
 export function resolveDisplayName(input: DisplayNameInput): string {
   const alias = input.alias?.trim();
   if (alias !== undefined && alias !== '') {
     return alias;
   }
-  const full = `${input.firstName ?? ''} ${input.lastName ?? ''}`.trim().replace(/\s+/g, ' ');
-  if (full !== '') {
-    return full;
-  }
-  const username = input.username?.trim();
-  if (username !== undefined && username !== '') {
-    return username;
-  }
-  return `Usuario ${input.userId}`;
+  return buildDisplayName(input.firstName, input.lastName, input.username, input.userId);
 }
 
 /**

@@ -1,6 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
+import {
+  OperatorProfileStore,
+  type OperatorProfile,
+  type TelegramFrom,
+} from '../operators/operatorProfiles';
 
 /**
  * Per-interaction ownership model (shared-group root-cause fix).
@@ -79,6 +84,13 @@ export class InteractionStore {
   private readonly operatorNames = new Map<string, number>();
   /** chatId → (telegram user id → operator display name), for topic mismatch labels. */
   private readonly operatorNameById = new Map<string, string>();
+  /**
+   * Central OperatorProfile store: the ONE place names live. The two
+   * legacy maps above stay as a reverse index (name → id for the
+   * reply-ownership guard) fed from every profile upsert — never a
+   * parallel source of truth for display names.
+   */
+  readonly profiles = new OperatorProfileStore();
   private writeQueue: Promise<void> = Promise.resolve();
 
   private static nameKey(chatId: number, name: string): string {
@@ -91,11 +103,49 @@ export class InteractionStore {
 
   /** Remembers an operator's display name so reply guards can resolve owners. */
   rememberOperator(chatId: number, userId: number, name: string | undefined): void {
-    if (name === undefined || name.trim() === '') {
-      return;
+    if (name !== undefined && name.trim() !== '') {
+      // First-writer-wins: duplicate display names across people must not
+      // let a same-name stranger steal the label's owner. Ownership stays
+      // id-keyed everywhere; this map is only a best-effort hint.
+      const key = InteractionStore.nameKey(chatId, name);
+      if (!this.operatorNames.has(key)) {
+        this.operatorNames.set(key, userId);
+      }
+      this.operatorNameById.set(InteractionStore.idKey(chatId, userId), name);
     }
-    this.operatorNames.set(InteractionStore.nameKey(chatId, name), userId);
-    this.operatorNameById.set(InteractionStore.idKey(chatId, userId), name);
+    const profile = this.profiles.get(userId);
+    if (profile !== undefined && profile.displayName.trim() !== '') {
+      const profileKey = InteractionStore.nameKey(chatId, profile.displayName);
+      if (!this.operatorNames.has(profileKey)) {
+        this.operatorNames.set(profileKey, userId);
+      }
+    }
+  }
+
+  /**
+   * Upserts the OperatorProfile from live Telegram `from` fields
+   * (message AND callback_query.from). First touch creates it; later
+   * touches refresh it when Telegram data changed. Also feeds the
+   * reply-guard reverse index so renamed operators stay resolvable.
+   */
+  upsertOperatorProfile(chatId: number, from: TelegramFrom): OperatorProfile | undefined {
+    const profile = this.profiles.upsert(from);
+    if (profile !== undefined) {
+      const key = InteractionStore.nameKey(chatId, profile.displayName);
+      if (!this.operatorNames.has(key)) {
+        this.operatorNames.set(key, profile.telegramUserId);
+      }
+      this.operatorNameById.set(
+        InteractionStore.idKey(chatId, profile.telegramUserId),
+        profile.displayName,
+      );
+    }
+    return profile;
+  }
+
+  /** Latest OperatorProfile for this user id, if any. */
+  getOperatorProfile(userId: number): OperatorProfile | undefined {
+    return this.profiles.get(userId);
   }
 
   resolveUserIdByName(chatId: number, name: string): number | undefined {
@@ -104,7 +154,7 @@ export class InteractionStore {
 
   /** Latest remembered display name for this operator, if any. */
   resolveNameByUserId(chatId: number, userId: number): string | undefined {
-    return this.operatorNameById.get(InteractionStore.idKey(chatId, userId));
+    return this.profiles.get(userId)?.displayName ?? this.operatorNameById.get(InteractionStore.idKey(chatId, userId));
   }
 
   create(
@@ -271,5 +321,18 @@ export class InteractionStore {
           interaction.status === 'CANCELLED'),
     );
     this.restore(valid);
+  }
+
+  /**
+   * OperatorProfile persistence passthroughs (separate snapshot file,
+   * same atomic pattern). Kept on this store so the webhook's
+   * best-effort `persistAll` and boot restore each touch one object.
+   */
+  saveProfilesToFile(filePath: string): Promise<void> {
+    return this.profiles.saveToFile(filePath);
+  }
+
+  async loadProfilesFromFile(filePath: string): Promise<void> {
+    await this.profiles.loadFromFile(filePath);
   }
 }

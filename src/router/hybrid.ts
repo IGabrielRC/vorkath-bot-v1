@@ -7,6 +7,22 @@ import { parseCallbackData } from '../telegram/keyboards';
  * L1/L2 never touch the interpreter (zero Gemini calls); only "none"
  * from the fast parser falls through to L3. Stale callbacks degrade
  * to a safe no-op.
+ *
+ * TRANSVERSAL CONVERSATIONAL CONTRACT (applies to phases 2-15):
+ * - Button taps and natural-language requests are equivalent inputs:
+ *   both entries resolve to the SAME intents and call the SAME
+ *   deterministic tools (search repo, draft engine, interaction store).
+ *   No business logic is duplicated between callback/command/NL
+ *   handlers and tools — handlers only route, tools execute.
+ * - Local deterministic parsing (L1 callbacks, L2 fast parser) runs
+ *   FIRST; Gemini (L3) only interprets ambiguous text into intents and
+ *   never executes anything itself.
+ * - The central topic-ownership guard runs BEFORE this router: foreign
+ *   or cross-topic input reaches neither Gemini nor any tool.
+ * - Responses carry the actor's profile displayName; authorization and
+ *   ownership are keyed by numeric telegramUserId only — never by name.
+ * - Button↔NL equivalence is locked by tests asserting shared entry
+ *   points (spies on the tool/registry layer) and Gemini-call counting.
  */
 
 export interface RouterCtx {
