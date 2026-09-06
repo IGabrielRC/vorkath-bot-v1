@@ -141,17 +141,37 @@ export function parseMonths(text: string): { kind: 'months'; months: number } | 
   return { kind: 'months', months };
 }
 
-/** Create/demo verbs — "hazlo" is deliberately absent (correction, not creation). */
-const CREATE_RE = /\b(crea|crear|prueba|demo|test|opera)\b/i;
+/**
+ * Fail-closed creation gate (WRITE safe-default, transversal invariant):
+ * CREATE_TEST_DRAFT fires ONLY on an UNEQUIVOCAL expression — a creation
+ * verb AND a test/operation noun in the same text ("crea/haz/abre una
+ * operación/prueba/demo/test", optional months). Generic single-token
+ * triggers ("prueba", "demo", "test" alone) and consult-pattern verbs
+ * ("revisa", "busca", "consulta") NEVER satisfy this gate: READ ambiguity
+ * may ask disambiguation, WRITE ambiguity never mutates — it asks
+ * clarification instead. Runs over NORMALIZED text (accent/case folded).
+ */
+const CREATE_VERB_RE =
+  /\b(crea|crear|creame|haz|hazme|hazlo|hacer|haceme|abre|abrir|abreme|opera|operar|operame|genera|generar|inicia|iniciar)\b/;
+
+const TEST_NOUN_RE = /\b(operacion|operaciones|prueba|pruebas|demo|demos|test|tests)\b/;
+
+/** True only for unequivocal creation requests (verb + noun, normalized). */
+export function isExplicitCreateRequest(text: string): boolean {
+  const n = normalizeText(text);
+  return CREATE_VERB_RE.test(n) && TEST_NOUN_RE.test(n);
+}
 
 /**
  * Complete mutation stated up front ("crea una prueba de 2 meses"):
- * create verb + month count in the same text. Returns null when no
- * months are mentioned so incomplete requests ("crea una prueba") keep
- * falling through to L3, which asks only for the missing months.
+ * UNEQUIVOCAL create expression + month count in the same text. Returns
+ * null when no months are mentioned so incomplete requests ("crea una
+ * prueba") keep falling through to L3, which asks only for the missing
+ * months — and null for consult phrases ("revisa la prueba de 2 meses"),
+ * which must NEVER become a draft.
  */
 export function parseCreateTest(text: string): { kind: 'createTest'; months: number } | null {
-  if (!CREATE_RE.test(text)) {
+  if (!isExplicitCreateRequest(text)) {
     return null;
   }
   const months = parseMonths(text);

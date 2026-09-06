@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { GoogleGenAI } from '@google/genai';
-import { extractEmbeddedAccount, parseEmail, parseMonths, parsePhone } from '../parser/fast';
+import { extractEmbeddedAccount, isExplicitCreateRequest, parseEmail, parseMonths, parsePhone } from '../parser/fast';
 
 /**
  * L3 Gemini intent interpreter: intent-only, never executes.
@@ -98,7 +98,10 @@ const SYSTEM_PROMPT =
   'You classify Telegram bot messages into intents. ' +
   'Reply with JSON only: {"name": <OPEN_SEARCH|CREATE_TEST_DRAFT|CORRECTION|OPEN_OPERATE|OPEN_EXPIRED|OPEN_INVENTORY|OPEN_CASH|OPEN_MORE|UNKNOWN>, "params": {...}}. ' +
   'OPEN_SEARCH: user wants to search a customer/account. ' +
-  'CREATE_TEST_DRAFT: user wants to create a test/demo operation (params.months when stated). ' +
+  'CREATE_TEST_DRAFT ONLY for unequivocal creation requests (a creation verb + a test noun: "crea/haz/abre una operacion/prueba/demo/test", optional months). ' +
+  'A bare "prueba"/"demo"/"test" or a consult phrase ("revisa/busca/consulta X") is NEVER CREATE_TEST_DRAFT: ' +
+  'consult phrases are OPEN_SEARCH (identifier verbatim when stated), bare/ambiguous input is UNKNOWN. ' +
+  'Fail-closed invariant: READ ambiguity may ask disambiguation; WRITE ambiguity NEVER drafts — return UNKNOWN so the app asks clarification. ' +
   'CORRECTION: user corrects an open draft (params.months = month count when mentioned). ' +
   'OPEN_OPERATE: generic operate request with no months ("quiero hacer una operación", "necesito operar") — same draft shell as the OPERAR button. ' +
   'OPEN_EXPIRED: expired/expiring accounts ("qué se me venció", "cuáles están vencidos", "algo por vencer") — same placeholder as the VENCIDOS button. ' +
@@ -182,7 +185,12 @@ export class StubIntentInterpreter implements IntentInterpreter {
     if (/\b(busc|revis|consult|mir|ficha|cliente|cuenta|vence|vencim|pasa con|dime|averigua)\w*\b/.test(lowered)) {
       return { name: 'OPEN_SEARCH', params: {}, confidence: 1 };
     }
-    if (/(crea|crear|prueba|demo|test|opera)/.test(lowered)) {
+    // Fail-closed WRITE gate: CREATE_TEST_DRAFT ONLY on an unequivocal
+    // creation expression (verb + noun — "crea/haz/abre una
+    // operación/prueba/demo/test"). Bare nouns ("prueba", "demo", "test")
+    // and consult phrases ("revisa/busca X") NEVER reach this branch:
+    // they resolved to OPEN_SEARCH above or fall to UNKNOWN below.
+    if (isExplicitCreateRequest(text)) {
       // Months ONLY when stated — never invented (missing stays missing).
       const months = parseMonths(text);
       return {

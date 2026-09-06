@@ -22,7 +22,7 @@ import {
   type InteractionType,
 } from '../interactions/interactions';
 import type { MockRepositories, SafeAccount } from '../mock/repositories';
-import { containsPhoneCandidate } from '../parser/fast';
+import { containsPhoneCandidate, extractEmbeddedAccount, isExplicitCreateRequest } from '../parser/fast';
 import { route } from '../router/hybrid';
 import { SessionStore } from '../session/store';
 import {
@@ -1928,6 +1928,23 @@ export function createWebhookHandler(deps: WebhookDeps) {
       return { ok: true };
     }
     if (intent.name === 'CREATE_TEST_DRAFT') {
+      // Fail-closed WRITE gate (dispatch-level enforcement): Gemini may
+      // overgeneralize a bare "prueba"/"demo"/"test" or a consult phrase
+      // ("revisa X") into CREATE_TEST_DRAFT. A draft is built ONLY when
+      // the RAW text carries an unequivocal creation expression — never
+      // on intent name alone, never with invented months. Without it the
+      // request degrades to READ (identifier stated → deterministic
+      // search) or UNKNOWN (clarification). WRITE ambiguity never mutates.
+      if (!isExplicitCreateRequest(text)) {
+        const fallbackIdentifier =
+          pickSearchIdentifier(intent.params) ?? extractEmbeddedAccount(text)?.value;
+        if (fallbackIdentifier !== undefined) {
+          await runDirectSearch(fallbackIdentifier);
+          return { ok: true };
+        }
+        await respond(UNKNOWN_TEXT);
+        return { ok: true };
+      }
       const months =
         typeof intent.params['months'] === 'number' ? intent.params['months'] : undefined;
       const missing = resolveMissingFields(

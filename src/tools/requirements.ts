@@ -16,6 +16,8 @@
  * always produces a question — never a guess, never a silent default.
  */
 
+import type { IntentName } from '../ai/intentInterpreter';
+
 export type ToolKind = 'read' | 'write';
 
 export interface ToolSpec {
@@ -52,6 +54,37 @@ const TOOL_SPECS: Record<string, ToolSpec> = {
 export function getToolSpec(tool: string): ToolSpec | undefined {
   return TOOL_SPECS[tool];
 }
+
+/**
+ * Fail-closed intent→mutation policy (WRITE safe-default, transversal).
+ *
+ * Every intent declares its mutation power up front:
+ * - `read` — deterministic reads only, never touches the draft store.
+ * - `draft-shell` — the explicit OPERAR-twin shell / correction of an
+ *   already-open draft; never creates a draft from ambiguous text.
+ * - `guarded-draft` — may build a draft ONLY after the dispatcher
+ *   verifies an unequivocal creation expression in the raw text
+ *   (`isExplicitCreateRequest`); otherwise it degrades to READ/UNKNOWN.
+ * - `none` — must NEVER execute a mutation: no draft create/update/
+ *   confirm/cancel, no repo write. Ambiguous WRITE intent lands here.
+ *
+ * The `Record<IntentName, …>` type is the future-proofing: adding a new
+ * intent to `INTENT_NAMES` without classifying it here is a COMPILE
+ * error, so no future WRITE intent can silently inherit mutation power.
+ */
+export type IntentMutationPolicy = 'read' | 'draft-shell' | 'guarded-draft' | 'none';
+
+export const INTENT_MUTATION_POLICY: Record<IntentName, IntentMutationPolicy> = {
+  OPEN_SEARCH: 'read',
+  CREATE_TEST_DRAFT: 'guarded-draft',
+  CORRECTION: 'draft-shell',
+  OPEN_OPERATE: 'draft-shell',
+  OPEN_EXPIRED: 'read',
+  OPEN_INVENTORY: 'read',
+  OPEN_CASH: 'read',
+  OPEN_MORE: 'read',
+  UNKNOWN: 'none',
+};
 
 /** True for immediate-execution reads (no confirmation ever). */
 export function isReadTool(tool: string): boolean {
