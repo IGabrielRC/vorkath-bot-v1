@@ -439,7 +439,7 @@ describe('slice B: account cards (22–30)', () => {
       expect(card).toContain(cliente);
     }
     expect(card).toContain('1 PERFIL (1)');
-    expect(card).toContain('vence 2026-09-27');
+    expect(card).toContain('vence 27 sep 2026 — 🟢 Vigente (21 días)');
   });
 
   it('(23) a FlujoTV card keeps its OWN model — never the Netflix 5-profile shape', async () => {
@@ -460,7 +460,7 @@ describe('slice B: account cards (22–30)', () => {
     const card = formatAccountCard(account!, PINNED_NOW);
     expect(card).toContain('📺 FlujoTV · maxnet050');
     expect(card).toContain('CUENTA COMPLETA — Jackson Amaya');
-    expect(card.split('\n')).toHaveLength(2);
+    expect(card.split('\n')).toHaveLength(3);
   });
 
   it('(25) PAIS_CUENTA is the service country — never the phone country', async () => {
@@ -469,30 +469,30 @@ describe('slice B: account cards (22–30)', () => {
     const netflixCard = formatAccountCard(netflix!, PINNED_NOW);
     // Daniel pares holds VE phone 4121461745 but his account country is BR.
     const danielLine = netflixCard.split('\n').find((line) => line.includes('Daniel pares')) ?? '';
-    expect(danielLine).toContain('País cuenta: BR');
+    expect(danielLine).toContain('País: BR');
     const [flujo] = await repos.searchServiceAccounts('cmaxnet002');
     const flujoCard = formatAccountCard(flujo!, PINNED_NOW);
     // Johnathan sobrino Dayana holds US phone 18174487435 with no stored
     // account country — the card shows the gap, never a phone-derived one.
     const johnathanLine =
       flujoCard.split('\n').find((line) => line.includes('Johnathan sobrino Dayana')) ?? '';
-    expect(johnathanLine).toContain('País cuenta: —');
+    expect(johnathanLine).toContain('País: —');
   });
 
   it('(26) slot status is DERIVED from expiry with an injectable clock', async () => {
     const repos = await loadRepos();
     const [flujo] = await repos.searchServiceAccounts('cmaxnet001');
     const card = formatAccountCard(flujo!, PINNED_NOW);
-    // Anny Tovar vence 2026-09-07: 1 día restante → Por vencer.
-    expect(card).toMatch(/Anny Tovar — vence 2026-09-07 — Por vencer \(1 día\)/);
+    // Anny Tovar vence 7 sep 2026: 1 día restante → Por vencer.
+    expect(card).toMatch(/Anny Tovar — vence 7 sep 2026 — 🟡 Por vencer \(1 día\)/);
     const [netflix] = await repos.searchServiceAccounts('dasdsadasda@gmail.com');
     const netflixCard = formatAccountCard(netflix!, PINNED_NOW);
-    // Daniel pares vence 2026-09-27: 21 días → Vigente.
-    expect(netflixCard).toMatch(/Daniel pares — vence 2026-09-27 — Vigente \(21 días\)/);
+    // Daniel pares vence 27 sep 2026: 21 días → Vigente.
+    expect(netflixCard).toMatch(/Daniel pares — vence 27 sep 2026 — 🟢 Vigente \(21 días\)/);
     const [vencido] = await repos.searchServiceAccounts('cmaxnet002');
     const vencidoCard = formatAccountCard(vencido!, PINNED_NOW);
-    // Nilson Zambrano vence 2026-09-02: −4 días → Vencido.
-    expect(vencidoCard).toMatch(/Nilson Zambrano — vence 2026-09-02 — Vencido \(-4 días\)/);
+    // Nilson Zambrano vence 2 sep 2026: −4 días → Vencido.
+    expect(vencidoCard).toMatch(/Nilson Zambrano — vence 2 sep 2026 — 🔴 Vencido \(-4 días\)/);
   });
 
   it('(27) legacy DIAS/ESTATUS never govern the derived status (TESTS ONLY rows)', () => {
@@ -516,8 +516,8 @@ describe('slice B: account cards (22–30)', () => {
     ];
     const [account] = groupRowsIntoAccounts(rows);
     const card = formatAccountCard(account!, PINNED_NOW);
-    expect(card).toMatch(/Stale Vigente — vence 2026-09-02 — Vencido/);
-    expect(card).toMatch(/Stale Vencido — vence 2026-10-04 — Vigente/);
+    expect(card).toMatch(/Stale Vigente — vence 2 sep 2026 — 🔴 Vencido/);
+    expect(card).toMatch(/Stale Vencido — vence 4 oct 2026 — 🟢 Vigente/);
   });
 
   it('(28) expired stays assigned — VENCIDO never reads as DISPONIBLE', async () => {
@@ -555,7 +555,7 @@ describe('slice B: account cards (22–30)', () => {
       expect(slot.numeroRaw).not.toBe('');
     }
     const card = formatAccountCard(account!, PINNED_NOW);
-    expect(card.split('\n')).toHaveLength(4);
+    expect(card.split('\n')).toHaveLength(7);
     expect(card).not.toMatch(SERVICE_QUESTION_RE);
   });
 });
@@ -618,7 +618,7 @@ describe('slice B: account conversation (31–40)', () => {
     await world.post(acctMessage(world.nextUpdateId(), GABRIEL, 'busca cuenta-inexistente-999'));
     expect(searchSpy).toHaveBeenCalledWith('cuenta-inexistente-999');
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('🔎 Cuenta no encontrada');
+    expect(last).toContain('🔎 CUENTA NO ENCONTRADA');
     expect(last).toContain('No encontramos esa cuenta.');
     expect(world.client.findButton('🔎Buscar otra')).toBeDefined();
     expect(world.client.findButton('←Volver')).toBeDefined();
@@ -846,7 +846,7 @@ describe('slice B: account multioperator (41–47)', () => {
     await world.post(acctMessage(world.nextUpdateId(), GABRIEL, 'crea una prueba de 2 meses'));
     expect(world.drafts.get({ chatId: GROUP_CHAT_ID, userId: GABRIEL })?.status).toBe('open');
     await world.post(acctMessage(world.nextUpdateId(), GABRIEL, 'busca cuenta-inexistente-999'));
-    expect(world.client.texts().at(-1)).toContain('🔎 Cuenta no encontrada');
+    expect(world.client.texts().at(-1)).toContain('🔎 CUENTA NO ENCONTRADA');
     expect(world.drafts.get({ chatId: GROUP_CHAT_ID, userId: GABRIEL })?.status).toBe('open');
     expect(world.drafts.get({ chatId: GROUP_CHAT_ID, userId: GABRIEL })?.months).toBe(2);
     await world.app.close();

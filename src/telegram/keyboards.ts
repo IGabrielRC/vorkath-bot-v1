@@ -7,6 +7,8 @@
  * See: https://core.telegram.org/bots/api#inlinekeyboardbutton
  */
 
+import { esc, title } from './render';
+
 /** Display name for a stored service id (`netflix` → `Netflix`). */
 function prettyService(servicio: string): string {
   const compact = servicio.replace(/\s+/g, '').toLowerCase();
@@ -136,10 +138,13 @@ export function parseCallbackData(data: string | undefined): ParsedCallback | nu
  * Visual ownership label. Backend enforcement is the real security; this
  * line only shows who owns the interaction. Every button-bearing message
  * (or message expecting continuation) carries it via `withOperator`.
+ * The name is HTML-escaped (central HTML parse_mode); `parseOperatorLabel`
+ * in `webhook.ts` decodes it back so the reply-ownership round-trip keeps
+ * working for hostile names.
  */
 export function operatorLabel(name: string | undefined): string {
   const display = name !== undefined && name.trim() !== '' ? name : 'Operador';
-  return `👤 Operador: ${display}`;
+  return `👤 Operador: ${esc(display)}`;
 }
 
 /** Appends the ownership label line to an interactive message. */
@@ -147,18 +152,18 @@ export function withOperator(text: string, name: string | undefined): string {
   return `${text}\n${operatorLabel(name)}`;
 }
 
-export const HOME_TEXT = '🏠 Vokath — ¿qué hacemos hoy?';
+export const HOME_TEXT = `${title('🏠 Vokath')}\n¿qué hacemos hoy?`;
 
 export const SECTION_TEXTS: Record<string, string> = {
-  operar: '⚡ OPERAR (demo) — crea una prueba MOCK o corrige el borrador abierto.',
-  buscar: '🔎 BUSCAR (demo) — envía un teléfono, correo o nombre a buscar.',
-  vencidos: '⏰ VENCIDOS (demo) — próximos vencimientos MOCK.',
-  inventario: '📦 INVENTARIO (demo) — existencias MOCK.',
-  caja: '💰 CAJA (demo) — resumen MOCK.',
-  mas: '⋯ MÁS (demo) — tasa, precios y código de instalación.',
+  operar: `${title('⚡ OPERAR')}\nCrea una prueba MOCK o corrige el borrador abierto.`,
+  buscar: `${title('🔎 BUSCAR')}\nEnvía un teléfono, correo o nombre a buscar.`,
+  vencidos: `${title('⏰ Vencidos MOCK')}\nPróximos vencimientos.`,
+  inventario: `${title('📦 Inventario MOCK')}\nExistencias.`,
+  caja: `${title('💰 CAJA')}\nResumen MOCK.`,
+  mas: `${title('⋯ MÁS')}\nTasa, precios y código de instalación.`,
 };
 
-export const DRAFT_TEXT = '📝 Borrador MOCK abierto. Confirma, corrige o cancela.';
+export const DRAFT_TEXT = `${title('📝 OPERACIÓN PENDIENTE')}\n\nBorrador MOCK abierto. Confirma, corrige o cancela.`;
 
 function button(text: string, action: CallbackAction): InlineKeyboardButton {
   return { text, callback_data: callbackData(action) };

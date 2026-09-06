@@ -386,8 +386,8 @@ describe('slice A: phone search UX 1-9 (webhook, real fixture)', () => {
     expect(last).toContain('Anny Tovar');
     expect(last).toContain('4145460657');
     expect(last).toContain('FlujoTV');
-    expect(last).toContain('2026-09-07');
-    expect(last).toContain('País cuenta: VE');
+    expect(last).toContain('7 sep 2026');
+    expect(last).toContain('País: VE');
     const payload = JSON.stringify(world.client.sent);
     expect(payload).not.toContain('ncsa909');
     expect(payload).not.toContain('contrasena');
@@ -417,7 +417,7 @@ describe('slice A: phone search UX 1-9 (webhook, real fixture)', () => {
     await world.post(sliceMessage(world.nextUpdateId(), GABRIEL, '04240000000'));
     expect(world.interpreter.calls).toBe(0);
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('No encontrado');
+    expect(last).toContain('🔎 NO ENCONTRADO');
     expect(last).toContain('No encontramos ningún cliente asociado a ese número.');
     expect(last).not.toContain('Crear cliente');
     const labels = world.client.buttons().map((b) => b.text);
@@ -463,7 +463,7 @@ describe('slice A: phone search UX 1-9 (webhook, real fixture)', () => {
     await world.post(sliceCallback(world.nextUpdateId(), GABRIEL, callbackDataFor('view0', search.id)));
     const last = world.client.texts().at(-1) ?? '';
     expect(last).toContain(expected.nombre);
-    expect(last).toContain('País cuenta:');
+    expect(last).toContain('País:');
     const updated = world.interactions.get(search.id);
     expect(updated?.state['selectedCustomer']).toMatchObject({ nombre: expected.nombre });
     expect(updated?.state['view']).toBe('customer-detail');

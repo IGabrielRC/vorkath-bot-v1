@@ -1,5 +1,6 @@
 import { deriveExpiryStatus, serviceLabel } from './customers';
 import type { MockAccount } from './excelLoader';
+import { renderAccountCard } from '../telegram/render';
 
 /**
  * Account domain (MOCK): ACCOUNT_IDENTIFIER is neutral — an email, a
@@ -91,7 +92,9 @@ export function groupRowsIntoAccounts(rows: MockAccount[]): ServiceAccount[] {
  * Read-only account card: service, identifier, PAIS_CUENTA per slot
  * line (never a phone-derived country), clients with derived
  * expiry/status. NEVER credentials: built from safe fields only
- * (no CORREO-adjacent secrets — no CONTRASEÑA/PIN). `now` is
+ * (no CORREO-adjacent secrets — no CONTRASEÑA/PIN). Layout lives in the
+ * central Telegram renderer (`renderAccountCard`); the domain work here
+ * is only deriving each slot status (BR-EXP-003/004/005). `now` is
  * injectable (tests pin the clock); see `deriveExpiryStatus` for the
  * BR-EXP-003/004/005 rule and the BR-EXP-008 timezone note.
  */
@@ -99,17 +102,21 @@ export function formatAccountCard(
   account: ServiceAccount,
   now: Date | string = new Date(),
 ): string {
-  const lines: string[] = [`📺 ${serviceLabel(account.servicio)} · ${account.identifier}`];
-  for (const slot of account.slots) {
-    const derived = deriveExpiryStatus(slot.fechaFin, now);
-    const vence = slot.fechaFin ?? 'sin fecha';
-    const dias =
-      derived.dias === null ? '' : derived.dias === 1 ? ' (1 día)' : ` (${derived.dias} días)`;
-    lines.push(
-      `• ${slot.perfil} — ${slot.cliente} — vence ${vence} — ${derived.estatus}${dias} — País cuenta: ${slot.paisCuenta === '' ? '—' : slot.paisCuenta}`,
-    );
-  }
-  return lines.join('\n');
+  return renderAccountCard({
+    servicio: serviceLabel(account.servicio),
+    identifier: account.identifier,
+    slots: account.slots.map((slot) => {
+      const derived = deriveExpiryStatus(slot.fechaFin, now);
+      return {
+        perfil: slot.perfil,
+        cliente: slot.cliente,
+        fechaFin: slot.fechaFin,
+        estatus: derived.estatus,
+        dias: derived.dias,
+        paisCuenta: slot.paisCuenta,
+      };
+    }),
+  });
 }
 
 export interface SelectedAccount {

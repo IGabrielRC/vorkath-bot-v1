@@ -46,6 +46,26 @@ import {
 } from './keyboards';
 import type { TelegramClient, TelegramContext } from './client';
 import {
+  esc,
+  expiredRow,
+  renderAccountChoices,
+  renderAccountNotFound,
+  renderActivitySummary,
+  renderCustomerList,
+  renderDraftCreated,
+  renderDraftOpened,
+  renderDraftResumed,
+  renderDraftUpdated,
+  renderExpired,
+  renderInventory,
+  renderLegacyDetail,
+  renderLegacyList,
+  renderLegacyNotFound,
+  renderOwnershipWarning,
+  renderPhoneNotFound,
+  unesc,
+} from './render';
+import {
   alertsOnlyText,
   findTopicOwner,
   type OperatorTopics,
@@ -65,15 +85,13 @@ export const NO_RESULTS_TEXT = '🔎 Sin resultados MOCK.';
  * NEVER "Crear cliente" — creation belongs exclusively to the explicit
  * new-sale flow (BR-CUS-009).
  */
-export const PHONE_NOT_FOUND_TEXT =
-  '🔎 No encontrado\nNo encontramos ningún cliente asociado a ese número.';
+export const PHONE_NOT_FOUND_TEXT = renderPhoneNotFound();
 /**
  * Read-only account not-found (BR-ACC-004): report + offer retry/volver.
  * NEVER anything else — unknown identifiers are reported, never
  * created, and searches never touch drafts.
  */
-export const ACCOUNT_NOT_FOUND_TEXT =
-  '🔎 Cuenta no encontrada\nNo encontramos esa cuenta. Escribe otra cuenta para reintentar o pulsa Volver.';
+export const ACCOUNT_NOT_FOUND_TEXT = renderAccountNotFound();
 export const NO_DRAFT_TEXT = 'No hay borrador abierto. Usa ⚡OPERAR para crear uno.';
 export const DRAFT_UPDATED_PREFIX = '📝 Borrador actualizado:';
 export const CORRECTION_PROMPT_TEXT = '✏️ Envía la corrección (ej. «hazlo 2 meses»).';
@@ -87,13 +105,15 @@ export function crossActionText(ownerName: string | undefined): string {
 
 /** Rejection when replying to another operator's interactive message. */
 export function replyBelongsText(ownerName: string): string {
-  return `⚠️ Este requerimiento pertenece a ${ownerName}.`;
+  return `⚠️ Este requerimiento pertenece a ${esc(ownerName)}.`;
 }
 
 /**
  * Extracts the owner display name from a bot message carrying the
  * `👤 Operador: <nombre>` label. Returns undefined for unlabeled
  * (pre-ownership or non-interactive) messages, which impose no reply guard.
+ * The label name is HTML-escaped at render time, so it is decoded back
+ * here — plain names round-trip byte-identical.
  */
 export function parseOperatorLabel(text: string | undefined): string | undefined {
   if (typeof text !== 'string') {
@@ -101,7 +121,10 @@ export function parseOperatorLabel(text: string | undefined): string | undefined
   }
   const match = /👤 Operador:\s*([^\n]+)/u.exec(text);
   const name = match?.[1]?.trim();
-  return name !== undefined && name !== '' ? name : undefined;
+  if (name === undefined || name === '') {
+    return undefined;
+  }
+  return unesc(name);
 }
 
 /**
@@ -413,7 +436,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           }
         }
         await sendEarly(
-          `🧵 Información del topic\n\nTopic: ${topicLabel}\nChat ID: ${String(chatId)}\nThread ID: ${actorThreadId === undefined ? 'general / none' : String(actorThreadId)}`,
+          `🧵 Información del topic\n\nTopic: ${esc(topicLabel)}\nChat ID: ${String(chatId)}\nThread ID: ${actorThreadId === undefined ? 'general / none' : String(actorThreadId)}`,
         );
         return { ok: true };
       }
@@ -791,7 +814,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           ) ?? 'otro operador';
         return {
           ok: false,
-          text: `⚠️ Esta operación pertenece a ${confirmOwner}.`,
+          text: renderOwnershipWarning(confirmOwner),
         };
       }
       return kind === 'confirm' ? deps.drafts.confirm(owner) : deps.drafts.cancel(owner);
@@ -823,10 +846,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       }
       const confirmed = deps.drafts.get(owner);
       const months = confirmed?.months;
-      const summary =
-        months !== undefined
-          ? `✅ Operación confirmada — ${actorName} (${months} mes(es)).`
-          : `✅ Operación confirmada — ${actorName}.`;
+      const summary = renderActivitySummary(actorName, months);
       await deps.client.sendMessage({
         chatId: targetChatId,
         text: summary,
@@ -870,7 +890,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           ) ?? 'otro operador';
         return {
           ok: false,
-          text: `⚠️ Esta operación pertenece a ${correctOwner}.`,
+          text: renderOwnershipWarning(correctOwner),
         };
       }
       return null;
@@ -1169,7 +1189,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       });
       persistAll();
       await sendLabeled(
-        `🔎 ${total} cuentas comparten ese identificador. Elige una:`,
+        renderAccountChoices(total),
         accountDisambiguationKeyboard(
           page.map((account) => ({ servicio: account.servicio, identifier: account.identifier })),
           { interactionId: interaction.id },
@@ -1221,7 +1241,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         deps.interactions.touch(interaction.id, { query, offset: 0, view: 'customer-list' });
         persistAll();
         await sendLabeled(
-          `${PHONE_NOT_FOUND_TEXT} Escribe otro número para reintentar o pulsa Volver.`,
+          PHONE_NOT_FOUND_TEXT,
           phoneSearchKeyboard(interaction.id),
           interaction.messageThreadId,
         );
@@ -1249,10 +1269,6 @@ export function createWebhookHandler(deps: WebhookDeps) {
           : 0;
       const safeOffset = Math.min(Math.max(offset, 0), Math.max(total - 1, 0));
       const page = customers.slice(safeOffset, safeOffset + SEARCH_PAGE_SIZE);
-      const lines = page.map(
-        (customer, index) =>
-          `${safeOffset + index + 1}. ${customer.nombre} — ${customer.phones.join(' / ')}`,
-      );
       deps.interactions.touch(interaction.id, {
         query,
         offset: safeOffset,
@@ -1261,7 +1277,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
       });
       persistAll();
       await sendLabeled(
-        `🔎 ${total} clientes comparten ese número. Elige uno:\n${lines.join('\n')}`,
+        renderCustomerList(
+          total,
+          page.map((customer) => ({ nombre: customer.nombre, phones: customer.phones })),
+          safeOffset,
+        ),
         searchResultsKeyboard(page.length, {
           interactionId: interaction.id,
           hasNext: safeOffset + SEARCH_PAGE_SIZE < total,
@@ -1306,7 +1326,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const view = createInteraction('SEARCH', { view: 'prompt' });
       persistAll();
       await sendLabeled(
-        SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR (demo)',
+        SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR',
         sectionKeyboard('buscar', view.id),
         thread ?? view.messageThreadId,
       );
@@ -1328,9 +1348,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
 
     function formatRows(rows: SafeAccount[]): string {
-      return rows
-        .map((row) => `• ${row.nombre} — ${row.perfil} (${row.pais}, ${row.estatus})`)
-        .join('\n');
+      return rows.map((row) => expiredRow(row)).join('\n');
     }
 
     /**
@@ -1350,9 +1368,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       persistAll();
       auditDraft('draft.created', { months: draft.months, resumed });
       await sendLabeled(
-        resumed
-          ? `📝 Borrador retomado: ${draft.months} mes(es) (paso 2 de 2). Confirma o cancela.`
-          : '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
+        resumed ? renderDraftResumed(draft.months) : renderDraftOpened(),
         draftKeyboard(operation.id),
         thread ?? operation.messageThreadId,
       );
@@ -1363,9 +1379,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const view = createInteraction('EXPIRED');
       persistAll();
       await sendLabeled(
-        expired.length === 0
-          ? '⏰ Sin vencidos MOCK.'
-          : `⏰ Vencidos MOCK (${expired.length}):\n${formatRows(expired.slice(0, 5))}`,
+        renderExpired(expired.slice(0, 5), expired.length),
         sectionKeyboard('vencidos', view.id),
         thread ?? view.messageThreadId,
       );
@@ -1373,11 +1387,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
 
     async function showInventory(thread?: number): Promise<void> {
       const summary = await deps.repos.getInventorySummary();
-      const lines = summary.map((row) => `• ${row.servicio}: ${row.total}`);
       const view = createInteraction('INVENTORY');
       persistAll();
       await sendLabeled(
-        lines.length === 0 ? '📦 Inventario MOCK vacío.' : `📦 Inventario MOCK:\n${lines.join('\n')}`,
+        renderInventory(summary),
         sectionKeyboard('inventario', view.id),
         thread ?? view.messageThreadId,
       );
@@ -1388,7 +1401,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const view = createInteraction('CASH');
       persistAll();
       await sendLabeled(
-        SECTION_TEXTS['caja'] ?? '💰 CAJA (demo) — resumen MOCK.',
+        SECTION_TEXTS['caja'] ?? '💰 CAJA',
         sectionKeyboard('caja', view.id),
         thread ?? view.messageThreadId,
       );
@@ -1399,7 +1412,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const view = createInteraction('MORE');
       persistAll();
       await sendLabeled(
-        SECTION_TEXTS['mas'] ?? '⋯ MÁS (demo)',
+        SECTION_TEXTS['mas'] ?? '⋯ MÁS',
         sectionKeyboard('mas', view.id),
         thread ?? view.messageThreadId,
       );
@@ -1420,7 +1433,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         deps.interactions.touch(interaction.id, { query, offset: 0, view: 'list' });
         persistAll();
         await sendLabeled(
-          `${NO_RESULTS_TEXT} “${query}” no coincide. Escribe otro dato para reintentar o pulsa Volver.`,
+          renderLegacyNotFound(query),
           sectionKeyboard('buscar', interaction.id),
           interaction.messageThreadId,
         );
@@ -1428,10 +1441,6 @@ export function createWebhookHandler(deps: WebhookDeps) {
       }
       const safeOffset = Math.min(Math.max(offset, 0), Math.max(total - 1, 0));
       const page = rows.slice(safeOffset, safeOffset + SEARCH_PAGE_SIZE);
-      const lines = page.map(
-        (row, index) =>
-          `${safeOffset + index + 1}. ${row.nombre} — ${row.perfil} (${row.pais}, ${row.estatus})`,
-      );
       deps.interactions.touch(interaction.id, {
         query,
         offset: safeOffset,
@@ -1440,7 +1449,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       });
       persistAll();
       await sendLabeled(
-        `🔎 ${total} resultado(s) MOCK:\n${lines.join('\n')}`,
+        renderLegacyList(total, page, safeOffset),
         searchResultsKeyboard(page.length, {
           interactionId: interaction.id,
           hasNext: safeOffset + SEARCH_PAGE_SIZE < total,
@@ -1469,7 +1478,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       });
       persistAll();
       await sendLabeled(
-        `👤 Cliente MOCK (${globalIndex + 1} de ${rows.length}):\n• Nombre: ${row.nombre}\n• Perfil: ${row.perfil}\n• Servicio: ${row.servicio}\n• País: ${row.pais}\n• Estatus: ${row.estatus}`,
+        renderLegacyDetail(row, globalIndex, rows.length),
         sectionKeyboard('buscar', interaction.id),
         interaction.messageThreadId,
       );
@@ -1538,7 +1547,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         const view = createInteraction('SEARCH', { view: 'prompt' });
         persistAll();
         await sendLabeled(
-          SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR (demo)',
+          SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR',
           sectionKeyboard('buscar', view.id),
           interaction.messageThreadId,
         );
@@ -1662,7 +1671,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await renderSearchPage(target, query);
         return;
       }
-      const sectionText = SECTION_TEXTS[action] ?? SECTION_TEXTS['mas'] ?? '⋯ MÁS (demo)';
+      const sectionText = SECTION_TEXTS[action] ?? SECTION_TEXTS['mas'] ?? '⋯ MÁS';
       const view = createInteraction('MORE');
       persistAll();
       await sendLabeled(sectionText, sectionKeyboard(action, view.id), interaction.messageThreadId);
@@ -1732,7 +1741,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return { ok: true };
       }
       if (action === 'buscar') {
-        await respond(SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR (demo)', 'buscar');
+        await respond(SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR', 'buscar');
         return { ok: true };
       }
       if (action === 'operar') {
@@ -1774,7 +1783,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await respondDraft(CORRECTION_PROMPT_TEXT);
         return { ok: true };
       }
-      const sectionText = SECTION_TEXTS[action] ?? SECTION_TEXTS['mas'] ?? '⋯ MÁS (demo)';
+      const sectionText = SECTION_TEXTS[action] ?? SECTION_TEXTS['mas'] ?? '⋯ MÁS';
       await respond(sectionText, action);
       return { ok: true };
     }
@@ -1801,7 +1810,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           tasa: '💱 Tasa (demo MOCK).',
           precio: '🏷️ Precios (demo MOCK).',
         };
-        await respond(placeholders[parse.command] ?? '⋯ MÁS (demo)', 'mas');
+        await respond(placeholders[parse.command] ?? '⋯ MÁS', 'mas');
         return { ok: true };
       }
       if (
@@ -1863,9 +1872,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         });
         persistAll();
         auditDraft('draft.created', { months: draft.months, resumed });
-        await respondDraft(
-          `📝 Borrador MOCK: ${draft.months} mes(es). Confirma, corrige o cancela.`,
-        );
+        await respondDraft(renderDraftCreated(draft.months));
         return { ok: true };
       }
       if (parse.kind === 'months') {
@@ -1878,9 +1885,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         }
         persistAll();
         auditDraft('draft.updated', { months: updated.months });
-        await respondDraft(
-          `${DRAFT_UPDATED_PREFIX} ${updated.months} mes(es) (paso 2 de 2). Confirma o cancela.`,
-        );
+        await respondDraft(renderDraftUpdated(updated.months));
         return { ok: true };
       }
       await respond(UNKNOWN_TEXT);
@@ -1919,7 +1924,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         );
         return { ok: true };
       }
-      await respond(SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR (demo)', 'buscar');
+      await respond(SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR', 'buscar');
       return { ok: true };
     }
     if (intent.name === 'CREATE_TEST_DRAFT') {
@@ -1938,9 +1943,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         });
         persistAll();
         auditDraft('draft.created', { months: draft.months, resumed });
-        await respondDraft(
-          `📝 Borrador MOCK: ${draft.months} mes(es). Confirma, corrige o cancela.`,
-        );
+        await respondDraft(renderDraftCreated(draft.months));
         return { ok: true };
       }
       // Incomplete mutation: same shell + same text as the Operar
@@ -1952,9 +1955,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       persistAll();
       auditDraft('draft.created', { months: draft.months, resumed });
       await respondDraft(
-        resumed
-          ? `📝 Borrador retomado: ${draft.months} mes(es) (paso 2 de 2). Confirma o cancela.`
-          : '📝 Borrador MOCK abierto (paso 1 de 2). Envía la corrección o confirma.',
+        resumed ? renderDraftResumed(draft.months) : renderDraftOpened(),
       );
       return { ok: true };
     }
@@ -1989,9 +1990,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       }
       persistAll();
       auditDraft('draft.updated', { months: updated.months });
-      await respondDraft(
-        `${DRAFT_UPDATED_PREFIX} ${updated.months} mes(es) (paso 2 de 2). Confirma o cancela.`,
-      );
+      await respondDraft(renderDraftUpdated(updated.months));
       return { ok: true };
     }
     await respond(UNKNOWN_TEXT);

@@ -1,4 +1,5 @@
 import type { MockAccount } from './excelLoader';
+import { renderCustomerCard } from '../telegram/render';
 import { splitStoredNumbers } from './phone';
 
 /**
@@ -128,21 +129,26 @@ export function serviceLabel(servicio: string): string {
  * Read-only summary card: name, phone(s), services, expiry, derived
  * status. PAIS shown is always PAIS_CUENTA (per subscription line) —
  * never a phone-derived country. NEVER credentials: built from safe
- * fields only (no CORREO/CONTRASEÑA/PIN).
+ * fields only (no CORREO/CONTRASEÑA/PIN). Layout lives in the central
+ * Telegram renderer (`renderCustomerCard`); the domain work here is only
+ * deriving each subscription status (BR-EXP-003/004/005).
  */
 export function formatCustomerCard(customer: Customer, now: Date | string = new Date()): string {
-  const lines: string[] = [`👤 ${customer.nombre}`];
-  lines.push(`📞 ${customer.phones.length > 0 ? customer.phones.join(' / ') : '—'}`);
-  for (const sub of customer.subscriptions) {
-    const derived = deriveExpiryStatus(sub.fechaFin, now);
-    const vence = sub.fechaFin ?? 'sin fecha';
-    const dias =
-      derived.dias === null ? '' : derived.dias === 1 ? ' (1 día)' : ` (${derived.dias} días)`;
-    lines.push(
-      `• ${serviceLabel(sub.servicio)} — ${sub.perfil} — vence ${vence} — ${derived.estatus}${dias} — País cuenta: ${sub.paisCuenta === '' ? '—' : sub.paisCuenta}`,
-    );
-  }
-  return lines.join('\n');
+  return renderCustomerCard({
+    nombre: customer.nombre,
+    phones: customer.phones,
+    subscriptions: customer.subscriptions.map((sub) => {
+      const derived = deriveExpiryStatus(sub.fechaFin, now);
+      return {
+        servicio: serviceLabel(sub.servicio),
+        perfil: sub.perfil,
+        fechaFin: sub.fechaFin,
+        estatus: derived.estatus,
+        dias: derived.dias,
+        paisCuenta: sub.paisCuenta,
+      };
+    }),
+  });
 }
 
 export interface SelectedCustomer {

@@ -1,4 +1,5 @@
 import type { TelegramClient } from '../telegram/client';
+import { renderAlert } from '../telegram/render';
 import { logger } from '../utils/logger';
 
 /**
@@ -26,14 +27,7 @@ export interface AlertTarget {
 
 /** Pure renderer — safe to unit-test without any Telegram dependency. */
 export function buildAlertText(alert: CriticalAlert): string {
-  const lines = [`⭐ ${alert.title}`, '', alert.summary, ''];
-  if (alert.actorName !== undefined && alert.actorName !== '') {
-    lines.push(`👤 Operador: ${alert.actorName}`);
-  }
-  if (alert.timestamp !== undefined && alert.timestamp !== '') {
-    lines.push(`🕒 ${alert.timestamp}`);
-  }
-  return lines.join('\n');
+  return renderAlert(alert);
 }
 
 export class AlertService {

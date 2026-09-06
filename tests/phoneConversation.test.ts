@@ -264,7 +264,7 @@ describe('slice A: phone conversation 31-40 (button≡NL, ask-only-missing)', ()
   it('(39) "otra cuenta" re-enters the wizard, zero Gemini', async () => {
     const world = await createConvWorld();
     await world.post(convMessage(world.nextUpdateId(), GABRIEL, '04240000000'));
-    expect(world.client.texts().at(-1)).toContain('No encontrado');
+    expect(world.client.texts().at(-1)).toContain('🔎 NO ENCONTRADO');
     await world.post(convMessage(world.nextUpdateId(), GABRIEL, 'otra cuenta'));
     expect(world.interpreter.calls).toBe(0);
     expect(world.client.texts().at(-1)).toContain('BUSCAR');

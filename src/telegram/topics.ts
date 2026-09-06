@@ -15,6 +15,7 @@
  */
 
 import { buildDisplayName } from '../operators/operatorProfiles';
+import { esc } from './render';
 
 /** operatorTelegramUserId → messageThreadId. Empty = Mode A. */
 export type OperatorTopics = Map<number, number>;
@@ -134,12 +135,12 @@ export function resolveDisplayName(input: DisplayNameInput): string {
  * The actor must move to their own assigned topic.
  */
 export function topicMismatchText(ownerName: string, actorName: string): string {
-  return `⚠️ Este espacio pertenece a ${ownerName}. Usa tu topic 👤 ${actorName}.`;
+  return `⚠️ Este espacio pertenece a ${esc(ownerName)}. Usa tu topic 👤 ${esc(actorName)}.`;
 }
 
 /** Guide reply for Mode B messages outside any assigned topic. */
 export function topicGuideText(operatorName: string): string {
-  return `👤 ${operatorName}, usa tu topic de trabajo.`;
+  return `👤 ${esc(operatorName)}, usa tu topic de trabajo.`;
 }
 
 /** Alerts-topic reply: the ⭐ Alertas topic is never operational for users. */

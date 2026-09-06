@@ -240,7 +240,7 @@ describe('slice A: phone multioperator 41-47 (ownership, isolation, drafts)', ()
     expect(draft?.status).toBe('open');
     expect(draft?.months).toBe(2);
     await world.post(multiMessage(world.nextUpdateId(), GABRIEL, '04240000000'));
-    expect(world.client.texts().at(-1)).toContain('No encontrado');
+    expect(world.client.texts().at(-1)).toContain('🔎 NO ENCONTRADO');
     expect(world.drafts.get({ chatId: GROUP_CHAT_ID, userId: GABRIEL })?.status).toBe('open');
     await world.app.close();
   });

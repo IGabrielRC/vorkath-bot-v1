@@ -1,4 +1,5 @@
 import type { InlineKeyboardMarkup } from './keyboards';
+import { TELEGRAM_PARSE_MODE } from './render';
 
 export interface SendMessageOpts {
   chatId: number;
@@ -95,6 +96,7 @@ export class HttpTelegramClient implements TelegramClient {
     return this.call('sendMessage', {
       chat_id: opts.chatId,
       text: opts.text,
+      parse_mode: TELEGRAM_PARSE_MODE,
       ...(opts.replyMarkup !== undefined ? { reply_markup: opts.replyMarkup } : {}),
       ...(opts.messageThreadId !== undefined ? { message_thread_id: opts.messageThreadId } : {}),
     });
@@ -105,6 +107,7 @@ export class HttpTelegramClient implements TelegramClient {
       chat_id: opts.chatId,
       message_id: opts.messageId,
       text: opts.text,
+      parse_mode: TELEGRAM_PARSE_MODE,
       ...(opts.replyMarkup !== undefined ? { reply_markup: opts.replyMarkup } : {}),
     });
   }

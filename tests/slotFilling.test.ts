@@ -361,7 +361,7 @@ describe('slot filling: search with identifier (webhook)', () => {
     await world.post(slotMessage(world.nextUpdateId(), GABRIEL, 'busca usuario@gmail.com'));
     expect(searchSpy).toHaveBeenCalledWith('usuario@gmail.com');
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('Cuenta no encontrada');
+    expect(last).toContain('CUENTA NO ENCONTRADA');
     expect(last).toMatch(/reintentar|Volver/);
     expect(last).not.toMatch(CREATE_CLIENT_RE);
     await world.app.close();
