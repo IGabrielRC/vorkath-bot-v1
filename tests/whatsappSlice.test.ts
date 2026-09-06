@@ -442,7 +442,7 @@ describe('slice B: multiphone flow (29–32)', () => {
     const world = await createWaWorld();
     await setupAndresAsk(world);
     const ask = world.client.lastText();
-    expect(ask).toContain('¿A cuál número quieres enviar los datos?');
+    expect(ask).toContain('¿A cuál número?');
     expect(ask).not.toContain('🔐 DATOS DE ACCESO');
     const buttons = world.client.lastButtons().map((button) => button.text);
     expect(buttons.some((text) => text.includes('34611161181'))).toBe(true);
@@ -458,7 +458,7 @@ describe('slice B: multiphone flow (29–32)', () => {
     await world.post(waMessage(world.nextUpdateId(), GABRIEL, 'mándame el WhatsApp'));
     const card = world.client.lastText();
     expect(card).toContain('WhatsApp preparado');
-    expect(card).not.toContain('¿A cuál número quieres enviar los datos?');
+    expect(card).not.toContain('¿A cuál número?');
     expect(world.client.lastUrlButton()).toContain('wa.me/34611161181');
   });
 

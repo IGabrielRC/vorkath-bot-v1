@@ -26,7 +26,7 @@ export const WHATSAPP_NO_NUMBER_TEXT =
   'No puedo determinar un número internacional válido para WhatsApp.';
 
 /** Phone-choice question: this exact wording, real-number buttons only. */
-export const WHATSAPP_ASK_PHONE_TEXT = '¿A cuál número quieres enviar los datos?';
+export const WHATSAPP_ASK_PHONE_TEXT = '¿A cuál número?';
 
 /** Link-ready line appended to the credential card — `preparado`, never a delivery claim. */
 export const WHATSAPP_PREPARED_TEXT = '💬 WhatsApp preparado.';

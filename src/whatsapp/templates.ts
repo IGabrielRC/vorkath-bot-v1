@@ -1,4 +1,5 @@
 import type { CredentialBundle } from '../mock/credentials';
+import { formatExpiryLong, renderExpiryGap } from '../telegram/render';
 
 /**
  * Central WhatsApp template renderer (Slice B — direct wa.me link).
@@ -24,7 +25,18 @@ export type WhatsAppTemplateId =
 export type WhatsAppTemplate = (bundle: CredentialBundle) => string;
 
 function pinLine(bundle: CredentialBundle): string {
-  return bundle.pin !== undefined && bundle.pin !== '' ? `\n🔑 PIN: ${bundle.pin}` : '';
+  return bundle.pin !== undefined && bundle.pin !== '' ? `\n🔒 PIN: ${bundle.pin}` : '';
+}
+
+/**
+ * Expiry line, MANDATORY in every credentials template: THIS assignment's
+ * `fechaFin` in the central long Spanish format — never another
+ * assignment's, never legacy DIAS, never invented. Invalid/unknown
+ * expiry renders the explicit gap, never a fake date.
+ */
+function expiryLine(bundle: CredentialBundle): string {
+  const expiry = formatExpiryLong(bundle.fechaFin) ?? renderExpiryGap();
+  return `\n📅 Vence: ${expiry}`;
 }
 
 function netflixTemplate(bundle: CredentialBundle): string {
@@ -32,7 +44,8 @@ function netflixTemplate(bundle: CredentialBundle): string {
     `¡Hola, ${bundle.customerName}! 👋\n` +
     `Aquí están tus datos de acceso a ${bundle.serviceLabel}:\n\n` +
     `📧 Cuenta: ${bundle.accountIdentifier}\n` +
-    `👤 Perfil: ${bundle.profile}\n` +
+    `👤 Perfil: ${bundle.profile}` +
+    `${expiryLine(bundle)}\n` +
     `🔑 Contraseña: ${bundle.accountPassword}` +
     `${pinLine(bundle)}\n\n` +
     `¡Disfruta! 🍿`
@@ -44,7 +57,8 @@ function flujotvSharedTemplate(bundle: CredentialBundle): string {
     `¡Hola, ${bundle.customerName}! 👋\n` +
     `Aquí están tus datos de acceso a ${bundle.serviceLabel}:\n\n` +
     `👤 Usuario: ${bundle.accountIdentifier}\n` +
-    `📺 Perfil: ${bundle.profile}\n` +
+    `📺 Perfil: ${bundle.profile}` +
+    `${expiryLine(bundle)}\n` +
     `🔑 Contraseña: ${bundle.accountPassword}` +
     `${pinLine(bundle)}\n\n` +
     `¡Disfruta! 🍿`
@@ -55,7 +69,8 @@ function flujotvCompleteTemplate(bundle: CredentialBundle): string {
   return (
     `¡Hola, ${bundle.customerName}! 👋\n` +
     `Aquí están tus datos de acceso a ${bundle.serviceLabel} (cuenta completa):\n\n` +
-    `👤 Usuario: ${bundle.accountIdentifier}\n` +
+    `👤 Usuario: ${bundle.accountIdentifier}` +
+    `${expiryLine(bundle)}\n` +
     `🔑 Contraseña: ${bundle.accountPassword}` +
     `${pinLine(bundle)}\n\n` +
     `¡Disfruta! 🍿`

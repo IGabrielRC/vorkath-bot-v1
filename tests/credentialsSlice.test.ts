@@ -35,7 +35,9 @@ import { credentialOptionLabel, resolveCredentialView } from '../src/tools/crede
  * - Rafael minnesota (phone `16124418159`): 4 assignments (Netflix +
  *   FlujoTV shared ×2 + FlujoTV complete) — the ambiguous case.
  * - Phone `4143764828`: Gloria Castañeda + Franklin Castañeda.
- * The fixture carries NO PIN column, so PIN stays absent — never invented.
+ * Netflix bundles carry the derived profile PIN (last-4 rule:
+ * Gloria → `4828`) — never invented, never persisted, never shown
+ * outside the explicit datos card / WhatsApp template.
  */
 
 const GABRIEL = 1057242322;
@@ -317,7 +319,7 @@ describe('slice A: Netflix credentials (1–8)', () => {
     expect(bundle.profile).toBe('1 PERFIL (4)');
     expect(bundle.accountType).toBe('netflix-profile');
     expect(bundle.customerName).toBe('Gloria Castañeda');
-    expect(bundle.pin).toBeUndefined();
+    expect(bundle.pin).toBe('4828');
   });
 
   it('(2) explicit datos request shows the account identifier', async () => {
@@ -347,11 +349,11 @@ describe('slice A: Netflix credentials (1–8)', () => {
     expect(card).not.toContain('1 PERFIL (2)');
   });
 
-  it('(5) PIN is absent when source carries no real PIN', async () => {
+  it('(5) Netflix card shows the derived profile PIN (last-4 rule)', async () => {
     const world = await createCredWorld();
     await searchPhoneSelect(world, GABRIEL, '4243764828', 'Gloria Castañeda');
     await world.post(credMessage(world.nextUpdateId(), GABRIEL, 'dame los datos'));
-    expect(world.client.lastText()).not.toContain('PIN');
+    expect(world.client.lastText()).toContain('🔒 PIN: 4828');
   });
 
   it('(6) Netflix password is tied to the account, not the profile', async () => {

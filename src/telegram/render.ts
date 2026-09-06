@@ -89,11 +89,53 @@ export function formatDate(value: string | null | undefined): string {
 }
 
 /**
+ * Central Spanish long date (`18 de septiembre de 2026`) for credential
+ * expiry — the ONE format every credentials WhatsApp template and every
+ * credential card uses, so copy swaps never fork the format. Strict
+ * `YYYY-MM-DD` only; null/empty/unparseable returns null and the caller
+ * renders the explicit gap (`sin fecha registrada`) — never a fake date,
+ * never legacy DIAS, never another assignment's expiry.
+ */
+const MESES_ES_LARGO = [
+  'enero',
+  'febrero',
+  'marzo',
+  'abril',
+  'mayo',
+  'junio',
+  'julio',
+  'agosto',
+  'septiembre',
+  'octubre',
+  'noviembre',
+  'diciembre',
+] as const;
+
+export function formatExpiryLong(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (match?.[1] === undefined || match?.[2] === undefined || match?.[3] === undefined) {
+    return null;
+  }
+  const month = MESES_ES_LARGO[Number(match[2]) - 1];
+  if (month === undefined) {
+    return null;
+  }
+  return `${String(Number(match[3]))} de ${month} de ${match[1]}`;
+}
+
+/** Explicit expiry gap — shown when no valid `YYYY-MM-DD` exists. */
+export function renderExpiryGap(): string {
+  return 'sin fecha registrada';
+}
+
+/**
  * Central status renderer. Vencido NEVER renders as Libre — that domain
  * rule (BR-SLOT-005) is enforced here by construction: this function has
  * no code path that emits `Libre` for any input.
- */
-export function renderStatus(estatus: string): string {
+ */export function renderStatus(estatus: string): string {
   switch (estatus) {
     case 'Vigente':
       return '🟢 Vigente';
@@ -448,6 +490,8 @@ export interface RenderedCredential {
   accountType: 'netflix-profile' | 'flujotv-shared' | 'flujotv-complete';
   /** Holding client — RAW. */
   customerName: string;
+  /** `FECHA QUE ACABA` of THIS assignment (`YYYY-MM-DD` or null) — RAW. */
+  fechaFin?: string | null;
   /** Real PIN — present ONLY when source carries one; otherwise omitted. */
   pin?: string;
 }
@@ -457,9 +501,10 @@ export interface RenderedCredential {
  * the central renderer, every dynamic value escaped. Shown ONLY after an
  * explicit datos request inside the actor's authorized operating topic —
  * normal search cards never include passwords/PIN. Netflix shows the
- * account password + profile; FlujoTV shows its own model (Usuario +
- * Perfil for shared, Usuario + Completa for exclusive). No WhatsApp
- * button here (slice B owns delivery) — card + Volver only.
+ * account password + profile + 🔒 PIN; FlujoTV shows its own model
+ * (Usuario + Perfil for shared, Usuario + Completa for exclusive). The
+ * card carries THIS assignment's expiry (long Spanish format, explicit
+ * gap when unknown — never another assignment's, never invented).
  */
 export function renderCredentialCard(bundle: RenderedCredential): string {
   const lines: string[] = [
@@ -479,9 +524,62 @@ export function renderCredentialCard(bundle: RenderedCredential): string {
       lines.push(field('Perfil', bundle.profile));
     }
   }
+  const expiry = formatExpiryLong(bundle.fechaFin ?? null) ?? renderExpiryGap();
+  lines.push(`📅 Vence: ${esc(expiry)}`);
   lines.push(field('Contraseña', bundle.accountPassword));
   if (bundle.pin !== undefined && bundle.pin !== '') {
-    lines.push(field('PIN', bundle.pin));
+    lines.push(`🔒 PIN: ${esc(bundle.pin)}`);
+  }
+  return lines.join('\n');
+}
+
+/** One assignment block for the multi-assignment first card (all RAW, escaped here). */
+export interface RenderedCredentialAssignment {
+  /** 1-based position — UX numbering only, resolution uses stable keys. */
+  numeral: string;
+  /** Display service label (`Netflix`, `FlujoTV`) — RAW. */
+  serviceLabel: string;
+  /** PERFIL as stored — RAW. */
+  profile: string;
+  /** Short safe disambiguator (client or account id) — RAW, shown only when set. */
+  disambiguator?: string;
+  /** Derived status (domain calculation, passed in). */
+  estatus: StatusKind | string;
+  /** Calendar days to expiry (null when unknown). */
+  dias: number | null;
+  /** `FECHA QUE ACABA` of THIS assignment (`YYYY-MM-DD` or null) — RAW. */
+  fechaFin: string | null;
+  /** PAIS_CUENTA as stored — shown ONLY when non-empty. */
+  paisCuenta?: string;
+}
+
+/**
+ * Multi-assignment FIRST card: compact blocks (title bold, blank-line
+ * separators, short lines, empty fields omitted — never `País: —`),
+ * one per assignment, so the operator picks the assignment directly —
+ * never a long card plus a generic Datos button forcing a second
+ * selector. Buttons (built by the caller, one per block, same order)
+ * resolve stable assignment keys; the numeral is UX only.
+ */
+export function renderCredentialAssignmentList(
+  total: number,
+  assignments: RenderedCredentialAssignment[],
+): string {
+  const lines: string[] = [`${title(`🔐 ¿Qué datos necesitas? (${total})`)}\nElige una opción:`];
+  for (const assignment of assignments) {
+    const head =
+      assignment.disambiguator !== undefined && assignment.disambiguator !== ''
+        ? `${assignment.numeral} ${assignment.serviceLabel} · ${assignment.profile} · ${assignment.disambiguator}`
+        : `${assignment.numeral} ${assignment.serviceLabel} · ${assignment.profile}`;
+    lines.push('', esc(head));
+    lines.push(
+      `${renderStatus(assignment.estatus)}${renderDias(assignment.dias)}`,
+    );
+    const expiry = formatExpiryLong(assignment.fechaFin) ?? renderExpiryGap();
+    lines.push(`📅 Vence: ${esc(expiry)}`);
+    if (assignment.paisCuenta !== undefined && assignment.paisCuenta.trim() !== '') {
+      lines.push(`🌎 País: ${esc(assignment.paisCuenta.trim())}`);
+    }
   }
   return lines.join('\n');
 }

@@ -38,6 +38,7 @@ export type CallbackAction =
   | 'correct'
   | 'cancel'
   | 'credentials'
+  | 'services'
   | 'view0'
   | 'view1'
   | 'view2'
@@ -59,6 +60,7 @@ const SHORT_IDS: Record<CallbackAction, string> = {
   correct: 'fix',
   cancel: 'no',
   credentials: 'cred',
+  services: 'svc',
   view0: 'w0',
   view1: 'w1',
   view2: 'w2',
@@ -202,17 +204,24 @@ export function whatsappUrlButton(url: string): InlineKeyboardButton {
 /**
  * Credential card keyboard (Slice A card + Slice B delivery): the
  * `💬 Abrir WhatsApp` URL button ONLY when a valid wa.me link was
- * prepared, plus [🔎Buscar otra][←Volver] (search-again + Volver).
+ * prepared (automatic whenever bundle+phone+E.164 are unambiguous —
+ * datos → 1 tap → WhatsApp), the `[← Servicios]` owned button ONLY when
+ * the card came from a multi-assignment selector (restores the selector
+ * card in place), plus [🔎Buscar otra][←Volver] (search-again + Volver).
  * The sensitive card never carries a 🔐Datos button (it IS the datos
  * view) and drafts stay untouched.
  */
 export function credentialCardKeyboard(
   interactionId?: string,
   whatsappUrl?: string,
+  opts?: { showServices?: boolean },
 ): InlineKeyboardMarkup {
   const rows: InlineKeyboardButton[][] = [];
   if (whatsappUrl !== undefined) {
     rows.push([whatsappUrlButton(whatsappUrl)]);
+  }
+  if (opts?.showServices === true) {
+    rows.push([ownedButton('← Servicios', 'services', interactionId)]);
   }
   rows.push([ownedButton('🔎Buscar otra', 'buscar', interactionId), backButton(interactionId)]);
   return { inline_keyboard: rows };

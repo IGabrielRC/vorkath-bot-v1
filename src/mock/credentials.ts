@@ -1,5 +1,6 @@
 import { serviceLabel } from './customers';
 import type { MockAccount, MockService } from './excelLoader';
+import { resolveNetflixPin } from './netflixPin';
 import { splitStoredNumbers } from './phone';
 
 /**
@@ -13,9 +14,11 @@ import { splitStoredNumbers } from './phone';
  * - FlujoTV: keeps its OWN model (`flujotv-shared` per-slot password from
  *   the assignment's own row, `passwordScope: 'slot'`; `flujotv-complete`
  *   exclusive slot) — the Netflix shape is never forced onto it.
- * - `pin` is present ONLY when a real PIN exists in source. The fixture
- *   carries no PIN column (BR-NFX-008 pending), so it stays absent —
- *   never synthesized, never defaulted.
+ * - `pin` is present ONLY on Netflix bundles whose assignment phone is
+ *   unequivocal (exactly one usable identity across the assignment's own
+ *   stored numbers → last-4 rule in `./netflixPin`). Ambiguous assignments
+ *   carry no PIN — the caller asks/disambiguates first, never invents.
+ *   FlujoTV bundles never carry a PIN.
  *
  * Bundles are built inside the domain/repository layer (see
  * `repositories.ts`) so raw `contrasena` values never flow through the
@@ -46,9 +49,15 @@ export interface CredentialBundle {
   customerName: string;
   /** Individual numbers across the assignment's stored NUMERO cell. */
   customerPhones: string[];
+  /** PAIS_CUENTA as stored (may be '') — safe display field, never phone-derived. */
+  paisCuenta: string;
+  /** `FECHA QUE ACABA` of THIS assignment (`YYYY-MM-DD` or null) — never
+   *   another assignment's, never legacy DIAS, never invented. */
+  fechaFin: string | null;
   /**
-   * Present ONLY when a real PIN exists in source. The fixture has no
-   * PIN column, so this stays absent — never invented.
+   * Derived Netflix profile PIN (last-4 rule in `./netflixPin`) — present
+   * ONLY when the assignment's own phone is unequivocal. NEVER on FlujoTV,
+   * NEVER invented, NEVER persisted beyond this transient bundle.
    */
   pin?: string;
 }
@@ -114,6 +123,9 @@ export function buildCredentialBundles(
     const type = accountTypeFor(row.servicio, row.perfil);
     const password =
       row.servicio === 'netflix' ? accountPasswordFor(accountScope, row) : row.contrasena.trim();
+    const phones = splitStoredNumbers(row.numero);
+    const pin =
+      row.servicio === 'netflix' ? resolveNetflixPin(phones) : undefined;
     return {
       service: row.servicio,
       serviceLabel: serviceLabel(row.servicio),
@@ -123,7 +135,10 @@ export function buildCredentialBundles(
       profile: row.perfil,
       accountType: type,
       customerName: row.nombre.trim(),
-      customerPhones: splitStoredNumbers(row.numero),
+      customerPhones: phones,
+      paisCuenta: row.pais,
+      fechaFin: row.fechaFin,
+      ...(pin !== undefined ? { pin } : {}),
     };
   });
 }

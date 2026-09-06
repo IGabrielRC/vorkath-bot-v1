@@ -13,9 +13,11 @@ import {
 } from '../mock/accounts';
 import {
   CustomerSelectionStore,
+  deriveExpiryStatus,
   formatCustomerCard,
   type Customer,
 } from '../mock/customers';
+import { deriveNetflixProfilePin, resolveNetflixPin } from '../mock/netflixPin';
 import {
   InteractionStore,
   type Interaction,
@@ -24,7 +26,7 @@ import {
 import type { MockRepositories, SafeAccount } from '../mock/repositories';
 import type { CredentialBundle } from '../mock/credentials';
 import type { MockService } from '../mock/excelLoader';
-import { credentialOptionLabel, resolveCredentialView } from '../tools/credentials';
+import { credentialAssignmentKey, credentialOptionLabels, resolveCredentialView } from '../tools/credentials';
 import {
   buildWhatsAppUrl,
   resolveWhatsAppTarget,
@@ -33,7 +35,7 @@ import {
   WHATSAPP_PREPARED_TEXT,
 } from '../whatsapp/link';
 import { renderCredentialWhatsAppText } from '../whatsapp/templates';
-import { containsPhoneCandidate, extractEmbeddedAccount, isExplicitCreateRequest } from '../parser/fast';
+import { containsPhoneCandidate, extractEmbeddedAccount, isExplicitCreateRequest, parseEmail, parsePhone } from '../parser/fast';
 import { route } from '../router/hybrid';
 import { SessionStore } from '../session/store';
 import {
@@ -65,8 +67,8 @@ import {
   renderAccountChoices,
   renderAccountNotFound,
   renderActivitySummary,
+  renderCredentialAssignmentList,
   renderCredentialCard,
-  renderCredentialChoices,
   renderCredentialNoContext,
   renderCustomerList,
   renderDraftCreated,
@@ -1454,12 +1456,199 @@ export function createWebhookHandler(deps: WebhookDeps) {
       return `credential:${bundle.service}:${bundle.accountIdentifier}`;
     }
 
-    /** Renders ONE sensitive card + safe-ref audit (no secrets in logs). */
+    /**
+     * Context precedence (explicit current-message identifier ALWAYS
+     * beats interaction selection > prior operator context >
+     * ask-missing): extracts the identifier stated in THIS update's text
+     * (L2 phone/email/account kinds first, else deterministic fallback
+     * extractors over the raw text), regardless of which layer routed it.
+     * Applies to account/phone/customer/assignment identifiers.
+     */
+    function extractIdentifierFromText(): string | undefined {
+      if (decision.layer === 'L2') {
+        const parse = decision.parse;
+        if (parse.kind === 'phone') {
+          return parse.raw;
+        }
+        if (parse.kind === 'email' || parse.kind === 'account') {
+          return parse.value;
+        }
+      }
+      const email = parseEmail(text);
+      if (email !== null) {
+        return email.value;
+      }
+      const phone = parsePhone(text);
+      if (phone !== null) {
+        return phone.raw;
+      }
+      const account = extractEmbeddedAccount(text);
+      if (account !== null) {
+        return account.value;
+      }
+      return undefined;
+    }
+
+    interface ExplicitCredentialResolution {
+      bundles: CredentialBundle[];
+      customer?: Customer;
+      account?: ServiceAccount;
+    }
+
+    /**
+     * Resolves an explicit identifier to credential bundles WITHOUT
+     * touching search/grouping/identity rules: phone-like identifiers
+     * travel the phone seam (grouped to customers), neutral identifiers
+     * travel the account seam (grouped to accounts), anything else falls
+     * back to the safe substring search mapped to holding customers.
+     * Single-customer/single-account resolutions also refresh the
+     * actor's own selection stores so the new resolution becomes the
+     * operator context for later bare repeats.
+     */
+    async function bundlesForExplicitIdentifier(
+      identifier: string,
+    ): Promise<ExplicitCredentialResolution | null> {
+      const trimmed = identifier.trim();
+      if (trimmed === '') {
+        return null;
+      }
+      if (containsPhoneCandidate(trimmed)) {
+        const customers = await deps.repos.searchCustomersByPhone(trimmed);
+        if (customers.length === 1) {
+          const only = customers[0] as Customer;
+          rememberCustomerSelection(only);
+          return {
+            bundles: await deps.repos.getCredentialBundlesForCustomer(only.id),
+            customer: only,
+          };
+        }
+        if (customers.length > 1) {
+          const union: CredentialBundle[] = [];
+          for (const customer of customers) {
+            union.push(
+              ...(await deps.repos.getCredentialBundlesForCustomer(customer.id)),
+            );
+          }
+          return { bundles: union };
+        }
+        return { bundles: [] };
+      }
+      const accounts = await deps.repos.searchServiceAccounts(trimmed);
+      if (accounts.length > 0) {
+        const union: CredentialBundle[] = [];
+        for (const account of accounts) {
+          union.push(...(await deps.repos.getCredentialBundlesForAccount(account.id)));
+        }
+        if (accounts.length === 1) {
+          const only = accounts[0] as ServiceAccount;
+          rememberAccountSelection(only);
+          return { bundles: union, account: only };
+        }
+        return { bundles: union };
+      }
+      const rows = await deps.repos.searchAccounts(trimmed);
+      const names = [...new Set(rows.map((row) => row.nombre))];
+      if (names.length === 0) {
+        return { bundles: [] };
+      }
+      const union: CredentialBundle[] = [];
+      let single: Customer | undefined;
+      for (const name of names) {
+        const key = name.trim().toLowerCase();
+        const bundles = await deps.repos.getCredentialBundlesForCustomer(key);
+        if (bundles.length === 0) {
+          continue;
+        }
+        union.push(...bundles);
+        if (names.length === 1) {
+          single = { id: key, nombre: name, phones: [], subscriptions: [] };
+        }
+      }
+      if (single !== undefined) {
+        rememberCustomerSelection(single);
+        return { bundles: union, customer: single };
+      }
+      return { bundles: union };
+    }
+
+    /** Actor's own latest phone query (search context) — preferred when usable. */
+    function preferredPhoneQuery(): string | undefined {
+      const query = resolveOwnSearchQuery();
+      if (query !== undefined && containsPhoneCandidate(query)) {
+        return query;
+      }
+      return undefined;
+    }
+
+    /**
+     * Effective Netflix PIN for ONE bundle at render time: the contextual
+     * phone wins when usable and matching the assignment, else the
+     * assignment-unequivocal PIN carried by the bundle, else undefined
+     * (the caller asks/disambiguates — never arbitrary, never stale).
+     * Non-Netflix bundles pass through untouched.
+     */
+    function bundleWithEffectivePin(
+      bundle: CredentialBundle,
+      phoneRaw?: string,
+    ): CredentialBundle {
+      if (bundle.service !== 'netflix') {
+        return bundle;
+      }
+      const pin =
+        resolveNetflixPin(bundle.customerPhones, phoneRaw) ?? bundle.pin;
+      if (pin === undefined || pin === bundle.pin) {
+        return bundle;
+      }
+      return { ...bundle, pin };
+    }
+
+    /** Numerals for assignment/phone option buttons — UX only, never resolution keys. */
+    const OPTION_NUMERALS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+
+    /**
+     * Renders ONE sensitive card + safe-ref audit (no secrets in logs).
+     * The WhatsApp button is AUTOMATIC whenever bundle+phone+E.164 are
+     * unambiguous (datos → 1 tap → WhatsApp — never type "abre whatsapp"
+     * after); ambiguous phones stay button-less (the explicit WhatsApp
+     * flow asks first). Single-card: callback-derived renders edit the
+     * SAME card in place via `sendLabeled`.
+     */
     async function renderCredentialDirect(
       interaction: Interaction,
       bundle: CredentialBundle,
       refs: CredentialRefs,
     ): Promise<void> {
+      const preferred = preferredPhoneQuery();
+      const effective = bundleWithEffectivePin(bundle, preferred);
+      const target = resolveWhatsAppTarget(effective.customerPhones, preferred);
+      let whatsappUrl: string | undefined;
+      let suffix = '';
+      let delivered = effective;
+      if (target.kind === 'direct') {
+        if (effective.service === 'netflix' && effective.pin === undefined) {
+          const pin = deriveNetflixProfilePin(target.identity);
+          if (pin !== undefined) {
+            delivered = { ...effective, pin };
+          }
+        }
+        whatsappUrl = buildWhatsAppUrl(
+          target.identity,
+          renderCredentialWhatsAppText(delivered),
+        );
+        suffix = `\n\n${WHATSAPP_PREPARED_TEXT}`;
+        auditor.record({
+          chatId: targetChatId,
+          actorTelegramUserId: targetActorId,
+          ...(targetActorName !== undefined ? { actorName: targetActorName } : {}),
+          actionType: 'whatsapp.link_prepared',
+          entity: credentialAuditRef(delivered),
+          metadata: {
+            service: delivered.service,
+            accountRef: delivered.accountIdentifier,
+            customerRef: delivered.customerName,
+          },
+        });
+      }
       deps.interactions.touch(interaction.id, { ...refs, view: 'credentials-detail' });
       persistAll();
       auditor.record({
@@ -1467,11 +1656,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
         actorTelegramUserId: targetActorId,
         ...(targetActorName !== undefined ? { actorName: targetActorName } : {}),
         actionType: 'credential.viewed',
-        entity: credentialAuditRef(bundle),
+        entity: credentialAuditRef(delivered),
         metadata: {
-          service: bundle.service,
-          accountRef: bundle.accountIdentifier,
-          customerRef: bundle.customerName,
+          service: delivered.service,
+          accountRef: delivered.accountIdentifier,
+          customerRef: delivered.customerName,
         },
       });
       logger.info(
@@ -1479,33 +1668,42 @@ export function createWebhookHandler(deps: WebhookDeps) {
         'Rendered credential card',
       );
       await sendLabeled(
-        renderCredentialCard({
-          serviceLabel: bundle.serviceLabel,
-          accountIdentifier: bundle.accountIdentifier,
-          accountPassword: bundle.accountPassword,
-          profile: bundle.profile,
-          accountType: bundle.accountType,
-          customerName: bundle.customerName,
-          ...(bundle.pin !== undefined ? { pin: bundle.pin } : {}),
+        `${renderCredentialCard({
+          serviceLabel: delivered.serviceLabel,
+          accountIdentifier: delivered.accountIdentifier,
+          accountPassword: delivered.accountPassword,
+          profile: delivered.profile,
+          accountType: delivered.accountType,
+          customerName: delivered.customerName,
+          fechaFin: delivered.fechaFin,
+          ...(delivered.pin !== undefined ? { pin: delivered.pin } : {}),
+        })}${suffix}`,
+        credentialCardKeyboard(interaction.id, whatsappUrl, {
+          showServices: refs.total > 1,
         }),
-        credentialCardKeyboard(interaction.id),
         interaction.messageThreadId,
       );
     }
 
-    /** Minimal disambiguation over real-data options — never passwords. */
+    /**
+     * Multi-assignment FIRST card: compact per-assignment blocks with
+     * clear per-assignment buttons (stable assignment keys stored in
+     * state — numbering is UX only). Never a long card + generic Datos
+     * button. The same renderer serves the WhatsApp variant (selection
+     * continues into phone targeting through the stored `whatsapp` flag).
+     */
     async function renderCredentialAsk(
       interaction: Interaction,
       options: CredentialBundle[],
       refs: CredentialRefs,
       viaWhatsApp = false,
     ): Promise<void> {
-      const multiCustomer = new Set(options.map((option) => option.customerName)).size > 1;
-      const labels = options.map((option) => credentialOptionLabel(option, multiCustomer));
+      const labels = credentialOptionLabels(options);
       deps.interactions.touch(interaction.id, {
         ...refs,
         total: options.length,
         view: 'credentials-list',
+        assignmentKeys: options.map((option) => credentialAssignmentKey(option)),
         ...(viaWhatsApp ? { whatsapp: true } : {}),
       });
       persistAll();
@@ -1514,16 +1712,48 @@ export function createWebhookHandler(deps: WebhookDeps) {
         'Rendered credential disambiguation',
       );
       await sendLabeled(
-        renderCredentialChoices(options.length),
+        renderCredentialAssignmentList(
+          options.length,
+          options.map((option, index) => {
+            const derived = deriveExpiryStatus(option.fechaFin);
+            const base = `${option.serviceLabel} · ${option.profile}`;
+            const label = labels[index] ?? base;
+            const suffix = label.startsWith(base)
+              ? label.slice(base.length).replace(/^ · /, '')
+              : label;
+            return {
+              numeral: OPTION_NUMERALS[index] ?? '•',
+              serviceLabel: option.serviceLabel,
+              profile: option.profile,
+              ...(suffix !== '' ? { disambiguator: suffix } : {}),
+              estatus: derived.estatus,
+              dias: derived.dias,
+              fechaFin: option.fechaFin,
+              paisCuenta: option.paisCuenta,
+            };
+          }),
+        ),
         credentialDisambiguationKeyboard(labels, { interactionId: interaction.id }),
         interaction.messageThreadId,
       );
     }
 
+    /**
+     * SHOW_CREDENTIALS explicit entry: explicit current-message
+     * identifier → interaction selection → prior operator context →
+     * ask-missing. Repeats are idempotent (same identifier/context →
+     * same logical card, never draft/Home/stale/UNKNOWN).
+     */
     async function runCredentialsFlow(
       origin: Interaction | undefined,
       serviceFilter?: MockService,
+      explicitIdentifier?: string,
     ): Promise<void> {
+      const identifier = explicitIdentifier ?? extractIdentifierFromText();
+      if (identifier !== undefined) {
+        await runExplicitCredentialsFlow(identifier, serviceFilter, false);
+        return;
+      }
       const fromOrigin = readCredentialSelection(origin);
       const selection =
         fromOrigin.customer !== undefined || fromOrigin.account !== undefined
@@ -1562,12 +1792,92 @@ export function createWebhookHandler(deps: WebhookDeps) {
       );
     }
 
-    /** Credential card from the owned disambiguation list (re-resolved, never persisted). */
-    async function renderCredentialSelection(
-      interaction: Interaction,
-      optionIndex: number,
+    /**
+     * Explicit-identifier credential entry (shared by datos and
+     * WhatsApp flows): the current message names the target, so it
+     * ALWAYS beats stored selection/context. A bare repeat (no new
+     * identifier) reuses the refreshed context — same logical result.
+     * An explicit identifier matching nothing answers the honest
+     * no-context guide — never a stale card, never Home, never UNKNOWN.
+     * Unambiguous resolutions mirror into the interaction state so they
+     * become the new operator context.
+     */
+    async function runExplicitCredentialsFlow(
+      identifier: string,
+      serviceFilter: MockService | undefined,
+      viaWhatsApp: boolean,
     ): Promise<void> {
-      const state = interaction.state;
+      const explicit = await bundlesForExplicitIdentifier(identifier);
+      if (explicit === null || explicit.bundles.length === 0) {
+        const view = createInteraction('SEARCH', { view: 'prompt' });
+        persistAll();
+        await sendLabeled(
+          renderCredentialNoContext(),
+          sectionKeyboard('buscar', view.id),
+          view.messageThreadId,
+        );
+        return;
+      }
+      const selection: CredentialSelection = {};
+      if (explicit.customer !== undefined) {
+        selection.customer = { id: explicit.customer.id, nombre: explicit.customer.nombre };
+      }
+      if (explicit.account !== undefined) {
+        selection.account = {
+          id: explicit.account.id,
+          servicio: explicit.account.servicio,
+          identifier: explicit.account.identifier,
+        };
+      }
+      const interaction = createInteraction('SEARCH', {
+        view: viaWhatsApp ? 'whatsapp-list' : 'credentials-list',
+        offset: 0,
+      });
+      let view = resolveCredentialView(explicit.bundles, serviceFilter);
+      if (view.kind === 'none' && serviceFilter !== undefined) {
+        view = resolveCredentialView(explicit.bundles, undefined);
+      }
+      const refs = credentialRefsFor(selection, serviceFilter, explicit.bundles.length);
+      deps.interactions.touch(interaction.id, {
+        ...refs,
+        ...(selection.customer !== undefined
+          ? { selectedCustomer: selection.customer }
+          : {}),
+        ...(selection.account !== undefined ? { selectedAccount: selection.account } : {}),
+        explicitIdentifier: identifier.trim(),
+      });
+      const touched = deps.interactions.get(interaction.id) ?? interaction;
+      if (view.kind === 'direct') {
+        if (viaWhatsApp) {
+          await renderWhatsAppForBundle(touched, view.bundle, refs, preferredPhoneQuery());
+          return;
+        }
+        await renderCredentialDirect(touched, view.bundle, refs);
+        return;
+      }
+      if (view.kind === 'ask') {
+        await renderCredentialAsk(touched, view.options, refs, viaWhatsApp);
+        return;
+      }
+      persistAll();
+      await sendLabeled(
+        renderCredentialNoContext(),
+        sectionKeyboard('buscar', touched.id),
+        touched.messageThreadId,
+      );
+    }
+
+    /**
+     * Re-resolves candidate bundles for an owned interaction from its
+     * secret-free state: single customer/account refs, or the stored
+     * explicit identifier (union resolutions). Powers selector taps,
+     * [← Servicios] restores and phone-choice taps without persisting
+     * any secret.
+     */
+    async function candidateBundlesForState(state: Record<string, unknown>): Promise<{
+      bundles: CredentialBundle[];
+      selection: CredentialSelection;
+    }> {
       const selection: CredentialSelection = {};
       if (typeof state['customerId'] === 'string') {
         selection.customer = { id: state['customerId'], nombre: '' };
@@ -1580,21 +1890,85 @@ export function createWebhookHandler(deps: WebhookDeps) {
         storedFilter === 'netflix' || storedFilter === 'flujotv'
           ? (storedFilter as MockService)
           : undefined;
-      const bundles = await credentialBundlesFor(selection);
-      let view = resolveCredentialView(bundles, serviceFilter);
-      if (view.kind === 'none' && serviceFilter !== undefined) {
-        view = resolveCredentialView(bundles, undefined);
+      if (
+        selection.customer !== undefined ||
+        selection.account !== undefined
+      ) {
+        const bundles = await credentialBundlesFor(selection);
+        let view = resolveCredentialView(bundles, serviceFilter);
+        if (view.kind === 'none' && serviceFilter !== undefined) {
+          view = resolveCredentialView(bundles, undefined);
+        }
+        if (view.kind === 'direct') {
+          return { bundles: [view.bundle], selection };
+        }
+        if (view.kind === 'ask') {
+          return { bundles: view.options, selection };
+        }
+        return { bundles, selection };
       }
-      if (view.kind !== 'ask') {
+      const storedIdentifier = state['explicitIdentifier'];
+      if (typeof storedIdentifier === 'string' && storedIdentifier.trim() !== '') {
+        const explicit = await bundlesForExplicitIdentifier(storedIdentifier);
+        const bundles = explicit?.bundles ?? [];
+        let view = resolveCredentialView(bundles, serviceFilter);
+        if (view.kind === 'none' && serviceFilter !== undefined) {
+          view = resolveCredentialView(bundles, undefined);
+        }
+        if (view.kind === 'direct') {
+          return { bundles: [view.bundle], selection };
+        }
+        if (view.kind === 'ask') {
+          return { bundles: view.options, selection };
+        }
+        return { bundles, selection };
+      }
+      return { bundles: [], selection };
+    }
+
+    /** Resolves ONE bundle out of stored stable assignment keys (numbering is UX only). */
+    function bundleForOptionIndex(
+      bundles: CredentialBundle[],
+      state: Record<string, unknown>,
+      optionIndex: number,
+    ): CredentialBundle | undefined {
+      const keys = Array.isArray(state['assignmentKeys'])
+        ? (state['assignmentKeys'] as unknown[]).filter(
+            (key): key is string => typeof key === 'string',
+          )
+        : [];
+      const key = keys[optionIndex];
+      if (key !== undefined) {
+        const match = bundles.find((bundle) => credentialAssignmentKey(bundle) === key);
+        if (match !== undefined) {
+          return match;
+        }
+      }
+      return bundles[optionIndex];
+    }
+
+    /** Credential card from the owned disambiguation list (stable keys, never persisted secrets). */
+    async function renderCredentialSelection(
+      interaction: Interaction,
+      optionIndex: number,
+    ): Promise<void> {
+      const state = interaction.state;
+      const { bundles, selection } = await candidateBundlesForState(state);
+      if (bundles.length === 0) {
         await ackStale('view');
         return;
       }
-      const bundle = view.options[optionIndex];
+      const storedFilter = state['serviceFilter'];
+      const serviceFilter =
+        storedFilter === 'netflix' || storedFilter === 'flujotv'
+          ? (storedFilter as MockService)
+          : undefined;
+      const bundle = bundleForOptionIndex(bundles, state, optionIndex);
       if (bundle === undefined) {
         await ackStale('view');
         return;
       }
-      const refs = credentialRefsFor(selection, serviceFilter, view.options.length);
+      const refs = credentialRefsFor(selection, serviceFilter, bundles.length);
       if (state['whatsapp'] === true) {
         deps.interactions.touch(interaction.id, { optionIndex });
         await renderWhatsAppForBundle(interaction, bundle, refs, preferredPhoneQuery(), optionIndex);
@@ -1603,45 +1977,35 @@ export function createWebhookHandler(deps: WebhookDeps) {
       await renderCredentialDirect(interaction, bundle, refs);
     }
 
-    /** Rebuilds the owned disambiguation list (Volver from a card/list). */
+    /** Rebuilds the owned disambiguation list ([← Servicios] / Volver from a card/list). */
     async function renderCredentialList(interaction: Interaction): Promise<void> {
       const state = interaction.state;
-      const selection: CredentialSelection = {};
-      if (typeof state['customerId'] === 'string') {
-        selection.customer = { id: state['customerId'], nombre: '' };
-      }
-      if (typeof state['accountId'] === 'string') {
-        selection.account = { id: state['accountId'], servicio: '', identifier: '' };
-      }
+      const { bundles, selection } = await candidateBundlesForState(state);
       const storedFilter = state['serviceFilter'];
       const serviceFilter =
         storedFilter === 'netflix' || storedFilter === 'flujotv'
           ? (storedFilter as MockService)
           : undefined;
-      const bundles = await credentialBundlesFor(selection);
-      let view = resolveCredentialView(bundles, serviceFilter);
-      if (view.kind === 'none' && serviceFilter !== undefined) {
-        view = resolveCredentialView(bundles, undefined);
-      }
       const refs = credentialRefsFor(selection, serviceFilter, bundles.length);
       const viaWhatsApp = state['whatsapp'] === true;
-      if (view.kind === 'ask') {
-        await renderCredentialAsk(interaction, view.options, refs, viaWhatsApp);
+      if (bundles.length > 1) {
+        await renderCredentialAsk(interaction, bundles, refs, viaWhatsApp);
         return;
       }
-      if (view.kind === 'direct') {
+      if (bundles.length === 1) {
+        const only = bundles[0] as CredentialBundle;
         if (viaWhatsApp) {
           const storedIndex = state['optionIndex'];
           await renderWhatsAppForBundle(
             interaction,
-            view.bundle,
+            only,
             refs,
             preferredPhoneQuery(),
             typeof storedIndex === 'number' ? storedIndex : undefined,
           );
           return;
         }
-        await renderCredentialDirect(interaction, view.bundle, refs);
+        await renderCredentialDirect(interaction, only, refs);
         return;
       }
       persistAll();
@@ -1671,15 +2035,6 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * AlertService.
      */
 
-    /** Actor's own latest phone query (search context) — preferred when usable. */
-    function preferredPhoneQuery(): string | undefined {
-      const query = resolveOwnSearchQuery();
-      if (query !== undefined && containsPhoneCandidate(query)) {
-        return query;
-      }
-      return undefined;
-    }
-
     /** Renders ONE bundle's delivery: direct link, phone ask, or no-link. */
     async function renderWhatsAppDirect(
       interaction: Interaction,
@@ -1687,9 +2042,17 @@ export function createWebhookHandler(deps: WebhookDeps) {
       refs: CredentialRefs,
       phoneRaw?: string,
     ): Promise<void> {
-      const target = resolveWhatsAppTarget(bundle.customerPhones, phoneRaw);
+      const effective = bundleWithEffectivePin(bundle, phoneRaw ?? preferredPhoneQuery());
+      const target = resolveWhatsAppTarget(effective.customerPhones, phoneRaw);
       if (target.kind === 'direct') {
-        const text = renderCredentialWhatsAppText(bundle);
+        let delivered = effective;
+        if (effective.service === 'netflix' && effective.pin === undefined) {
+          const pin = deriveNetflixProfilePin(target.identity);
+          if (pin !== undefined) {
+            delivered = { ...effective, pin };
+          }
+        }
+        const text = renderCredentialWhatsAppText(delivered);
         const url = buildWhatsAppUrl(target.identity, text);
         deps.interactions.touch(interaction.id, { ...refs, view: 'whatsapp-detail' });
         persistAll();
@@ -1711,15 +2074,18 @@ export function createWebhookHandler(deps: WebhookDeps) {
         );
         await sendLabeled(
           `${renderCredentialCard({
-            serviceLabel: bundle.serviceLabel,
-            accountIdentifier: bundle.accountIdentifier,
-            accountPassword: bundle.accountPassword,
-            profile: bundle.profile,
-            accountType: bundle.accountType,
-            customerName: bundle.customerName,
-            ...(bundle.pin !== undefined ? { pin: bundle.pin } : {}),
+            serviceLabel: delivered.serviceLabel,
+            accountIdentifier: delivered.accountIdentifier,
+            accountPassword: delivered.accountPassword,
+            profile: delivered.profile,
+            accountType: delivered.accountType,
+            customerName: delivered.customerName,
+            fechaFin: delivered.fechaFin,
+            ...(delivered.pin !== undefined ? { pin: delivered.pin } : {}),
           })}\n\n${WHATSAPP_PREPARED_TEXT}`,
-          credentialCardKeyboard(interaction.id, url),
+          credentialCardKeyboard(interaction.id, url, {
+            showServices: refs.total > 1,
+          }),
           interaction.messageThreadId,
         );
         return;
@@ -1771,7 +2137,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
     async function runWhatsAppFlow(
       origin: Interaction | undefined,
       serviceFilter?: MockService,
+      explicitIdentifier?: string,
     ): Promise<void> {
+      const identifier = explicitIdentifier ?? extractIdentifierFromText();
+      if (identifier !== undefined) {
+        await runExplicitCredentialsFlow(identifier, serviceFilter, true);
+        return;
+      }
       const fromOrigin = readCredentialSelection(origin);
       const selection =
         fromOrigin.customer !== undefined || fromOrigin.account !== undefined
@@ -1838,17 +2210,16 @@ export function createWebhookHandler(deps: WebhookDeps) {
         storedFilter === 'netflix' || storedFilter === 'flujotv'
           ? (storedFilter as MockService)
           : undefined;
-      const bundles = await credentialBundlesFor(selection);
-      let view = resolveCredentialView(bundles, serviceFilter);
-      if (view.kind === 'none' && serviceFilter !== undefined) {
-        view = resolveCredentialView(bundles, undefined);
-      }
+      const { bundles } = await candidateBundlesForState(state);
       let bundle: CredentialBundle | undefined;
-      if (view.kind === 'direct') {
-        bundle = view.bundle;
-      } else if (view.kind === 'ask') {
+      if (bundles.length === 1) {
+        bundle = bundles[0];
+      } else if (bundles.length > 1) {
         const storedIndex = state['optionIndex'];
-        bundle = typeof storedIndex === 'number' ? view.options[storedIndex] : undefined;
+        bundle =
+          typeof storedIndex === 'number'
+            ? bundleForOptionIndex(bundles, state, storedIndex)
+            : undefined;
       }
       if (bundle === undefined) {
         await ackStale('view');
@@ -2121,6 +2492,32 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await runCredentialsFlow(interaction);
         return;
       }
+      if (action === 'services') {
+        // [← Servicios]: restores the owned multi-assignment selector
+        // card IN PLACE (same card edit) when one exists (N options) —
+        // never Home, never a new card, never lost context. Without a
+        // selector to restore the tap is a safe no-op.
+        if (
+          interaction.type === 'SEARCH' &&
+          (interaction.state['view'] === 'credentials-detail' ||
+            interaction.state['view'] === 'whatsapp-detail' ||
+            interaction.state['view'] === 'whatsapp-phones' ||
+            interaction.state['view'] === 'whatsapp-nolink' ||
+            interaction.state['view'] === 'credentials-list' ||
+            interaction.state['view'] === 'whatsapp-list')
+        ) {
+          const total =
+            typeof interaction.state['total'] === 'number'
+              ? (interaction.state['total'] as number)
+              : 0;
+          if (total > 1) {
+            await renderCredentialList(interaction);
+            return;
+          }
+        }
+        await ackStale('services');
+        return;
+      }
       if (action === 'operar') {
         await openOperateDraft(interaction.messageThreadId);
         return;
@@ -2320,6 +2717,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await runCredentialsFlow(undefined);
         return { ok: true };
       }
+      if (action === 'services') {
+        // Legacy unbound Servicios: no owned selector exists — Home.
+        await respond(HOME_TEXT);
+        return { ok: true };
+      }
       if (action === 'buscar') {
         await respond(SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR', 'buscar');
         return { ok: true };
@@ -2502,13 +2904,18 @@ export function createWebhookHandler(deps: WebhookDeps) {
         rawService === 'netflix' || rawService === 'flujotv'
           ? (rawService as MockService)
           : undefined;
+      // L3 semantic/reference variant: an identifier stated verbatim in
+      // the text travels explicitly (explicit current-message identifier
+      // beats stored context); reference-only ('esa…') resolves from the
+      // actor's own context inside the flow.
+      const l3Identifier = pickSearchIdentifier(intent.params);
       if (intent.params['whatsapp'] === true) {
         // WhatsApp semantic variant (L3): same delivery tool as the L2
         // phrases and the 💬 Abrir WhatsApp button.
-        await runWhatsAppFlow(undefined, serviceFilter);
+        await runWhatsAppFlow(undefined, serviceFilter, l3Identifier);
         return { ok: true };
       }
-      await runCredentialsFlow(undefined, serviceFilter);
+      await runCredentialsFlow(undefined, serviceFilter, l3Identifier);
       return { ok: true };
     }
     if (intent.name === 'OPEN_SEARCH') {
