@@ -82,11 +82,14 @@ export class MockStore {
    *
    * Phone matching goes through THE one normalizer (`./phone`): both the
    * query and every stored NUMERO cell (multi-number cells split on `/`)
-   * become canonical key sets, matched by E.164 equality or digit-suffix
-   * overlap — so `4145460657`, `0414-5460657` and `+58 414-5460657` all
-   * hit the same row with no hardcoded prefix stripping. A legacy
+   * become canonical key sets, matched by EXACT key equality only — E.164
+   * when libphonenumber-js resolves both sides, country+national when
+   * region metadata proves sameness, identical digit strings otherwise —
+   * so `4145460657`, `0414-5460657` and `+58 414-5460657` all hit the
+   * same row with no hardcoded prefix stripping and no suffix rule.
+   * Distinct numbers sharing trailing digits never collide; a legacy
    * digit-substring fallback (>=3 digits) keeps short/partial entry
-   * working exactly as before.
+   * working exactly as before, returning every candidate row.
    */
   search(query: string): MockAccount[] {
     const q = query.toLowerCase().trim();
