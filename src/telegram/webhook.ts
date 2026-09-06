@@ -25,6 +25,14 @@ import type { MockRepositories, SafeAccount } from '../mock/repositories';
 import type { CredentialBundle } from '../mock/credentials';
 import type { MockService } from '../mock/excelLoader';
 import { credentialOptionLabel, resolveCredentialView } from '../tools/credentials';
+import {
+  buildWhatsAppUrl,
+  resolveWhatsAppTarget,
+  WHATSAPP_ASK_PHONE_TEXT,
+  WHATSAPP_NO_NUMBER_TEXT,
+  WHATSAPP_PREPARED_TEXT,
+} from '../whatsapp/link';
+import { renderCredentialWhatsAppText } from '../whatsapp/templates';
 import { containsPhoneCandidate, extractEmbeddedAccount, isExplicitCreateRequest } from '../parser/fast';
 import { route } from '../router/hybrid';
 import { SessionStore } from '../session/store';
@@ -39,6 +47,7 @@ import {
   SECTION_TEXTS,
   accountDisambiguationKeyboard,
   accountSearchKeyboard,
+  credentialCardKeyboard,
   credentialDisambiguationKeyboard,
   draftKeyboard,
   homeKeyboard,
@@ -47,6 +56,7 @@ import {
   sectionKeyboard,
   withOperator,
   type CallbackAction,
+  type InlineKeyboardMarkup,
 } from './keyboards';
 import type { TelegramClient, TelegramContext } from './client';
 import {
@@ -971,11 +981,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
      */
     async function sendLabeled(
       responseText: string,
-      replyMarkup:
-        | ReturnType<typeof homeKeyboard>
-        | ReturnType<typeof sectionKeyboard>
-        | ReturnType<typeof draftKeyboard>
-        | ReturnType<typeof searchResultsKeyboard>,
+      replyMarkup: InlineKeyboardMarkup,
       threadOverride?: number,
     ): Promise<void> {
       const labeled = withOperator(responseText, targetActorName);
@@ -1482,7 +1488,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           customerName: bundle.customerName,
           ...(bundle.pin !== undefined ? { pin: bundle.pin } : {}),
         }),
-        accountSearchKeyboard(interaction.id),
+        credentialCardKeyboard(interaction.id),
         interaction.messageThreadId,
       );
     }
@@ -1492,10 +1498,16 @@ export function createWebhookHandler(deps: WebhookDeps) {
       interaction: Interaction,
       options: CredentialBundle[],
       refs: CredentialRefs,
+      viaWhatsApp = false,
     ): Promise<void> {
       const multiCustomer = new Set(options.map((option) => option.customerName)).size > 1;
       const labels = options.map((option) => credentialOptionLabel(option, multiCustomer));
-      deps.interactions.touch(interaction.id, { ...refs, total: options.length, view: 'credentials-list' });
+      deps.interactions.touch(interaction.id, {
+        ...refs,
+        total: options.length,
+        view: 'credentials-list',
+        ...(viaWhatsApp ? { whatsapp: true } : {}),
+      });
       persistAll();
       logger.info(
         { userId: targetActorId, chatId: targetChatId, updateId, action: 'credentials-ask' },
@@ -1583,6 +1595,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return;
       }
       const refs = credentialRefsFor(selection, serviceFilter, view.options.length);
+      if (state['whatsapp'] === true) {
+        deps.interactions.touch(interaction.id, { optionIndex });
+        await renderWhatsAppForBundle(interaction, bundle, refs, preferredPhoneQuery(), optionIndex);
+        return;
+      }
       await renderCredentialDirect(interaction, bundle, refs);
     }
 
@@ -1607,11 +1624,23 @@ export function createWebhookHandler(deps: WebhookDeps) {
         view = resolveCredentialView(bundles, undefined);
       }
       const refs = credentialRefsFor(selection, serviceFilter, bundles.length);
+      const viaWhatsApp = state['whatsapp'] === true;
       if (view.kind === 'ask') {
-        await renderCredentialAsk(interaction, view.options, refs);
+        await renderCredentialAsk(interaction, view.options, refs, viaWhatsApp);
         return;
       }
       if (view.kind === 'direct') {
+        if (viaWhatsApp) {
+          const storedIndex = state['optionIndex'];
+          await renderWhatsAppForBundle(
+            interaction,
+            view.bundle,
+            refs,
+            preferredPhoneQuery(),
+            typeof storedIndex === 'number' ? storedIndex : undefined,
+          );
+          return;
+        }
         await renderCredentialDirect(interaction, view.bundle, refs);
         return;
       }
@@ -1621,6 +1650,212 @@ export function createWebhookHandler(deps: WebhookDeps) {
         sectionKeyboard('buscar', interaction.id),
         interaction.messageThreadId,
       );
+    }
+
+    /**
+     * Slice B — direct WhatsApp delivery (wa.me, prefilled, manual send).
+     *
+     * The `💬 Abrir WhatsApp` URL button (L1, no callback) and the L2
+     * WhatsApp phrases plus L3 semantic variants ALL converge here — same
+     * context resolution as SHOW_CREDENTIALS (the actor's OWN selections
+     * only, never a peer's), same deterministic bundle tool, plus phone
+     * targeting through the slice-A identity (`identifyPhone`: explicit
+     * `+CC` priority, legacy only when safely decidable).
+     *
+     * Read-only: drafts are never created, updated, or cancelled here; no
+     * business state is mutated. Semantics are NEVER "sent": the UI says
+     * `💬 WhatsApp preparado.` and shows the direct URL button (at most a
+     * `whatsapp.link_prepared` audit trace with safe refs only). The full
+     * wa.me URL carries credentialed text — it is transient (button
+     * only), NEVER logged, NEVER persisted, NEVER sent to Gemini or
+     * AlertService.
+     */
+
+    /** Actor's own latest phone query (search context) — preferred when usable. */
+    function preferredPhoneQuery(): string | undefined {
+      const query = resolveOwnSearchQuery();
+      if (query !== undefined && containsPhoneCandidate(query)) {
+        return query;
+      }
+      return undefined;
+    }
+
+    /** Renders ONE bundle's delivery: direct link, phone ask, or no-link. */
+    async function renderWhatsAppDirect(
+      interaction: Interaction,
+      bundle: CredentialBundle,
+      refs: CredentialRefs,
+      phoneRaw?: string,
+    ): Promise<void> {
+      const target = resolveWhatsAppTarget(bundle.customerPhones, phoneRaw);
+      if (target.kind === 'direct') {
+        const text = renderCredentialWhatsAppText(bundle);
+        const url = buildWhatsAppUrl(target.identity, text);
+        deps.interactions.touch(interaction.id, { ...refs, view: 'whatsapp-detail' });
+        persistAll();
+        auditor.record({
+          chatId: targetChatId,
+          actorTelegramUserId: targetActorId,
+          ...(targetActorName !== undefined ? { actorName: targetActorName } : {}),
+          actionType: 'whatsapp.link_prepared',
+          entity: credentialAuditRef(bundle),
+          metadata: {
+            service: bundle.service,
+            accountRef: bundle.accountIdentifier,
+            customerRef: bundle.customerName,
+          },
+        });
+        logger.info(
+          { userId: targetActorId, chatId: targetChatId, updateId, action: 'whatsapp-direct' },
+          'Prepared WhatsApp link',
+        );
+        await sendLabeled(
+          `${renderCredentialCard({
+            serviceLabel: bundle.serviceLabel,
+            accountIdentifier: bundle.accountIdentifier,
+            accountPassword: bundle.accountPassword,
+            profile: bundle.profile,
+            accountType: bundle.accountType,
+            customerName: bundle.customerName,
+            ...(bundle.pin !== undefined ? { pin: bundle.pin } : {}),
+          })}\n\n${WHATSAPP_PREPARED_TEXT}`,
+          credentialCardKeyboard(interaction.id, url),
+          interaction.messageThreadId,
+        );
+        return;
+      }
+      if (target.kind === 'ask') {
+        const phones = target.options.map((option) => option.raw);
+        deps.interactions.touch(interaction.id, { ...refs, view: 'whatsapp-phones', phones });
+        persistAll();
+        logger.info(
+          { userId: targetActorId, chatId: targetChatId, updateId, action: 'whatsapp-ask' },
+          'Asked WhatsApp target phone',
+        );
+        await sendLabeled(
+          WHATSAPP_ASK_PHONE_TEXT,
+          credentialDisambiguationKeyboard(phones, { interactionId: interaction.id }),
+          interaction.messageThreadId,
+        );
+        return;
+      }
+      deps.interactions.touch(interaction.id, { ...refs, view: 'whatsapp-nolink' });
+      persistAll();
+      logger.info(
+        { userId: targetActorId, chatId: targetChatId, updateId, action: 'whatsapp-nolink' },
+        'No usable WhatsApp number',
+      );
+      const others =
+        target.others.length > 0 ? `\n\nNúmeros registrados: ${target.others.join(' / ')}` : '';
+      await sendLabeled(
+        `${WHATSAPP_NO_NUMBER_TEXT}${others}`,
+        credentialCardKeyboard(interaction.id),
+        interaction.messageThreadId,
+      );
+    }
+
+    /** Stores the ask-path option index so the later phone tap re-resolves. */
+    async function renderWhatsAppForBundle(
+      interaction: Interaction,
+      bundle: CredentialBundle,
+      refs: CredentialRefs,
+      phoneRaw?: string,
+      optionIndex?: number,
+    ): Promise<void> {
+      if (optionIndex !== undefined) {
+        deps.interactions.touch(interaction.id, { optionIndex });
+      }
+      await renderWhatsAppDirect(interaction, bundle, refs, phoneRaw);
+    }
+
+    async function runWhatsAppFlow(
+      origin: Interaction | undefined,
+      serviceFilter?: MockService,
+    ): Promise<void> {
+      const fromOrigin = readCredentialSelection(origin);
+      const selection =
+        fromOrigin.customer !== undefined || fromOrigin.account !== undefined
+          ? fromOrigin
+          : resolveOwnCredentialContext();
+      const bundles = await credentialBundlesFor(selection);
+      if (bundles.length === 0) {
+        const view = createInteraction('SEARCH', { view: 'prompt' });
+        persistAll();
+        await sendLabeled(
+          renderCredentialNoContext(),
+          sectionKeyboard('buscar', view.id),
+          view.messageThreadId,
+        );
+        return;
+      }
+      const interaction = createInteraction('SEARCH', { view: 'whatsapp-list', offset: 0 });
+      let view = resolveCredentialView(bundles, serviceFilter);
+      if (view.kind === 'none' && serviceFilter !== undefined) {
+        view = resolveCredentialView(bundles, undefined);
+      }
+      const refs = credentialRefsFor(selection, serviceFilter, bundles.length);
+      if (view.kind === 'direct') {
+        await renderWhatsAppForBundle(interaction, view.bundle, refs, preferredPhoneQuery());
+        return;
+      }
+      if (view.kind === 'ask') {
+        await renderCredentialAsk(interaction, view.options, refs, true);
+        return;
+      }
+      persistAll();
+      await sendLabeled(
+        renderCredentialNoContext(),
+        sectionKeyboard('buscar', interaction.id),
+        interaction.messageThreadId,
+      );
+    }
+
+    /** WhatsApp target-phone tap from the owned real-number list. */
+    async function renderWhatsAppPhoneChoice(
+      interaction: Interaction,
+      phoneIndex: number,
+    ): Promise<void> {
+      const state = interaction.state;
+      const phones = Array.isArray(state['phones'])
+        ? (state['phones'] as unknown[]).filter(
+            (phone): phone is string => typeof phone === 'string',
+          )
+        : [];
+      const phoneRaw = phones[phoneIndex];
+      if (phoneRaw === undefined) {
+        await ackStale('view');
+        return;
+      }
+      const selection: CredentialSelection = {};
+      if (typeof state['customerId'] === 'string') {
+        selection.customer = { id: state['customerId'], nombre: '' };
+      }
+      if (typeof state['accountId'] === 'string') {
+        selection.account = { id: state['accountId'], servicio: '', identifier: '' };
+      }
+      const storedFilter = state['serviceFilter'];
+      const serviceFilter =
+        storedFilter === 'netflix' || storedFilter === 'flujotv'
+          ? (storedFilter as MockService)
+          : undefined;
+      const bundles = await credentialBundlesFor(selection);
+      let view = resolveCredentialView(bundles, serviceFilter);
+      if (view.kind === 'none' && serviceFilter !== undefined) {
+        view = resolveCredentialView(bundles, undefined);
+      }
+      let bundle: CredentialBundle | undefined;
+      if (view.kind === 'direct') {
+        bundle = view.bundle;
+      } else if (view.kind === 'ask') {
+        const storedIndex = state['optionIndex'];
+        bundle = typeof storedIndex === 'number' ? view.options[storedIndex] : undefined;
+      }
+      if (bundle === undefined) {
+        await ackStale('view');
+        return;
+      }
+      const refs = credentialRefsFor(selection, serviceFilter, bundles.length);
+      await renderWhatsAppDirect(interaction, bundle, refs, phoneRaw);
     }
 
     /**
@@ -1836,7 +2071,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
         } else if (
           interaction.type === 'SEARCH' &&
           (interaction.state['view'] === 'credentials-list' ||
-            interaction.state['view'] === 'credentials-detail')
+            interaction.state['view'] === 'credentials-detail' ||
+            interaction.state['view'] === 'whatsapp-list' ||
+            interaction.state['view'] === 'whatsapp-detail' ||
+            interaction.state['view'] === 'whatsapp-phones' ||
+            interaction.state['view'] === 'whatsapp-nolink')
         ) {
           // Volver from a credential card/list: back to the owned
           // disambiguation list when one exists (N options), Home for a
@@ -1974,6 +2213,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
         }
         if (interaction.state['view'] === 'credentials-list') {
           await renderCredentialSelection(interaction, viewIndex);
+          return;
+        }
+        if (interaction.state['view'] === 'whatsapp-phones') {
+          await renderWhatsAppPhoneChoice(interaction, viewIndex);
           return;
         }
         await renderAccountDetail(interaction, query, offset + viewIndex);
@@ -2127,6 +2370,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
 
     if (decision.layer === 'L2') {
       const parse = decision.parse;
+      if (parse.kind === 'whatsapp') {
+        // Direct WhatsApp delivery (L2, zero Gemini): the SAME delivery
+        // tool the 💬 Abrir WhatsApp button prepares — button≡NL by
+        // construction. Read-only: no confirmation, no draft.
+        await runWhatsAppFlow(undefined, parse.service);
+        return { ok: true };
+      }
       if (parse.kind === 'credentials') {
         // Explicit datos request (L2, zero Gemini): the SAME
         // SHOW_CREDENTIALS tool the 🔐Datos button runs — button≡NL by
@@ -2252,6 +2502,12 @@ export function createWebhookHandler(deps: WebhookDeps) {
         rawService === 'netflix' || rawService === 'flujotv'
           ? (rawService as MockService)
           : undefined;
+      if (intent.params['whatsapp'] === true) {
+        // WhatsApp semantic variant (L3): same delivery tool as the L2
+        // phrases and the 💬 Abrir WhatsApp button.
+        await runWhatsAppFlow(undefined, serviceFilter);
+        return { ok: true };
+      }
       await runCredentialsFlow(undefined, serviceFilter);
       return { ok: true };
     }

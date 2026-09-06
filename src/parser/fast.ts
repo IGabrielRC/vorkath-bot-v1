@@ -15,6 +15,7 @@ export type FastCommand =
 export type FastParseResult =
   | { kind: 'command'; command: FastCommand }
   | { kind: 'credentials'; service?: 'netflix' | 'flujotv' }
+  | { kind: 'whatsapp'; service?: 'netflix' | 'flujotv' }
   | { kind: 'email'; value: string }
   | { kind: 'phone'; value: string; raw: string }
   | { kind: 'createTest'; months: number }
@@ -288,6 +289,41 @@ export function parseCredentialsRequest(
 }
 
 /**
+ * Direct WhatsApp delivery request (Slice B — wa.me, prefilled, manual
+ * send; L2 zero-Gemini twin of the `💬 Abrir WhatsApp` URL button).
+ *
+ * Matches over NORMALIZED text when a WhatsApp token is present
+ * (`whatsapp`, accent-folded `wasap`/`watsap`/`guasap`, `wsp`) with L2
+ * phrases like "abre WhatsApp", "mándame el WhatsApp", "prepárame el
+ * mensaje", "dame los datos por WhatsApp" — plus the bare delivery
+ * phrase "prepárame el mensaje" with no token. A stated service ("por
+ * WhatsApp los datos de Netflix") travels as the filter. Sits FIRST in
+ * the cascade so a datos+WhatsApp text reaches the delivery flow (which
+ * renders the card AND prepares the link) instead of the plain datos
+ * card. WhatsApp-paste phone texts never match here — they carry no
+ * WhatsApp token word, only number formatting.
+ */
+export function parseWhatsAppRequest(
+  text: string,
+): { kind: 'whatsapp'; service?: 'netflix' | 'flujotv' } | null {
+  const n = normalizeText(text);
+  // Bare delivery phrase ("prepárame el mensaje"): the NL twin of the
+  // delivery button — no WhatsApp token needed, resolved against the
+  // actor's own credential context like every other twin.
+  const bareDelivery = /prepara\w*\s+(el\s+)?mensaje/.test(n);
+  if (!bareDelivery && !/whatsapp|wasap|watsap|guasap|\bwsp\b/.test(n)) {
+    return null;
+  }
+  if (/\bnetflix\b/.test(n)) {
+    return { kind: 'whatsapp', service: 'netflix' };
+  }
+  if (/\bflujo/.test(n)) {
+    return { kind: 'whatsapp', service: 'flujotv' };
+  }
+  return { kind: 'whatsapp' };
+}
+
+/**
  * Service-name recognition (Netflix + FlujoTV, case/spacing tolerant).
  * Checked LAST before `none` so more specific kinds always win:
  * "precio netflix" stays a `precio` command, "netflix 414..." stays a
@@ -381,12 +417,14 @@ export function extractEmbeddedAccount(text: string): { kind: 'account'; value: 
 }
 
 /**
- * Deterministic cascade: credentials → command → email → phone →
- * createTest → section → embeddedAccount → months → service → account →
- * none. "none" means the router must fall through to L3 (Gemini
- * intent-only).
+ * Deterministic cascade: whatsapp → credentials → command → email →
+ * phone → createTest → section → embeddedAccount → months → service →
+ * account → none. "none" means the router must fall through to L3
+ * (Gemini intent-only).
  *
- * `credentials` sits FIRST so an explicit datos request ("dame los datos
+ * `whatsapp` sits FIRST so a delivery request ("dame los datos por
+ * WhatsApp") reaches the delivery flow instead of the plain datos card.
+ * `credentials` sits next so an explicit datos request ("dame los datos
  * de Netflix") reaches the sensitive card instead of the `command`,
  * `service` or identifier branches — normal search can never open it.
  * `createTest` sits BEFORE `months` so "crea una prueba de 2 meses"
@@ -406,6 +444,7 @@ export function parseFast(text: string): FastParseResult {
     return { kind: 'none' };
   }
   return (
+    parseWhatsAppRequest(trimmed) ??
     parseCredentialsRequest(trimmed) ??
     parseCommand(trimmed) ??
     parseEmail(trimmed) ??

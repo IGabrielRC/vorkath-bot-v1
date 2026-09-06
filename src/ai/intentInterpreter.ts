@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { GoogleGenAI } from '@google/genai';
-import { extractEmbeddedAccount, isExplicitCreateRequest, parseCredentialsRequest, parseEmail, parseMonths, parsePhone } from '../parser/fast';
+import { extractEmbeddedAccount, isExplicitCreateRequest, parseCredentialsRequest, parseEmail, parseMonths, parsePhone, parseWhatsAppRequest } from '../parser/fast';
 
 /**
  * L3 Gemini intent interpreter: intent-only, never executes.
@@ -106,6 +106,7 @@ const SYSTEM_PROMPT =
   'OPEN_CREDENTIALS: EXPLICIT access-data request only ("dame los datos", "pásame los datos", "dame usuario y contraseña", "datos de acceso", "cuál es la contraseña", semantic/reference variants like "esa cuenta, pásame la clave"). ' +
   'params.service = "netflix"/"flujotv" ONLY when the service is stated verbatim ("datos de Netflix"); ' +
   'params.reference="last" for "esa/ese/la anterior" with no new id. ' +
+  'params.whatsapp=true when WhatsApp delivery is requested ("abre WhatsApp", "mándame el WhatsApp", "prepárame el mensaje", "datos por WhatsApp", semantic variants) — the deterministic tool prepares the wa.me link AFTER; never include credentials or URLs. ' +
   'Interpretation ONLY: never execute, never fetch, never include credentials — the deterministic tool fetches AFTER. ' +
   'CREATE_TEST_DRAFT ONLY for unequivocal creation requests (a creation verb + a test noun: "crea/haz/abre una operacion/prueba/demo/test", optional months). ' +
   'A bare "prueba"/"demo"/"test" or a consult phrase ("revisa/busca/consulta X") is NEVER CREATE_TEST_DRAFT: ' +
@@ -140,8 +141,27 @@ export class StubIntentInterpreter implements IntentInterpreter {
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
       .toLowerCase();
-    // Explicit datos request (Slice A — SHOW_CREDENTIALS): checked FIRST
-    // so "esa cuenta, dame los datos" never degrades to a plain search.
+    // Direct WhatsApp delivery (Slice B): checked FIRST so "dame los
+    // datos por WhatsApp" reaches the delivery tool (card + wa.me link,
+    // `preparado` — never "sent"). Same intent as credentials plus the
+    // `whatsapp` channel flag; the deterministic fetch runs AFTER and
+    // secrets never reach the model.
+    const whatsapp = parseWhatsAppRequest(text);
+    if (whatsapp !== null) {
+      const hasReference = /(esa|ese|eso|misma|mismo|esta|este|anterior|última|ultima)\b/.test(lowered);
+      return {
+        name: 'OPEN_CREDENTIALS',
+        params: {
+          whatsapp: true,
+          ...(whatsapp.service !== undefined ? { service: whatsapp.service } : {}),
+          ...(hasReference ? { reference: 'last' } : {}),
+        },
+        confidence: 1,
+      };
+    }
+    // Explicit datos request (Slice A — SHOW_CREDENTIALS): checked right
+    // after the WhatsApp delivery request so "esa cuenta, dame los datos"
+    // never degrades to a plain search.
     // Semantic/reference variants land here; the deterministic
     // CredentialTool fetches AFTER — secrets never reach the model.
     const credentials = parseCredentialsRequest(text);

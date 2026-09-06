@@ -70,7 +70,15 @@ const SHORT_IDS: Record<CallbackAction, string> = {
 
 export interface InlineKeyboardButton {
   text: string;
-  callback_data: string;
+  /**
+   * Callback payload (L1 routing). Absent on direct-URL buttons
+   * (`💬 Abrir WhatsApp` opens wa.me — no callback fires, the operator
+   * presses send manually). At least one of `callback_data`/`url` is set.
+   * See: https://core.telegram.org/bots/api#inlinekeyboardbutton
+   */
+  callback_data?: string;
+  /** Direct URL — used ONLY by the WhatsApp delivery button. */
+  url?: string;
 }
 
 export interface InlineKeyboardMarkup {
@@ -184,6 +192,30 @@ function ownedButton(
 
 export function backButton(interactionId?: string): InlineKeyboardButton {
   return ownedButton('←Volver', 'back', interactionId);
+}
+
+/** Direct wa.me opener: URL button, NO callback, NO copy-paste portal. */
+export function whatsappUrlButton(url: string): InlineKeyboardButton {
+  return { text: '💬 Abrir WhatsApp', url };
+}
+
+/**
+ * Credential card keyboard (Slice A card + Slice B delivery): the
+ * `💬 Abrir WhatsApp` URL button ONLY when a valid wa.me link was
+ * prepared, plus [🔎Buscar otra][←Volver] (search-again + Volver).
+ * The sensitive card never carries a 🔐Datos button (it IS the datos
+ * view) and drafts stay untouched.
+ */
+export function credentialCardKeyboard(
+  interactionId?: string,
+  whatsappUrl?: string,
+): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = [];
+  if (whatsappUrl !== undefined) {
+    rows.push([whatsappUrlButton(whatsappUrl)]);
+  }
+  rows.push([ownedButton('🔎Buscar otra', 'buscar', interactionId), backButton(interactionId)]);
+  return { inline_keyboard: rows };
 }
 
 /** /start Home keyboard: six spec buttons (owned when interactionId set). */
