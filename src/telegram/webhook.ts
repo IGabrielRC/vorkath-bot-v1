@@ -14,6 +14,11 @@ import {
 import type { MockRepositories, SafeAccount } from '../mock/repositories';
 import { route } from '../router/hybrid';
 import { SessionStore } from '../session/store';
+import {
+  ASK_ACCOUNT_TEXT,
+  pickSearchIdentifier,
+  resolveMissingFields,
+} from '../tools/requirements';
 import { logger } from '../utils/logger';
 import {
   HOME_TEXT,
@@ -964,6 +969,57 @@ export function createWebhookHandler(deps: WebhookDeps) {
       return undefined;
     }
 
+    /**
+     * Resolves a conversational reference ("esa misma…") to the actor's
+     * OWN latest searched query (latest PENDING SEARCH interaction with
+     * a stored query, same thread scope). Never consults a peer's
+     * context: chatId + owner + thread must all match. Returns
+     * undefined when the actor has no searchable context — the caller
+     * then asks only for the identifier.
+     */
+    function resolveOwnSearchQuery(): string | undefined {
+      let best: Interaction | undefined;
+      for (const candidate of deps.interactions.snapshot()) {
+        if (
+          candidate.chatId !== targetChatId ||
+          candidate.ownerTelegramUserId !== targetActorId ||
+          candidate.type !== 'SEARCH' ||
+          candidate.status !== 'PENDING'
+        ) {
+          continue;
+        }
+        if (
+          targetThreadId !== undefined &&
+          candidate.messageThreadId !== undefined &&
+          candidate.messageThreadId !== targetThreadId
+        ) {
+          continue;
+        }
+        const query = candidate.state['query'];
+        if (typeof query !== 'string' || query.trim() === '') {
+          continue;
+        }
+        if (best === undefined || candidate.updatedAt >= best.updatedAt) {
+          best = candidate;
+        }
+      }
+      const resolved = best?.state['query'];
+      return typeof resolved === 'string' ? resolved.trim() : undefined;
+    }
+
+    /**
+     * THE shared deterministic search entry: parameterized NL and the
+     * guided wizard's eventual input converge here (one SEARCH
+     * interaction per request, then the repo seam). Complete reads
+     * execute immediately with NO confirmation.
+     */
+    async function runDirectSearch(identifier: string): Promise<void> {
+      // Per-requester search interaction: result buttons reject the peer;
+      // the peer starts their own search. Both coexist.
+      const interaction = createInteraction('SEARCH', { view: 'list', offset: 0 });
+      await renderSearchPage(interaction, identifier);
+    }
+
     function sectionInteractionType(section: string | undefined): InteractionType {
       switch (section) {
         case 'buscar':
@@ -994,10 +1050,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const rows = await deps.repos.searchAccounts(query);
       const total = rows.length;
       if (total === 0) {
+        // Not-found: report + offer retry/volver. NEVER offer "Crear
+        // cliente" here — creation belongs exclusively to the explicit
+        // new-sale flow.
         deps.interactions.touch(interaction.id, { query, offset: 0, view: 'list' });
         persistAll();
         await sendLabeled(
-          NO_RESULTS_TEXT,
+          `${NO_RESULTS_TEXT} “${query}” no coincide. Escribe otro dato para reintentar o pulsa Volver.`,
           sectionKeyboard('buscar', interaction.id),
           interaction.messageThreadId,
         );
@@ -1388,8 +1447,24 @@ export function createWebhookHandler(deps: WebhookDeps) {
         // the peer starts their own search. Both coexist.
         // The `account` kind is the neutral ACCOUNT_IDENTIFIER — the
         // returned servicio comes from the data row, never assumed.
-        const interaction = createInteraction('SEARCH', { view: 'list', offset: 0 });
-        await renderSearchPage(interaction, parse.value);
+        // L2 carries the identifier, so missingFields is empty and the
+        // read executes immediately (no confirmation, no follow-up).
+        await runDirectSearch(parse.value);
+        return { ok: true };
+      }
+      if (parse.kind === 'createTest') {
+        // Complete mutation stated up front: draft + summary +
+        // Confirm/Correct/Cancel — never executes directly.
+        const resumed = deps.drafts.isOpen(owner);
+        const draft = deps.drafts.create(owner, {
+          months: parse.months,
+          ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
+        });
+        persistAll();
+        auditDraft('draft.created', { months: draft.months, resumed });
+        await respondDraft(
+          `📝 Borrador MOCK: ${draft.months} mes(es). Confirma, corrige o cancela.`,
+        );
         return { ok: true };
       }
       if (parse.kind === 'months') {
@@ -1413,12 +1488,62 @@ export function createWebhookHandler(deps: WebhookDeps) {
 
     // L3 — Gemini intent only; execution stays deterministic. The model
     // receives ONLY this actor's identity — never group mutable session.
+    // Ask-only-what-is-missing: the intent params are compared against
+    // each tool's required fields (resolveMissingFields). Complete reads
+    // execute immediately; complete writes build a draft for
+    // confirmation; anything missing asks ONLY for it.
     const intent = decision.intent;
     if (intent.name === 'OPEN_SEARCH') {
+      let identifier = pickSearchIdentifier(intent.params);
+      if (identifier === undefined && intent.params['reference'] === 'last') {
+        identifier = resolveOwnSearchQuery();
+      }
+      const missing = resolveMissingFields(
+        'searchAccount',
+        identifier === undefined ? {} : { identifier },
+      );
+      if (missing.length === 0 && identifier !== undefined) {
+        await runDirectSearch(identifier);
+        return { ok: true };
+      }
+      if (/cuenta/i.test(text)) {
+        // Account-flavored ask: ONLY the identifier, never a service
+        // question (the repo discovers the service from the row).
+        const interaction = createInteraction('SEARCH', { view: 'prompt' });
+        persistAll();
+        await sendLabeled(
+          ASK_ACCOUNT_TEXT,
+          sectionKeyboard('buscar', interaction.id),
+          interaction.messageThreadId,
+        );
+        return { ok: true };
+      }
       await respond(SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR (demo)', 'buscar');
       return { ok: true };
     }
     if (intent.name === 'CREATE_TEST_DRAFT') {
+      const months =
+        typeof intent.params['months'] === 'number' ? intent.params['months'] : undefined;
+      const missing = resolveMissingFields(
+        'demoCreateTest',
+        months === undefined ? {} : { months },
+      );
+      if (missing.length === 0 && months !== undefined) {
+        // Complete mutation: draft + summary + Confirm/Correct/Cancel.
+        const resumed = deps.drafts.isOpen(owner);
+        const draft = deps.drafts.create(owner, {
+          months,
+          ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
+        });
+        persistAll();
+        auditDraft('draft.created', { months: draft.months, resumed });
+        await respondDraft(
+          `📝 Borrador MOCK: ${draft.months} mes(es). Confirma, corrige o cancela.`,
+        );
+        return { ok: true };
+      }
+      // Incomplete mutation: same shell + same text as the Operar
+      // button — it asks only for the missing correction (months).
       const resumed = deps.drafts.isOpen(owner);
       const draft = deps.drafts.create(owner, {
         ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),

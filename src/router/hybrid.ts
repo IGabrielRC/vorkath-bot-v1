@@ -23,6 +23,23 @@ import { parseCallbackData } from '../telegram/keyboards';
  *   ownership are keyed by numeric telegramUserId only — never by name.
  * - Button↔NL equivalence is locked by tests asserting shared entry
  *   points (spies on the tool/registry layer) and Gemini-call counting.
+ *
+ * ASK ONLY WHAT IS MISSING (transversal, phases 2-15):
+ * - Complete NL → direct result/draft: a READ with its identifier
+ *   executes the SAME deterministic search tool the Buscar flow uses
+ *   (no confirmation, no follow-up question); a WRITE with full data
+ *   builds a DRAFT + summary + Confirm/Correct/Cancel (never executes).
+ * - Partial NL → ask ONLY the missing fields (ToolRequirementResolver
+ *   → missingFields), completing the same draft/context, then confirm
+ *   when complete. Provided params are never re-asked; the service is
+ *   never asked when the repo discovers it from the row; not-found
+ *   reports + offers retry/volver and never offers "Crear cliente"
+ *   outside the explicit new-sale flow.
+ * - Button with no data → guided wizard (prompt entry); parameterized
+ *   NL and the wizard's eventual input converge on the SAME search
+ *   tool. Gemini interprets only (intent/params/references/
+ *   corrections) — it never invents missing params, never mutates,
+ *   never skips guards.
  */
 
 export interface RouterCtx {

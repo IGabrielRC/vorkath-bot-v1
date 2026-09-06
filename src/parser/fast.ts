@@ -14,8 +14,9 @@ export type FastCommand =
 
 export type FastParseResult =
   | { kind: 'command'; command: FastCommand }
-  | { kind: 'phone'; value: string }
   | { kind: 'email'; value: string }
+  | { kind: 'phone'; value: string }
+  | { kind: 'createTest'; months: number }
   | { kind: 'months'; months: number }
   | { kind: 'service'; value: 'netflix' | 'flujotv' }
   | { kind: 'account'; value: string }
@@ -68,8 +69,27 @@ export function parseMonths(text: string): { kind: 'months'; months: number } | 
   return { kind: 'months', months };
 }
 
-function parseCommand(text: string): { kind: 'command'; command: FastCommand } | null {
-  for (const { command, re } of COMMAND_PATTERNS) {
+/** Create/demo verbs — "hazlo" is deliberately absent (correction, not creation). */
+const CREATE_RE = /\b(crea|crear|prueba|demo|test|opera)\b/i;
+
+/**
+ * Complete mutation stated up front ("crea una prueba de 2 meses"):
+ * create verb + month count in the same text. Returns null when no
+ * months are mentioned so incomplete requests ("crea una prueba") keep
+ * falling through to L3, which asks only for the missing months.
+ */
+export function parseCreateTest(text: string): { kind: 'createTest'; months: number } | null {
+  if (!CREATE_RE.test(text)) {
+    return null;
+  }
+  const months = parseMonths(text);
+  if (months === null) {
+    return null;
+  }
+  return { kind: 'createTest', months: months.months };
+}
+
+function parseCommand(text: string): { kind: 'command'; command: FastCommand } | null {  for (const { command, re } of COMMAND_PATTERNS) {
     if (re.test(text)) {
       return { kind: 'command', command };
     }
@@ -131,9 +151,54 @@ export function parseAccountIdentifier(
 }
 
 /**
- * Deterministic cascade: command → email → phone → months → service →
- * account → none. "none" means the router must fall through to L3
- * (Gemini intent-only).
+ * Embedded account-identifier extraction (the "revísame maxnet050"
+ * root-cause fix).
+ *
+ * `parseAccountIdentifier` only matches a bare single token, so a
+ * conversational phrase like "revísame una cuenta maxnet050" fell
+ * through to `none` → L3, where the identifier was dropped and the bot
+ * asked for data the user already gave. This scans multi-word text for
+ * the FIRST identifier token anywhere in it:
+ * - identifier charset, 3–64 chars after trimming chat punctuation
+ *   (`"maxnet050."` / `"¿maxnet050?"` still resolve),
+ * - MUST contain a digit (plain words never match),
+ * - pure-digit tokens are EXCLUDED (digits belong to the phone path;
+ *   short counts like "2" or "123" must never become an account search).
+ *
+ * Every real fixture username (`maxnet050`, `cmaxnet001`, …) contains
+ * digits + letters, so they match; the returned `servicio` always comes
+ * from the data row itself, never assumed.
+ */
+export function extractEmbeddedAccount(text: string): { kind: 'account'; value: string } | null {
+  const candidates = text.match(/[A-Za-z0-9._%+-]+/g) ?? [];
+  for (const raw of candidates) {
+    const token = raw.replace(/^[.,;:!?"'«»¡¿()]+|[.,;:!?"'«»¡¿()]+$/g, '');
+    if (token.length < 3 || token.length > 64) {
+      continue;
+    }
+    if (!/\d/.test(token)) {
+      continue;
+    }
+    if (/^\d+$/.test(token)) {
+      continue;
+    }
+    if (!/^[A-Za-z0-9._%+-]+$/.test(token)) {
+      continue;
+    }
+    return { kind: 'account', value: token.toLowerCase() };
+  }
+  return null;
+}
+
+/**
+ * Deterministic cascade: command → email → phone → createTest →
+ * embeddedAccount → months → service → account → none. "none" means
+ * the router must fall through to L3 (Gemini intent-only).
+ *
+ * `createTest` sits BEFORE `months` so "crea una prueba de 2 meses"
+ * opens a draft with months=2 instead of hitting the months-correction
+ * branch with no draft open; bare corrections ("hazlo 2 meses", no
+ * create verb) still fall through to `months`.
  */
 export function parseFast(text: string): FastParseResult {
   const trimmed = text.trim();
@@ -144,6 +209,8 @@ export function parseFast(text: string): FastParseResult {
     parseCommand(trimmed) ??
     parseEmail(trimmed) ??
     parsePhone(trimmed) ??
+    parseCreateTest(trimmed) ??
+    extractEmbeddedAccount(trimmed) ??
     parseMonths(trimmed) ??
     parseService(trimmed) ??
     parseAccountIdentifier(trimmed) ?? { kind: 'none' }
