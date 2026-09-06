@@ -15,9 +15,10 @@ import { dirname, join } from 'node:path';
  * name tables exist anywhere — a brand-new allowlisted user is auto-named
  * on first touch.
  *
- * Display chain (never empty): first_name + last_name → first_name →
- * @username → `Usuario <id>` (raw id only as last resort; diagnostics
- * may show it, normal UX never should need it).
+ * Display chain (never empty, never a numeric id in normal UX):
+ * first_name + last_name → first_name → @username → `Usuario` (bare).
+ * Raw Telegram ids stay out of every normal render; only diagnostics
+ * (e.g. /topicid) may show an id explicitly.
  */
 
 export interface TelegramFrom {
@@ -41,9 +42,10 @@ function now(): string {
 }
 
 /**
- * Central display-name builder. NEVER returns an empty string. Name parts
- * are trimmed; a blank first_name falls through to the next link instead
- * of rendering an empty `👤 Operador:` label.
+ * Central display-name builder. NEVER returns an empty string and NEVER
+ * leaks a numeric Telegram id: the last resort is the bare `Usuario`
+ * label. The `userId` parameter is kept for signature compatibility
+ * (security/ownership keys still use it) but it never renders.
  */
 export function buildDisplayName(
   firstName: string | undefined,
@@ -51,6 +53,7 @@ export function buildDisplayName(
   username: string | undefined,
   userId: number,
 ): string {
+  void userId;
   const first = firstName?.trim() ?? '';
   const last = lastName?.trim() ?? '';
   const full = `${first} ${last}`.trim().replace(/\s+/g, ' ');
@@ -61,8 +64,57 @@ export function buildDisplayName(
   if (handle !== '') {
     return handle.startsWith('@') ? handle : `@${handle}`;
   }
-  return `Usuario ${userId}`;
+  return 'Usuario';
 }
+
+/**
+ * True when a stored/rendered owner label leaks a raw Telegram id:
+ * a bare numeric string (`"941030473"`) or the legacy `Usuario <id>`
+ * fallback. Such labels must never reach normal UX — callers fall back
+ * to the profile store or the bare `Usuario` label instead. Security is
+ * unaffected: ownership always compares numeric ids, never labels.
+ */
+export function isIdLeakingLabel(name: string | undefined): boolean {
+  if (name === undefined) {
+    return false;
+  }
+  const trimmed = name.trim();
+  if (/^\d+$/.test(trimmed)) {
+    return true;
+  }
+  return /^usuario\s+\d+$/i.test(trimmed);
+}
+
+/**
+ * Strips id-leaking or empty owner labels. Returns undefined when the
+ * label must not render (missing, blank, or id-leaking) so callers can
+ * fall back to the profile store, a member lookup, or `otro operador`.
+ */
+export function sanitizeOwnerLabel(name: string | undefined): string | undefined {
+  if (name === undefined) {
+    return undefined;
+  }
+  const trimmed = name.trim();
+  if (trimmed === '' || isIdLeakingLabel(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+/** Minimal Telegram chat-member identity for last-resort owner resolution. */
+export interface ChatMemberInfo {
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+}
+
+/**
+ * Optional last-resort member fetcher (wraps `getChatMember` with the
+ * chat already bound). Optional by design: offline test stubs don't
+ * implement it, and production only calls it on a store miss — never on
+ * the per-message hot path.
+ */
+export type ChatMemberFetcher = (userId: number) => Promise<ChatMemberInfo | undefined>;
 
 function sameParts(
   current: OperatorProfile,
@@ -89,7 +141,7 @@ export class OperatorProfileStore {
    * Creates the profile on first touch, refreshes it when Telegram data
    * changed (e.g. the operator renamed their first_name). Returns
    * undefined for a `from` without a numeric id — callers then fall back
-   * to the `Usuario <id>` chain only when an id is known.
+   * to the bare `Usuario` chain.
    */
   upsert(from: TelegramFrom): OperatorProfile | undefined {
     const userId = from.id;
@@ -124,7 +176,8 @@ export class OperatorProfileStore {
 
   /**
    * Central resolution: profile displayName when known, otherwise the
-   * display chain built from live `from` fields (never empty).
+   * display chain built from live `from` fields (never empty, never
+   * id-leaking).
    */
   resolveDisplayName(userId: number, from?: TelegramFrom): string {
     const known = this.profiles.get(userId);
@@ -144,7 +197,54 @@ export class OperatorProfileStore {
     if (known !== undefined) {
       return known.displayName;
     }
-    return `Usuario ${userId}`;
+    return 'Usuario';
+  }
+
+  /**
+   * Owner-name resolution with last-resort member fallback. Order:
+   * profile store → live `from` fields → `fetcher` (getChatMember,
+   * store-miss only) → bare `Usuario`. A fetched identity is upserted so
+   * the next rejection is a pure cache hit; a total fallback failure
+   * still renders non-empty, id-free UX. Never throws: a failing fetcher
+   * degrades to `Usuario`.
+   */
+  async resolveWithMemberFallback(
+    userId: number,
+    from?: TelegramFrom,
+    fetcher?: ChatMemberFetcher,
+  ): Promise<string> {
+    const known = this.profiles.get(userId);
+    if (known !== undefined && !isIdLeakingLabel(known.displayName)) {
+      return known.displayName;
+    }
+    if (from !== undefined) {
+      const upserted = this.upsert({ ...from, id: userId });
+      if (upserted !== undefined && !isIdLeakingLabel(upserted.displayName)) {
+        return upserted.displayName;
+      }
+    }
+    if (fetcher !== undefined) {
+      try {
+        const member = await fetcher(userId);
+        if (member !== undefined) {
+          const upserted = this.upsert({
+            id: userId,
+            ...(member.first_name !== undefined ? { first_name: member.first_name } : {}),
+            ...(member.last_name !== undefined ? { last_name: member.last_name } : {}),
+            ...(member.username !== undefined ? { username: member.username } : {}),
+          });
+          if (upserted !== undefined && !isIdLeakingLabel(upserted.displayName)) {
+            return upserted.displayName;
+          }
+        }
+      } catch {
+        // Network/member failure degrades to the bare label below.
+      }
+    }
+    if (known !== undefined && known.displayName.trim() !== '') {
+      return isIdLeakingLabel(known.displayName) ? 'Usuario' : known.displayName;
+    }
+    return 'Usuario';
   }
 
   /** Full in-memory snapshot (pure — for persistence and tests). */

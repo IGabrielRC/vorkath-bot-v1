@@ -291,7 +291,8 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * Pre-auth display name: READ-ONLY (touches nothing — rejected updates
      * leave zero trace: no session, no draft, no interaction, no profile,
      * no Gemini, no MOCK). Operator alias when one exists → live
-     * first_name + last_name → @username → `Usuario <id>`: never empty.
+     * first_name + last_name → @username → bare `Usuario`: never empty,
+     * never id-leaking.
      */
     const storedAlias = deps.interactions.resolveNameByUserId(chatId, actorId);
     const preAuthName = resolveDisplayName({
@@ -357,6 +358,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * reply itself, answered back into the origin topic through sendEarly.
      * Message text only, never callbacks. It must NOT become a router
      * bypass: no state, no Gemini — keep as is.
+     *
+     * Diagnostic privilege: this is the ONE normal path allowed to show a
+     * raw id (`Usuario <id>` when the bound owner has no stored profile),
+     * because the reply already prints Chat/Thread ids for debugging.
      */
     if (callback === undefined) {
       const firstToken = (message?.text?.trim().split(/\s+/)[0] ?? '')
@@ -375,10 +380,8 @@ export function createWebhookHandler(deps: WebhookDeps) {
               chatId,
               boundOwnerId,
             );
-            topicLabel = resolveDisplayName({
-              ...(storedBound !== undefined ? { alias: storedBound } : {}),
-              userId: boundOwnerId,
-            });
+            // Diagnostic fallback keeps the raw id visible on purpose.
+            topicLabel = storedBound ?? `Usuario ${boundOwnerId}`;
           }
         }
         await sendEarly(
@@ -452,11 +455,23 @@ export function createWebhookHandler(deps: WebhookDeps) {
         if (actorThreadId !== assignedThread) {
           const threadOwnerId = findTopicOwner(operatorTopics, actorThreadId);
           if (threadOwnerId !== undefined) {
-            const storedThreadOwner = deps.interactions.resolveNameByUserId(chatId, threadOwnerId);
-            const threadOwnerName = resolveDisplayName({
-              ...(storedThreadOwner !== undefined ? { alias: storedThreadOwner } : {}),
-              userId: threadOwnerId,
-            });
+            /**
+             * Owner-name resolution: OperatorProfile store first (the
+             * owner may never have interacted, so the guard holds no
+             * `from` fields for them). getChatMember ONLY on a store
+             * miss — last resort, then persisted — never per message.
+             * Offline test stubs omit getChatMember and skip cleanly.
+             */
+            const getMember = deps.client.getChatMember?.bind(deps.client);
+            const threadOwnerName = await deps.interactions.resolveOwnerDisplayName(
+              chatId,
+              threadOwnerId,
+              getMember !== undefined
+                ? {
+                    fetcher: (userId) => getMember(chatId, userId),
+                  }
+                : undefined,
+            );
             auditor.record({
               chatId,
               actorTelegramUserId: actorId,
@@ -739,9 +754,16 @@ export function createWebhookHandler(deps: WebhookDeps) {
           },
           `draft:${peer.chatId}:${peer.userId}`,
         );
+        // Owner warning: profile store first, never a stored numeric id.
+        const confirmOwner =
+          deps.interactions.resolveOwnerLabelSync(
+            targetChatId,
+            peer.userId,
+            peer.ownerName,
+          ) ?? 'otro operador';
         return {
           ok: false,
-          text: `⚠️ Esta operación pertenece a ${peer.ownerName ?? 'otro operador'}.`,
+          text: `⚠️ Esta operación pertenece a ${confirmOwner}.`,
         };
       }
       return kind === 'confirm' ? deps.drafts.confirm(owner) : deps.drafts.cancel(owner);
@@ -811,9 +833,16 @@ export function createWebhookHandler(deps: WebhookDeps) {
           },
           `draft:${peer.chatId}:${peer.userId}`,
         );
+        // Owner warning: profile store first, never a stored numeric id.
+        const correctOwner =
+          deps.interactions.resolveOwnerLabelSync(
+            targetChatId,
+            peer.userId,
+            peer.ownerName,
+          ) ?? 'otro operador';
         return {
           ok: false,
-          text: `⚠️ Esta operación pertenece a ${peer.ownerName ?? 'otro operador'}.`,
+          text: `⚠️ Esta operación pertenece a ${correctOwner}.`,
         };
       }
       return null;
@@ -833,7 +862,15 @@ export function createWebhookHandler(deps: WebhookDeps) {
       interaction: Interaction | undefined,
       requestedAction: string,
     ): Promise<true> {
-      const ownerName = interaction?.ownerName;
+      // Owner toast: profile store first, never a stored numeric id.
+      const ownerName =
+        interaction !== undefined
+          ? deps.interactions.resolveOwnerLabelSync(
+              targetChatId,
+              interaction.ownerTelegramUserId,
+              interaction.ownerName,
+            )
+          : undefined;
       if (callbackId !== undefined) {
         await deps.client.answerCallbackQuery(callbackId, {
           text: crossActionText(ownerName),
@@ -1354,7 +1391,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
           // interactions stay usable (migration-safe).
           if (callbackId !== undefined) {
             await deps.client.answerCallbackQuery(callbackId, {
-              text: crossActionText(interaction.ownerName),
+              text: crossActionText(
+                deps.interactions.resolveOwnerLabelSync(
+                  targetChatId,
+                  interaction.ownerTelegramUserId,
+                  interaction.ownerName,
+                ),
+              ),
             });
           }
           auditInteraction('interaction.blocked_cross_thread', interaction, {

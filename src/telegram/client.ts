@@ -52,15 +52,32 @@ export function sendPayload(
 }
 
 /**
+ * Minimal Telegram chat-member identity (subset of the Bot API User
+ * object returned inside `getChatMember`). Display fields only — never
+ * a security key.
+ */
+export interface ChatMember {
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+}
+
+/**
  * Minimal Telegram Bot API client (send/edit/answer). HTTP only — no
  * business logic lives here; the router decides what to send.
  * See: https://core.telegram.org/bots/api#sendmessage
  * See: https://core.telegram.org/bots/api#answercallbackquery
+ *
+ * `getChatMember` is OPTIONAL on purpose: it exists only as a
+ * last-resort owner-name fallback on a profile-store miss (never on the
+ * per-message hot path). Offline test stubs omit it and nothing breaks.
+ * See: https://core.telegram.org/bots/api#getchatmember
  */
 export interface TelegramClient {
   sendMessage(opts: SendMessageOpts): Promise<unknown>;
   editMessageText(opts: EditMessageOpts): Promise<unknown>;
   answerCallbackQuery(callbackQueryId: string, opts?: AnswerCallbackOpts): Promise<unknown>;
+  getChatMember?(chatId: number, userId: number): Promise<ChatMember | undefined>;
 }
 
 type FetchFn = typeof globalThis.fetch;
@@ -97,6 +114,27 @@ export class HttpTelegramClient implements TelegramClient {
       callback_query_id: callbackQueryId,
       ...(opts?.text !== undefined ? { text: opts.text } : {}),
     });
+  }
+
+  /**
+   * Last-resort owner identity lookup. Only called on a profile-store
+   * miss by the webhook ownership guard — never per message.
+   */
+  async getChatMember(chatId: number, userId: number): Promise<ChatMember | undefined> {
+    const result = (await this.call('getChatMember', {
+      chat_id: chatId,
+      user_id: userId,
+    })) as { ok?: boolean; result?: { user?: Record<string, unknown> } };
+    const user = result?.result?.user;
+    if (user === undefined || user === null || typeof user !== 'object') {
+      return undefined;
+    }
+    const member: ChatMember = {
+      ...(typeof user['first_name'] === 'string' ? { first_name: user['first_name'] } : {}),
+      ...(typeof user['last_name'] === 'string' ? { last_name: user['last_name'] } : {}),
+      ...(typeof user['username'] === 'string' ? { username: user['username'] } : {}),
+    };
+    return member;
   }
 
   private async call(method: string, payload: Record<string, unknown>): Promise<unknown> {

@@ -500,7 +500,8 @@ describe('operator profiles: automatic names, id-keyed security (9-23)', () => {
     const world = await createProfileWorld();
     await world.post(profileMessage(world.nextUpdateId(), ANDRES, '/start', {}));
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain(`👤 Operador: Usuario ${ANDRES}`);
+    expect(last).toContain('👤 Operador: Usuario');
+    expect(last).not.toContain(String(ANDRES));
     for (const text of world.client.texts()) {
       expect(text).not.toMatch(/👤 Operador:\s*$/mu);
     }

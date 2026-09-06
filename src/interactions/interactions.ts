@@ -3,6 +3,8 @@ import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   OperatorProfileStore,
+  sanitizeOwnerLabel,
+  type ChatMemberFetcher,
   type OperatorProfile,
   type TelegramFrom,
 } from '../operators/operatorProfiles';
@@ -155,6 +157,65 @@ export class InteractionStore {
   /** Latest remembered display name for this operator, if any. */
   resolveNameByUserId(chatId: number, userId: number): string | undefined {
     return this.profiles.get(userId)?.displayName ?? this.operatorNameById.get(InteractionStore.idKey(chatId, userId));
+  }
+
+  /**
+   * Owner display name for rejection/ownership messages naming ANOTHER
+   * operator. Resolution order: OperatorProfile store → live `from`
+   * fields → optional member `fetcher` (store-miss only, then persisted)
+   * → remembered per-chat names → bare `Usuario`. Never empty, never a
+   * numeric id. Security stays id-keyed everywhere; this only feeds UX
+   * labels. Same-name strangers can't steal labels: every fallback here
+   * is keyed by the owner's numeric id (first-writer-wins on the reverse
+   * index is only a reply-guard hint, never a display source).
+   */
+  async resolveOwnerDisplayName(
+    chatId: number,
+    userId: number,
+    opts?: { from?: TelegramFrom; fetcher?: ChatMemberFetcher; storedFallback?: string },
+  ): Promise<string> {
+    const stored = this.profiles.get(userId)?.displayName;
+    const cleanStored = sanitizeOwnerLabel(stored);
+    if (cleanStored !== undefined && opts?.from === undefined) {
+      // Store hit: pure cache, the fetcher never fires on this path.
+      return cleanStored;
+    }
+    const resolved = await this.profiles.resolveWithMemberFallback(
+      userId,
+      opts?.from,
+      opts?.fetcher,
+    );
+    if (resolved !== 'Usuario') {
+      return resolved;
+    }
+    if (cleanStored !== undefined) {
+      return cleanStored;
+    }
+    const remembered = sanitizeOwnerLabel(
+      this.operatorNameById.get(InteractionStore.idKey(chatId, userId)),
+    );
+    if (remembered !== undefined) {
+      return remembered;
+    }
+    return sanitizeOwnerLabel(opts?.storedFallback) ?? resolved;
+  }
+
+  /**
+   * Sync variant for sync-only rejection paths (draft/toast guards):
+   * profile store → remembered per-chat names → sanitized stored label.
+   * No network ever — the async member fallback lives only on the
+   * topic-guard path (store-miss only).
+   */
+  resolveOwnerLabelSync(
+    chatId: number,
+    userId: number,
+    storedFallback?: string,
+  ): string | undefined {
+    return (
+      sanitizeOwnerLabel(this.profiles.get(userId)?.displayName) ??
+      sanitizeOwnerLabel(this.operatorNameById.get(InteractionStore.idKey(chatId, userId))) ??
+      sanitizeOwnerLabel(storedFallback)
+    );
   }
 
   create(

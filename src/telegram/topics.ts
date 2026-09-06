@@ -109,13 +109,15 @@ export interface DisplayNameInput {
 }
 
 /**
- * Display-name resolution chain — NEVER returns an empty string:
+ * Display-name resolution chain — NEVER returns an empty string and NEVER
+ * a numeric id in normal UX:
  * 1) operator alias/config when one exists,
  * 2) Telegram first_name + last_name,
  * 3) @username,
- * 4) `Usuario <id>` fallback.
+ * 4) bare `Usuario` fallback.
  * Delegates to the central OperatorProfile builder so every render
- * shares one chain (one place, not two parallel systems).
+ * shares one chain (one place, not two parallel systems). Raw ids are
+ * allowed only in diagnostics (e.g. /topicid renders them explicitly).
  */
 export function resolveDisplayName(input: DisplayNameInput): string {
   const alias = input.alias?.trim();
@@ -127,8 +129,9 @@ export function resolveDisplayName(input: DisplayNameInput): string {
 
 /**
  * Cross-thread write rejection: names the topic's owner AND the acting
- * operator, both via the display-name chain (never empty — falls back to
- * `Usuario <id>`). The actor must move to their own assigned topic.
+ * operator, both via the display-name chain (never empty, never a numeric
+ * id — the caller resolves both through the OperatorProfile store first).
+ * The actor must move to their own assigned topic.
  */
 export function topicMismatchText(ownerName: string, actorName: string): string {
   return `⚠️ Este espacio pertenece a ${ownerName}. Usa tu topic 👤 ${actorName}.`;

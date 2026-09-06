@@ -479,7 +479,8 @@ describe('forum Topics mode (Mode B)', () => {
       topicMessage(world.nextUpdateId(), OP3, '/start', THREAD_OP3, {}),
     );
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain(`👤 Operador: Usuario ${OP3}`);
+    expect(last).toContain('👤 Operador: Usuario');
+    expect(last).not.toContain(String(OP3));
     for (const text of world.client.texts()) {
       expect(text).not.toMatch(/👤 Operador:\s*$/m);
     }
