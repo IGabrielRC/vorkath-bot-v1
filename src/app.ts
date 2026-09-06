@@ -13,6 +13,7 @@ import { HttpTelegramClient, type TelegramClient } from './telegram/client';
 import { registerWebhook } from './telegram/setWebhook';
 import {
   parseActivityTopicId,
+  parseAlertsTopicId,
   parseOperatorTopics,
   type OperatorTopics,
 } from './telegram/topics';
@@ -48,6 +49,8 @@ export interface AppDeps {
   operatorTopics?: OperatorTopics;
   /** Activity topic override (tests). Undefined = parse from env. */
   activityTopicId?: number;
+  /** Alerts topic override (tests). Undefined = parse from env. */
+  alertsTopicId?: number;
   /** Draft snapshot path; undefined disables best-effort persist (tests). */
   draftsStatePath?: string;
   /** Interaction snapshot path; undefined disables best-effort persist (tests). */
@@ -73,6 +76,7 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
   // a half-configured forum mode. Absent/empty = Mode A (unchanged).
   const operatorTopics = deps.operatorTopics ?? parseOperatorTopics(env.TELEGRAM_OPERATOR_TOPICS);
   const activityTopicId = deps.activityTopicId ?? parseActivityTopicId(env.TELEGRAM_ACTIVITY_TOPIC_ID);
+  const alertsTopicId = deps.alertsTopicId ?? parseAlertsTopicId(env.TELEGRAM_ALERTS_TOPIC_ID);
   const handleWebhook = createWebhookHandler({
     env,
     allowlist,
@@ -86,6 +90,7 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
     auditor,
     operatorTopics,
     ...(activityTopicId !== undefined ? { activityTopicId } : {}),
+    ...(alertsTopicId !== undefined ? { alertsTopicId } : {}),
     ...(deps.draftsStatePath !== undefined ? { draftsStatePath: deps.draftsStatePath } : {}),
     ...(deps.interactionsStatePath !== undefined
       ? { interactionsStatePath: deps.interactionsStatePath }

@@ -81,6 +81,22 @@ export function parseActivityTopicId(raw: string | undefined): number | undefine
   return threadId;
 }
 
+/**
+ * Fail-fast parser for `TELEGRAM_ALERTS_TOPIC_ID` (⭐ Alertas topic).
+ * Empty/missing/undefined yields undefined (alert delivery disabled).
+ * Otherwise must be a positive integer thread id.
+ */
+export function parseAlertsTopicId(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') {
+    return undefined;
+  }
+  const threadId = Number(raw.trim());
+  if (!Number.isInteger(threadId) || threadId <= 0) {
+    throw new Error(`Invalid TELEGRAM_ALERTS_TOPIC_ID: ${JSON.stringify(raw)}`);
+  }
+  return threadId;
+}
+
 export interface DisplayNameInput {
   /** Operator alias / remembered name when one exists (preferred). */
   alias?: string;

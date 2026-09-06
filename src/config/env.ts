@@ -55,6 +55,20 @@ const activityTopicIdSchema = z
     'TELEGRAM_ACTIVITY_TOPIC_ID must be empty or a positive integer thread id',
   );
 
+/**
+ * Alerts-topic id (⭐ Alertas) for critical-alert delivery. OPTIONAL —
+ * absent/undefined keeps every alert path disabled and never breaks
+ * startup or /health. When present it must be a positive integer.
+ * Kept `.optional()` (no default) so existing env objects keep compiling.
+ */
+const alertsTopicIdSchema = z
+  .string()
+  .optional()
+  .refine(
+    (raw) => raw === undefined || raw.trim() === '' || (/^\d+$/.test(raw.trim()) && Number(raw.trim()) > 0),
+    'TELEGRAM_ALERTS_TOPIC_ID must be empty or a positive integer thread id',
+  );
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
@@ -66,6 +80,7 @@ const envSchema = z.object({
   AUTHORIZED_TELEGRAM_CHAT_IDS: csvOfTelegramChatIds,
   TELEGRAM_OPERATOR_TOPICS: operatorTopicsSchema,
   TELEGRAM_ACTIVITY_TOPIC_ID: activityTopicIdSchema,
+  TELEGRAM_ALERTS_TOPIC_ID: alertsTopicIdSchema,
   GEMINI_API_KEY: z.string().min(1, 'GEMINI_API_KEY is required'),
   GEMINI_MODEL: z.string().min(1, 'GEMINI_MODEL is required'),
   PUBLIC_BASE_URL: z.string().url('PUBLIC_BASE_URL must be a valid URL'),

@@ -3,6 +3,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { IntentInterpreter } from '../ai/intentInterpreter';
 import { isAuthorized, isAuthorizedChat } from '../auth/allowlist';
 import { type Auditor, createAuditor } from '../audit/audit';
+import { AlertService } from '../alerts/alerts';
 import type { Env } from '../config/env';
 import { DraftEngine, type DraftOwner, type DraftResult } from '../drafts/engine';
 import {
@@ -107,6 +108,11 @@ export interface WebhookDeps {
   operatorTopics?: OperatorTopics;
   /** Forum topic receiving the single allowed activity summary. Undefined = disabled. */
   activityTopicId?: number;
+  /**
+   * Forum topic receiving critical alerts (⭐ Alertas). Undefined =
+   * disabled: /testalert degrades to a guide reply and nothing breaks.
+   */
+  alertsTopicId?: number;
   /** File path for best-effort draft persistence; undefined disables it. */
   draftsStatePath?: string;
   /** File path for best-effort interaction persistence; undefined disables it. */
@@ -311,6 +317,69 @@ export function createWebhookHandler(deps: WebhookDeps) {
       return { ok: true };
     }
 
+    const operatorTopics: OperatorTopics = deps.operatorTopics ?? new Map();
+
+    /**
+     * Diagnostic commands (/topicid, /testalert): owner-only helpers that
+     * run BEFORE idempotency/session/topic gates so they can never mutate
+     * operator state. They create no interaction, no draft, no session
+     * touch, no MockStore write, no Gemini call, and no business audit —
+     * the ONLY side effect is the reply itself, answered back into the
+     * origin topic through sendEarly. Message text only, never callbacks.
+     */
+    if (callback === undefined) {
+      const firstToken = (message?.text?.trim().split(/\s+/)[0] ?? '')
+        .split('@')[0]
+        ?.toLowerCase();
+      if (firstToken === '/topicid' || firstToken === '/testalert') {
+        if (firstToken === '/topicid') {
+          let topicLabel: string;
+          if (actorThreadId === undefined) {
+            topicLabel = 'General';
+          } else {
+            const boundOwnerId = findTopicOwner(operatorTopics, actorThreadId);
+            if (boundOwnerId === undefined) {
+              topicLabel = '(desconocido)';
+            } else {
+              const storedBound = deps.interactions.resolveNameByUserId(
+                chatId,
+                boundOwnerId,
+              );
+              topicLabel = resolveDisplayName({
+                ...(storedBound !== undefined ? { alias: storedBound } : {}),
+                userId: boundOwnerId,
+              });
+            }
+          }
+          await sendEarly(
+            `🧵 Información del topic\n\nTopic: ${topicLabel}\nChat ID: ${String(chatId)}\nThread ID: ${actorThreadId === undefined ? 'general / none' : String(actorThreadId)}`,
+          );
+          return { ok: true };
+        }
+        if (deps.alertsTopicId === undefined) {
+          logger.info(
+            { userId: actorId, chatId },
+            'Alerts topic not configured — /testalert skipped',
+          );
+          await sendEarly('⚠️ Topic de Alertas no configurado (TELEGRAM_ALERTS_TOPIC_ID).');
+          return { ok: true };
+        }
+        const alerts = new AlertService(deps.client);
+        await alerts.sendCriticalAlert(
+          { chatId, alertsThreadId: deps.alertsTopicId },
+          {
+            type: 'test',
+            title: 'ALERTA DE PRUEBA',
+            summary: 'Vorkath puede enviar alertas correctamente.',
+            actorName,
+            timestamp: new Date().toISOString(),
+          },
+        );
+        await sendEarly('✅ Alerta de prueba enviada.');
+        return { ok: true };
+      }
+    }
+
     if (updateId !== undefined && deps.sessions.markUpdateSeen(updateId)) {
       logger.info({ userId: actorId, updateId }, 'Ignored duplicate Telegram update');
       return { ok: true };
@@ -322,7 +391,6 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * topic. Rejections execute NOTHING: no session, no draft, no
      * interaction, no Gemini, no MOCK — just the guide reply.
      */
-    const operatorTopics: OperatorTopics = deps.operatorTopics ?? new Map();
     const assignedThread = operatorTopics.get(actorId);
     if (assignedThread !== undefined) {
       if (actorThreadId === undefined) {
