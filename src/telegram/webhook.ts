@@ -27,6 +27,7 @@ import {
 } from './keyboards';
 import type { TelegramClient, TelegramContext } from './client';
 import {
+  alertsOnlyText,
   findTopicOwner,
   type OperatorTopics,
   resolveDisplayName,
@@ -198,11 +199,13 @@ function viewIndexFor(action: string): number | null {
  * through the chat alone. Secrets and MOCK credentials are never logged:
  * log lines carry user/update ids and layer/action only.
  *
- * Full pipeline: secret gate (401) → user+chat allowlist (neutral, zero
- * side-channels) → update_id idempotency → per-actor session touch →
- * reply-ownership guard → L1/L2/L3 cascade → Telegram reply. Rejected
- * updates touch nothing: no session, no draft, no interaction, no Gemini,
- * no MOCK.
+  * Full pipeline: secret gate (401) → user+chat allowlist (neutral, zero
+  * side-channels) → /topicid diagnostic exception (auth-gated,
+  * side-effect-free) → CENTRAL TOPIC-OWNERSHIP GUARD (Mode B) →
+  * /testalert (under the guard) → update_id idempotency → per-actor
+  * session touch → reply-ownership guard → L1/L2/L3 cascade → Telegram
+  * reply. Rejected updates touch nothing: no session, no draft, no
+  * interaction, no Gemini, no MOCK.
  */
 export function createWebhookHandler(deps: WebhookDeps) {
   const auditor = deps.auditor ?? createAuditor();
@@ -318,44 +321,165 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
 
     const operatorTopics: OperatorTopics = deps.operatorTopics ?? new Map();
+    const modeB = operatorTopics.size > 0;
 
     /**
-     * Diagnostic commands (/topicid, /testalert): owner-only helpers that
-     * run BEFORE idempotency/session/topic gates so they can never mutate
-     * operator state. They create no interaction, no draft, no session
-     * touch, no MockStore write, no Gemini call, and no business audit —
-     * the ONLY side effect is the reply itself, answered back into the
-     * origin topic through sendEarly. Message text only, never callbacks.
+     * DOCUMENTED EXCEPTION — /topicid (OWNER-only diagnostic: authorized
+     * operators only, since user+chat auth already passed above). It runs
+     * AFTER auth but is EXEMPT from the topic-ownership guard below, so it
+     * keeps working in General and in any topic. It creates no
+     * interaction, no draft, no session touch, no MockStore write, no
+     * Gemini call, and no business audit — the ONLY side effect is the
+     * reply itself, answered back into the origin topic through sendEarly.
+     * Message text only, never callbacks. It must NOT become a router
+     * bypass: no state, no Gemini — keep as is.
      */
     if (callback === undefined) {
       const firstToken = (message?.text?.trim().split(/\s+/)[0] ?? '')
         .split('@')[0]
         ?.toLowerCase();
-      if (firstToken === '/topicid' || firstToken === '/testalert') {
-        if (firstToken === '/topicid') {
-          let topicLabel: string;
-          if (actorThreadId === undefined) {
-            topicLabel = 'General';
+      if (firstToken === '/topicid') {
+        let topicLabel: string;
+        if (actorThreadId === undefined) {
+          topicLabel = 'General';
+        } else {
+          const boundOwnerId = findTopicOwner(operatorTopics, actorThreadId);
+          if (boundOwnerId === undefined) {
+            topicLabel = '(desconocido)';
           } else {
-            const boundOwnerId = findTopicOwner(operatorTopics, actorThreadId);
-            if (boundOwnerId === undefined) {
-              topicLabel = '(desconocido)';
-            } else {
-              const storedBound = deps.interactions.resolveNameByUserId(
-                chatId,
-                boundOwnerId,
-              );
-              topicLabel = resolveDisplayName({
-                ...(storedBound !== undefined ? { alias: storedBound } : {}),
-                userId: boundOwnerId,
-              });
-            }
+            const storedBound = deps.interactions.resolveNameByUserId(
+              chatId,
+              boundOwnerId,
+            );
+            topicLabel = resolveDisplayName({
+              ...(storedBound !== undefined ? { alias: storedBound } : {}),
+              userId: boundOwnerId,
+            });
           }
-          await sendEarly(
-            `🧵 Información del topic\n\nTopic: ${topicLabel}\nChat ID: ${String(chatId)}\nThread ID: ${actorThreadId === undefined ? 'general / none' : String(actorThreadId)}`,
-          );
+        }
+        await sendEarly(
+          `🧵 Información del topic\n\nTopic: ${topicLabel}\nChat ID: ${String(chatId)}\nThread ID: ${actorThreadId === undefined ? 'general / none' : String(actorThreadId)}`,
+        );
+        return { ok: true };
+      }
+    }
+
+    /**
+     * CENTRAL TOPIC-OWNERSHIP GUARD (Mode B only — skipped when no
+     * mapping is configured, i.e. Mode A unchanged).
+     *
+     * Position: Telegram Update → user auth → chat auth → THIS GUARD →
+     * (/topicid exception above, /testalert below) → router/parser/
+     * Gemini/tools/drafts/alerts. The router only ever sees updates this
+     * guard cleared.
+     *
+     * Bypass audit (every path verified to flow through this guard):
+     * - /topicid is the ONLY exemption (documented above, auth-gated,
+     *   side-effect-free).
+     * - /testalert used to run BEFORE the gate (executed from another
+     *   operator's topic) — it now sits BELOW the guard.
+     * - Early commands (/start), free text, fast-parser hits and Gemini
+     *   fallback all flow through `route()` below the guard.
+     * - Callbacks (buttons) carry no text so they never matched the
+     *   diagnostic branch; they hit this guard via the tap thread, then
+     *   the interaction owner/thread/chat checks in L1.
+     * - Replies to peer messages and pending-input consumption happen
+     *   below the guard — a cross-topic update never reaches them.
+     * - AlertService publishing is infrastructure (no Telegram update),
+     *   so it is unaffected by this guard by design.
+     *
+     * Rule: a mapped operator may act ONLY inside their assigned topic.
+     * The alerts topic and General are never operational for users.
+     * Rejections execute NOTHING: no session, no draft, no interaction,
+     * no Gemini, no MOCK — just the guide reply.
+     */
+    if (modeB) {
+      // Alerts thread (TELEGRAM_ALERTS_TOPIC_ID): NOT operational. Any
+      // operation attempt there (/start, /testalert, search, operar,
+      // text, callbacks) gets the alerts-only reply and nothing executes.
+      if (deps.alertsTopicId !== undefined && actorThreadId === deps.alertsTopicId) {
+        auditor.record({
+          chatId,
+          actorTelegramUserId: actorId,
+          actorName,
+          actionType: 'topic.blocked_alerts_thread',
+          ...(updateId !== undefined
+            ? { metadata: { threadId: actorThreadId, updateId } }
+            : { metadata: { threadId: actorThreadId } }),
+        });
+        await sendEarly(alertsOnlyText());
+        return { ok: true };
+      }
+      const assignedThread = operatorTopics.get(actorId);
+      if (assignedThread !== undefined) {
+        if (actorThreadId === undefined) {
+          // Outside every assigned topic (General — its id is never
+          // assumed): personal guide, never operate.
+          auditor.record({
+            chatId,
+            actorTelegramUserId: actorId,
+            actorName,
+            actionType: 'topic.blocked_outside',
+            ...(updateId !== undefined ? { metadata: { updateId } } : {}),
+          });
+          await sendEarly(topicGuideText(actorName));
           return { ok: true };
         }
+        if (actorThreadId !== assignedThread) {
+          const threadOwnerId = findTopicOwner(operatorTopics, actorThreadId);
+          if (threadOwnerId !== undefined) {
+            const storedThreadOwner = deps.interactions.resolveNameByUserId(chatId, threadOwnerId);
+            const threadOwnerName = resolveDisplayName({
+              ...(storedThreadOwner !== undefined ? { alias: storedThreadOwner } : {}),
+              userId: threadOwnerId,
+            });
+            auditor.record({
+              chatId,
+              actorTelegramUserId: actorId,
+              actorName,
+              actionType: 'topic.blocked_cross_thread',
+              metadata: {
+                threadId: actorThreadId,
+                ownerUserId: threadOwnerId,
+                ownerName: threadOwnerName,
+              },
+            });
+            await deps.client.sendMessage({
+              chatId,
+              text: topicMismatchText(threadOwnerName, actorName),
+              messageThreadId: actorThreadId,
+            });
+            return { ok: true };
+          }
+          auditor.record({
+            chatId,
+            actorTelegramUserId: actorId,
+            actorName,
+            actionType: 'topic.blocked_outside',
+            ...(updateId !== undefined ? { metadata: { threadId: actorThreadId, updateId } } : { metadata: { threadId: actorThreadId } }),
+          });
+          await deps.client.sendMessage({
+            chatId,
+            text: topicGuideText(actorName),
+            messageThreadId: actorThreadId,
+          });
+          return { ok: true };
+        }
+      }
+    }
+
+    /**
+     * /testalert — fully UNDER the guard above: it only works from the
+     * actor's own topic (Mode B) and the alert still routes to the alerts
+     * thread. Creates no interaction, no draft, no session touch, no
+     * Gemini call — the ONLY side effects are the alert post and the
+     * confirmation reply. Message text only, never callbacks.
+     */
+    if (callback === undefined) {
+      const firstToken = (message?.text?.trim().split(/\s+/)[0] ?? '')
+        .split('@')[0]
+        ?.toLowerCase();
+      if (firstToken === '/testalert') {
         if (deps.alertsTopicId === undefined) {
           logger.info(
             { userId: actorId, chatId },
@@ -383,69 +507,6 @@ export function createWebhookHandler(deps: WebhookDeps) {
     if (updateId !== undefined && deps.sessions.markUpdateSeen(updateId)) {
       logger.info({ userId: actorId, updateId }, 'Ignored duplicate Telegram update');
       return { ok: true };
-    }
-
-    /**
-     * Forum topic gate (Mode B only — skipped when no mapping is
-     * configured). Mapped operators may act ONLY inside their assigned
-     * topic. Rejections execute NOTHING: no session, no draft, no
-     * interaction, no Gemini, no MOCK — just the guide reply.
-     */
-    const assignedThread = operatorTopics.get(actorId);
-    if (assignedThread !== undefined) {
-      if (actorThreadId === undefined) {
-        // Outside every assigned topic (General included — its id is
-        // never assumed): guide, never operate.
-        auditor.record({
-          chatId,
-          actorTelegramUserId: actorId,
-          actorName,
-          actionType: 'topic.blocked_outside',
-          ...(updateId !== undefined ? { metadata: { updateId } } : {}),
-        });
-        await sendEarly(topicGuideText(actorName));
-        return { ok: true };
-      }
-      if (actorThreadId !== assignedThread) {
-        const threadOwnerId = findTopicOwner(operatorTopics, actorThreadId);
-        if (threadOwnerId !== undefined) {
-          const storedThreadOwner = deps.interactions.resolveNameByUserId(chatId, threadOwnerId);
-          const threadOwnerName = resolveDisplayName({
-            ...(storedThreadOwner !== undefined ? { alias: storedThreadOwner } : {}),
-            userId: threadOwnerId,
-          });
-          auditor.record({
-            chatId,
-            actorTelegramUserId: actorId,
-            actorName,
-            actionType: 'topic.blocked_cross_thread',
-            metadata: {
-              threadId: actorThreadId,
-              ownerUserId: threadOwnerId,
-              ownerName: threadOwnerName,
-            },
-          });
-          await deps.client.sendMessage({
-            chatId,
-            text: topicMismatchText(threadOwnerName),
-            messageThreadId: actorThreadId,
-          });
-          return { ok: true };
-        }
-        auditor.record({
-          chatId,
-          actorTelegramUserId: actorId,
-          actorName,
-          actionType: 'topic.blocked_outside',
-          ...(updateId !== undefined ? { metadata: { threadId: actorThreadId, updateId } } : { metadata: { threadId: actorThreadId } }),
-        });
-        await deps.client.sendMessage({
-          chatId,
-          text: topicGuideText(actorName),
-          messageThreadId: actorThreadId,
-        });
-        return { ok: true };
-      }
     }
 
     deps.sessions.touchSession(actorId, updateId, chatId);

@@ -129,12 +129,21 @@ export function resolveDisplayName(input: DisplayNameInput): string {
   return `Usuario ${input.userId}`;
 }
 
-/** Cross-thread write rejection: names the topic's owner. */
-export function topicMismatchText(ownerName: string): string {
-  return `⚠️ Este espacio pertenece a ${ownerName}. Usa tu propio topic.`;
+/**
+ * Cross-thread write rejection: names the topic's owner AND the acting
+ * operator, both via the display-name chain (never empty — falls back to
+ * `Usuario <id>`). The actor must move to their own assigned topic.
+ */
+export function topicMismatchText(ownerName: string, actorName: string): string {
+  return `⚠️ Este espacio pertenece a ${ownerName}. Usa tu topic 👤 ${actorName}.`;
 }
 
 /** Guide reply for Mode B messages outside any assigned topic. */
 export function topicGuideText(operatorName: string): string {
-  return `⚠️ Usa tu topic para operar, ${operatorName}.`;
+  return `👤 ${operatorName}, usa tu topic de trabajo.`;
+}
+
+/** Alerts-topic reply: the ⭐ Alertas topic is never operational for users. */
+export function alertsOnlyText(): string {
+  return '⭐ Este topic es solo para alertas. Usa tu espacio de trabajo.';
 }

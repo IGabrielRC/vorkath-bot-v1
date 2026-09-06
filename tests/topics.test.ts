@@ -291,7 +291,7 @@ describe('forum Topics mode (Mode B)', () => {
     const before = world.interactions.snapshot().length;
     await world.post(topicMessage(world.nextUpdateId(), EDWARD, 'netflix', THREAD_GABRIEL));
     expect(world.client.texts().at(-1)).toBe(
-      '⚠️ Este espacio pertenece a Gabriel. Usa tu propio topic.',
+      '⚠️ Este espacio pertenece a Gabriel. Usa tu topic 👤 Edward.',
     );
     expect(world.interpreter.calls).toBe(0);
     expect(world.sessions.getSession(EDWARD, GROUP_CHAT_ID)).toBeUndefined();
@@ -309,7 +309,7 @@ describe('forum Topics mode (Mode B)', () => {
     const before = world.interactions.snapshot().length;
     await world.post(topicMessage(world.nextUpdateId(), GABRIEL, 'netflix', THREAD_EDWARD));
     expect(world.client.texts().at(-1)).toBe(
-      '⚠️ Este espacio pertenece a Edward. Usa tu propio topic.',
+      '⚠️ Este espacio pertenece a Edward. Usa tu topic 👤 Gabriel.',
     );
     expect(world.interpreter.calls).toBe(0);
     expect(draftOf(world, GABRIEL)).toBeUndefined();
@@ -322,7 +322,7 @@ describe('forum Topics mode (Mode B)', () => {
     await world.post(topicMessage(world.nextUpdateId(), GABRIEL, 'netflix', THREAD_GABRIEL));
     await world.post(topicMessage(world.nextUpdateId(), OP3, 'netflix', THREAD_GABRIEL));
     expect(world.client.texts().at(-1)).toBe(
-      '⚠️ Este espacio pertenece a Gabriel. Usa tu propio topic.',
+      '⚠️ Este espacio pertenece a Gabriel. Usa tu topic 👤 Marta.',
     );
     expect(world.interpreter.calls).toBe(0);
     expect(draftOf(world, OP3)).toBeUndefined();
