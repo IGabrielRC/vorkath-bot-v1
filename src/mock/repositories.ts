@@ -1,5 +1,7 @@
 import type { ServiceAccount } from './accounts';
 import { groupRowsIntoAccounts } from './accounts';
+import type { CredentialBundle } from './credentials';
+import { buildCredentialBundles } from './credentials';
 import type { Customer } from './customers';
 import { groupRowsIntoCustomers } from './customers';
 import type { MockAccount, MockService } from './excelLoader';
@@ -42,6 +44,20 @@ export interface MockRepositories {
    */
   searchCustomersByPhone(query: string): Promise<Customer[]>;
   searchServiceAccounts(identifier: string): Promise<ServiceAccount[]>;
+  /**
+   * Explicit-credential path (Slice A — SHOW_CREDENTIALS ONLY): ONE
+   * customer's assignments as CredentialBundles, built in the domain
+   * layer from raw rows. `customerId` is the MOCK-stable normalized
+   * name. Raw `contrasena` values never leave through any other seam —
+   * normal search stays secret-free by construction.
+   */
+  getCredentialBundlesForCustomer(customerId: string): Promise<CredentialBundle[]>;
+  /**
+   * Explicit-credential path (Slice A — SHOW_CREDENTIALS ONLY): ONE
+   * account's assignments as CredentialBundles. `accountId` is the
+   * MOCK-stable `${servicio}:${normalized identifier}`.
+   */
+  getCredentialBundlesForAccount(accountId: string): Promise<CredentialBundle[]>;
   getExpiredAccounts(): Promise<SafeAccount[]>;
   getInventorySummary(): Promise<InventorySummary[]>;
 }
@@ -78,6 +94,21 @@ export class MockAccountRepositories implements MockRepositories {
    */
   async searchServiceAccounts(identifier: string): Promise<ServiceAccount[]> {
     return groupRowsIntoAccounts(this.store.searchByAccountIdentifier(identifier));
+  }
+
+  async getCredentialBundlesForCustomer(customerId: string): Promise<CredentialBundle[]> {
+    const key = customerId.trim().toLowerCase();
+    const scoped = this.store.accounts.filter(
+      (row) => row.nombre.trim().toLowerCase() === key,
+    );
+    return buildCredentialBundles(scoped, this.store.accounts);
+  }
+
+  async getCredentialBundlesForAccount(accountId: string): Promise<CredentialBundle[]> {
+    const scoped = this.store.accounts.filter(
+      (row) => `${row.servicio}:${row.correo.trim().toLowerCase()}` === accountId,
+    );
+    return buildCredentialBundles(scoped, this.store.accounts);
   }
 
   async getExpiredAccounts(): Promise<SafeAccount[]> {

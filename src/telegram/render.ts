@@ -227,8 +227,7 @@ export function renderAccountCard(input: {
 }
 
 /** One account slot: profile + holding client + expiry + status. */
-export interface AccountSlot {
-  /** PERFIL as stored — RAW. */
+export interface AccountSlot {  /** PERFIL as stored — RAW. */
   perfil: string;
   /** NOMBRE: the client holding this slot — RAW. */
   cliente: string;
@@ -425,8 +424,7 @@ export interface AlertInput {
  * Critical alert (`⭐ ALERTA`): caller-provided strings rendered into the
  * alerts topic. NEVER pass secrets — the text posts verbatim downstream.
  */
-export function renderAlert(alert: AlertInput): string {
-  const lines = [title('⭐ ALERTA'), title(alert.title), '', esc(alert.summary), ''];
+export function renderAlert(alert: AlertInput): string {  const lines = [title('⭐ ALERTA'), title(alert.title), '', esc(alert.summary), ''];
   if (alert.actorName !== undefined && alert.actorName !== '') {
     lines.push(`👤 Operador: ${esc(alert.actorName)}`);
   }
@@ -434,4 +432,70 @@ export function renderAlert(alert: AlertInput): string {
     lines.push(`🕒 ${esc(alert.timestamp)}`);
   }
   return lines.join('\n');
+}
+
+/** Explicit-credential card input: ONE CredentialBundle's safe view (RAW strings, escaped here). */
+export interface RenderedCredential {
+  /** Display service label (`Netflix`, `FlujoTV`) — RAW. */
+  serviceLabel: string;
+  /** CORREO as stored (email, username or code) — RAW. */
+  accountIdentifier: string;
+  /** Real credential — rendered ONLY on the explicit datos path. */
+  accountPassword: string;
+  /** PERFIL as stored — RAW. */
+  profile: string;
+  /** Per-service shape — FlujoTV keeps its own model. */
+  accountType: 'netflix-profile' | 'flujotv-shared' | 'flujotv-complete';
+  /** Holding client — RAW. */
+  customerName: string;
+  /** Real PIN — present ONLY when source carries one; otherwise omitted. */
+  pin?: string;
+}
+
+/**
+ * Sensitive access-data card (Slice A — SHOW_CREDENTIALS ONLY): HTML via
+ * the central renderer, every dynamic value escaped. Shown ONLY after an
+ * explicit datos request inside the actor's authorized operating topic —
+ * normal search cards never include passwords/PIN. Netflix shows the
+ * account password + profile; FlujoTV shows its own model (Usuario +
+ * Perfil for shared, Usuario + Completa for exclusive). No WhatsApp
+ * button here (slice B owns delivery) — card + Volver only.
+ */
+export function renderCredentialCard(bundle: RenderedCredential): string {
+  const lines: string[] = [
+    title('🔐 DATOS DE ACCESO'),
+    '',
+    field('Cliente', bundle.customerName),
+    field('Servicio', bundle.serviceLabel),
+  ];
+  if (bundle.accountType === 'netflix-profile') {
+    lines.push(field('Cuenta', bundle.accountIdentifier));
+    lines.push(field('Perfil', bundle.profile));
+  } else {
+    lines.push(field('Usuario', bundle.accountIdentifier));
+    if (bundle.accountType === 'flujotv-complete') {
+      lines.push(field('Cuenta', 'Completa / Exclusiva'));
+    } else {
+      lines.push(field('Perfil', bundle.profile));
+    }
+  }
+  lines.push(field('Contraseña', bundle.accountPassword));
+  if (bundle.pin !== undefined && bundle.pin !== '') {
+    lines.push(field('PIN', bundle.pin));
+  }
+  return lines.join('\n');
+}
+
+/** Minimal credential disambiguation header (buttons carry the choice). */
+export function renderCredentialChoices(total: number): string {
+  return `${title(`🔐 ¿Qué datos necesitas? (${total})`)}\nElige una opción:`;
+}
+
+/** No-context guide: credentials require a selected client/account first. */
+export function renderCredentialNoContext(): string {
+  return notFound(
+    '🔐 DATOS DE ACCESO',
+    'Primero busca un cliente o una cuenta y selecciónalo.',
+    'Escribe un teléfono, nombre o cuenta para buscar.',
+  );
 }

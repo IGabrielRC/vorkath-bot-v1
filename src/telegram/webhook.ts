@@ -22,6 +22,9 @@ import {
   type InteractionType,
 } from '../interactions/interactions';
 import type { MockRepositories, SafeAccount } from '../mock/repositories';
+import type { CredentialBundle } from '../mock/credentials';
+import type { MockService } from '../mock/excelLoader';
+import { credentialOptionLabel, resolveCredentialView } from '../tools/credentials';
 import { containsPhoneCandidate, extractEmbeddedAccount, isExplicitCreateRequest } from '../parser/fast';
 import { route } from '../router/hybrid';
 import { SessionStore } from '../session/store';
@@ -36,6 +39,7 @@ import {
   SECTION_TEXTS,
   accountDisambiguationKeyboard,
   accountSearchKeyboard,
+  credentialDisambiguationKeyboard,
   draftKeyboard,
   homeKeyboard,
   phoneSearchKeyboard,
@@ -51,6 +55,9 @@ import {
   renderAccountChoices,
   renderAccountNotFound,
   renderActivitySummary,
+  renderCredentialCard,
+  renderCredentialChoices,
+  renderCredentialNoContext,
   renderCustomerList,
   renderDraftCreated,
   renderDraftOpened,
@@ -1318,6 +1325,305 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
 
     /**
+     * SHOW_CREDENTIALS shared entry (Slice A): the 🔐Datos button (L1)
+     * and the explicit datos phrases (L2) plus Gemini semantic/reference
+     * variants (L3) ALL converge here — same context resolution, same
+     * deterministic tool, same card. Read-only: drafts are never
+     * created, updated, or cancelled here; no business state is mutated.
+     *
+     * Context resolves from the actor's OWN selections only (the owning
+     * interaction first, else the actor's latest SEARCH selection in
+     * this thread scope) — never a peer's. Credentials render ONLY
+     * inside the actor's authorized operating topic: this flow runs
+     * strictly below the central topic-ownership guard, and every new
+     * callback it introduces travels owned (topic/guard/ownership on
+     * every callback). Secrets never reach logs — audit carries safe
+     * refs only (`credential_view` + service/account/customer refs).
+     */
+    interface CredentialSelection {
+      customer?: { id: string; nombre: string };
+      account?: { id: string; servicio: string; identifier: string };
+    }
+
+    function readCredentialSelection(interaction: Interaction | undefined): CredentialSelection {
+      if (interaction === undefined) {
+        return {};
+      }
+      const selected = interaction.state['selectedCustomer'];
+      const account = interaction.state['selectedAccount'];
+      const out: CredentialSelection = {};
+      if (
+        typeof selected === 'object' &&
+        selected !== null &&
+        typeof (selected as { id?: unknown }).id === 'string' &&
+        typeof (selected as { nombre?: unknown }).nombre === 'string'
+      ) {
+        out.customer = {
+          id: (selected as { id: string }).id,
+          nombre: (selected as { nombre: string }).nombre,
+        };
+      }
+      if (
+        typeof account === 'object' &&
+        account !== null &&
+        typeof (account as { id?: unknown }).id === 'string'
+      ) {
+        const typed = account as { id: string; servicio?: unknown; identifier?: unknown };
+        out.account = {
+          id: typed.id,
+          servicio: typeof typed.servicio === 'string' ? typed.servicio : '',
+          identifier: typeof typed.identifier === 'string' ? typed.identifier : '',
+        };
+      }
+      return out;
+    }
+
+    /**
+     * Resolves the actor's OWN latest credential context: the newest
+     * SEARCH interaction owned by (chatId, actorId) in this thread scope
+     * carrying a selected customer/account. Never consults a peer's
+     * context. Returns empty when the actor selected nothing — the
+     * caller then guides back to search instead of guessing.
+     */
+    function resolveOwnCredentialContext(): CredentialSelection {
+      let best: Interaction | undefined;
+      for (const candidate of deps.interactions.snapshot()) {
+        if (
+          candidate.chatId !== targetChatId ||
+          candidate.ownerTelegramUserId !== targetActorId ||
+          candidate.type !== 'SEARCH'
+        ) {
+          continue;
+        }
+        if (
+          targetThreadId !== undefined &&
+          candidate.messageThreadId !== undefined &&
+          candidate.messageThreadId !== targetThreadId
+        ) {
+          continue;
+        }
+        const selection = readCredentialSelection(candidate);
+        if (selection.customer === undefined && selection.account === undefined) {
+          continue;
+        }
+        if (best === undefined || candidate.updatedAt >= best.updatedAt) {
+          best = candidate;
+        }
+      }
+      return readCredentialSelection(best);
+    }
+
+    /** Safe refs for credential interaction state — NEVER passwords/PIN. */
+    interface CredentialRefs {
+      customerId?: string;
+      accountId?: string;
+      serviceFilter?: MockService;
+      total: number;
+    }
+
+    function credentialRefsFor(
+      selection: CredentialSelection,
+      serviceFilter: MockService | undefined,
+      total: number,
+    ): CredentialRefs {
+      return {
+        ...(selection.customer !== undefined ? { customerId: selection.customer.id } : {}),
+        ...(selection.account !== undefined ? { accountId: selection.account.id } : {}),
+        ...(serviceFilter !== undefined ? { serviceFilter } : {}),
+        total,
+      };
+    }
+
+    async function credentialBundlesFor(selection: CredentialSelection): Promise<CredentialBundle[]> {
+      if (selection.customer !== undefined) {
+        return deps.repos.getCredentialBundlesForCustomer(selection.customer.id);
+      }
+      if (selection.account !== undefined) {
+        return deps.repos.getCredentialBundlesForAccount(selection.account.id);
+      }
+      return [];
+    }
+
+    function credentialAuditRef(bundle: CredentialBundle): string {
+      return `credential:${bundle.service}:${bundle.accountIdentifier}`;
+    }
+
+    /** Renders ONE sensitive card + safe-ref audit (no secrets in logs). */
+    async function renderCredentialDirect(
+      interaction: Interaction,
+      bundle: CredentialBundle,
+      refs: CredentialRefs,
+    ): Promise<void> {
+      deps.interactions.touch(interaction.id, { ...refs, view: 'credentials-detail' });
+      persistAll();
+      auditor.record({
+        chatId: targetChatId,
+        actorTelegramUserId: targetActorId,
+        ...(targetActorName !== undefined ? { actorName: targetActorName } : {}),
+        actionType: 'credential.viewed',
+        entity: credentialAuditRef(bundle),
+        metadata: {
+          service: bundle.service,
+          accountRef: bundle.accountIdentifier,
+          customerRef: bundle.customerName,
+        },
+      });
+      logger.info(
+        { userId: targetActorId, chatId: targetChatId, updateId, action: 'credentials-direct' },
+        'Rendered credential card',
+      );
+      await sendLabeled(
+        renderCredentialCard({
+          serviceLabel: bundle.serviceLabel,
+          accountIdentifier: bundle.accountIdentifier,
+          accountPassword: bundle.accountPassword,
+          profile: bundle.profile,
+          accountType: bundle.accountType,
+          customerName: bundle.customerName,
+          ...(bundle.pin !== undefined ? { pin: bundle.pin } : {}),
+        }),
+        accountSearchKeyboard(interaction.id),
+        interaction.messageThreadId,
+      );
+    }
+
+    /** Minimal disambiguation over real-data options — never passwords. */
+    async function renderCredentialAsk(
+      interaction: Interaction,
+      options: CredentialBundle[],
+      refs: CredentialRefs,
+    ): Promise<void> {
+      const multiCustomer = new Set(options.map((option) => option.customerName)).size > 1;
+      const labels = options.map((option) => credentialOptionLabel(option, multiCustomer));
+      deps.interactions.touch(interaction.id, { ...refs, total: options.length, view: 'credentials-list' });
+      persistAll();
+      logger.info(
+        { userId: targetActorId, chatId: targetChatId, updateId, action: 'credentials-ask' },
+        'Rendered credential disambiguation',
+      );
+      await sendLabeled(
+        renderCredentialChoices(options.length),
+        credentialDisambiguationKeyboard(labels, { interactionId: interaction.id }),
+        interaction.messageThreadId,
+      );
+    }
+
+    async function runCredentialsFlow(
+      origin: Interaction | undefined,
+      serviceFilter?: MockService,
+    ): Promise<void> {
+      const fromOrigin = readCredentialSelection(origin);
+      const selection =
+        fromOrigin.customer !== undefined || fromOrigin.account !== undefined
+          ? fromOrigin
+          : resolveOwnCredentialContext();
+      const bundles = await credentialBundlesFor(selection);
+      if (bundles.length === 0) {
+        const view = createInteraction('SEARCH', { view: 'prompt' });
+        persistAll();
+        await sendLabeled(
+          renderCredentialNoContext(),
+          sectionKeyboard('buscar', view.id),
+          view.messageThreadId,
+        );
+        return;
+      }
+      const interaction = createInteraction('SEARCH', { view: 'credentials-list', offset: 0 });
+      let view = resolveCredentialView(bundles, serviceFilter);
+      if (view.kind === 'none' && serviceFilter !== undefined) {
+        view = resolveCredentialView(bundles, undefined);
+      }
+      const refs = credentialRefsFor(selection, serviceFilter, bundles.length);
+      if (view.kind === 'direct') {
+        await renderCredentialDirect(interaction, view.bundle, refs);
+        return;
+      }
+      if (view.kind === 'ask') {
+        await renderCredentialAsk(interaction, view.options, refs);
+        return;
+      }
+      persistAll();
+      await sendLabeled(
+        renderCredentialNoContext(),
+        sectionKeyboard('buscar', interaction.id),
+        interaction.messageThreadId,
+      );
+    }
+
+    /** Credential card from the owned disambiguation list (re-resolved, never persisted). */
+    async function renderCredentialSelection(
+      interaction: Interaction,
+      optionIndex: number,
+    ): Promise<void> {
+      const state = interaction.state;
+      const selection: CredentialSelection = {};
+      if (typeof state['customerId'] === 'string') {
+        selection.customer = { id: state['customerId'], nombre: '' };
+      }
+      if (typeof state['accountId'] === 'string') {
+        selection.account = { id: state['accountId'], servicio: '', identifier: '' };
+      }
+      const storedFilter = state['serviceFilter'];
+      const serviceFilter =
+        storedFilter === 'netflix' || storedFilter === 'flujotv'
+          ? (storedFilter as MockService)
+          : undefined;
+      const bundles = await credentialBundlesFor(selection);
+      let view = resolveCredentialView(bundles, serviceFilter);
+      if (view.kind === 'none' && serviceFilter !== undefined) {
+        view = resolveCredentialView(bundles, undefined);
+      }
+      if (view.kind !== 'ask') {
+        await ackStale('view');
+        return;
+      }
+      const bundle = view.options[optionIndex];
+      if (bundle === undefined) {
+        await ackStale('view');
+        return;
+      }
+      const refs = credentialRefsFor(selection, serviceFilter, view.options.length);
+      await renderCredentialDirect(interaction, bundle, refs);
+    }
+
+    /** Rebuilds the owned disambiguation list (Volver from a card/list). */
+    async function renderCredentialList(interaction: Interaction): Promise<void> {
+      const state = interaction.state;
+      const selection: CredentialSelection = {};
+      if (typeof state['customerId'] === 'string') {
+        selection.customer = { id: state['customerId'], nombre: '' };
+      }
+      if (typeof state['accountId'] === 'string') {
+        selection.account = { id: state['accountId'], servicio: '', identifier: '' };
+      }
+      const storedFilter = state['serviceFilter'];
+      const serviceFilter =
+        storedFilter === 'netflix' || storedFilter === 'flujotv'
+          ? (storedFilter as MockService)
+          : undefined;
+      const bundles = await credentialBundlesFor(selection);
+      let view = resolveCredentialView(bundles, serviceFilter);
+      if (view.kind === 'none' && serviceFilter !== undefined) {
+        view = resolveCredentialView(bundles, undefined);
+      }
+      const refs = credentialRefsFor(selection, serviceFilter, bundles.length);
+      if (view.kind === 'ask') {
+        await renderCredentialAsk(interaction, view.options, refs);
+        return;
+      }
+      if (view.kind === 'direct') {
+        await renderCredentialDirect(interaction, view.bundle, refs);
+        return;
+      }
+      persistAll();
+      await sendLabeled(
+        renderCredentialNoContext(),
+        sectionKeyboard('buscar', interaction.id),
+        interaction.messageThreadId,
+      );
+    }
+
+    /**
      * Dataless buscar prompt — the SAME wizard the BUSCAR button opens.
      * Serves the L2 `buscar` section (dataless re-entry: "buscar otro
      * número", "otra cuenta") so button≡NL with zero Gemini.
@@ -1527,6 +1833,23 @@ export function createWebhookHandler(deps: WebhookDeps) {
             await renderCustomerSearch(interaction, query);
             return;
           }
+        } else if (
+          interaction.type === 'SEARCH' &&
+          (interaction.state['view'] === 'credentials-list' ||
+            interaction.state['view'] === 'credentials-detail')
+        ) {
+          // Volver from a credential card/list: back to the owned
+          // disambiguation list when one exists (N options), Home for a
+          // direct single-card (no list to return to) — drafts and
+          // persistent requirements are never deleted either way.
+          const total =
+            typeof interaction.state['total'] === 'number'
+              ? (interaction.state['total'] as number)
+              : 0;
+          if (total > 1) {
+            await renderCredentialList(interaction);
+            return;
+          }
         } else if (interaction.type === 'SEARCH' && interaction.state['view'] === 'detail') {
           // Volver belongs to the interaction: back to the owned list,
           // never deleting drafts or persistent requirements.
@@ -1536,8 +1859,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
               : '';
           await renderSearchPage(interaction, query);
           return;
-        }
-        // Navigation never touches drafts — both actors' state survives.
+        }        // Navigation never touches drafts — both actors' state survives.
         const home = createInteraction('HOME');
         persistAll();
         await sendLabeled(HOME_TEXT, homeKeyboard(home.id), interaction.messageThreadId);
@@ -1551,6 +1873,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
           sectionKeyboard('buscar', view.id),
           interaction.messageThreadId,
         );
+        return;
+      }
+      if (action === 'credentials') {
+        // 🔐Datos button: the SAME deterministic SHOW_CREDENTIALS tool
+        // the explicit datos phrases run (button≡NL) — ownership and
+        // thread already verified by the caller.
+        await runCredentialsFlow(interaction);
         return;
       }
       if (action === 'operar') {
@@ -1641,6 +1970,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
           interaction.state['view'] === 'account-detail'
         ) {
           await renderAccountCard(interaction, query, offset + viewIndex);
+          return;
+        }
+        if (interaction.state['view'] === 'credentials-list') {
+          await renderCredentialSelection(interaction, viewIndex);
           return;
         }
         await renderAccountDetail(interaction, query, offset + viewIndex);
@@ -1740,6 +2073,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await respond(HOME_TEXT);
         return { ok: true };
       }
+      if (action === 'credentials') {
+        await runCredentialsFlow(undefined);
+        return { ok: true };
+      }
       if (action === 'buscar') {
         await respond(SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR', 'buscar');
         return { ok: true };
@@ -1790,6 +2127,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
 
     if (decision.layer === 'L2') {
       const parse = decision.parse;
+      if (parse.kind === 'credentials') {
+        // Explicit datos request (L2, zero Gemini): the SAME
+        // SHOW_CREDENTIALS tool the 🔐Datos button runs — button≡NL by
+        // construction. Read-only: no confirmation, no draft.
+        await runCredentialsFlow(undefined, parse.service);
+        return { ok: true };
+      }
       if (parse.kind === 'command') {
         if (parse.command === 'confirmar') {
           const result = await confirmWithActivity();
@@ -1899,6 +2243,18 @@ export function createWebhookHandler(deps: WebhookDeps) {
     // execute immediately; complete writes build a draft for
     // confirmation; anything missing asks ONLY for it.
     const intent = decision.intent;
+    if (intent.name === 'OPEN_CREDENTIALS') {
+      // Gemini semantic/reference variant (L3): the model interpreted
+      // intent+reference FIRST — this deterministic fetch runs AFTER and
+      // secrets never reach the model. Same SHOW_CREDENTIALS tool as L1/L2.
+      const rawService = intent.params['service'];
+      const serviceFilter =
+        rawService === 'netflix' || rawService === 'flujotv'
+          ? (rawService as MockService)
+          : undefined;
+      await runCredentialsFlow(undefined, serviceFilter);
+      return { ok: true };
+    }
     if (intent.name === 'OPEN_SEARCH') {
       let identifier = pickSearchIdentifier(intent.params);
       if (identifier === undefined && intent.params['reference'] === 'last') {

@@ -40,6 +40,13 @@ const TOOL_SPECS: Record<string, ToolSpec> = {
   getCustomerDetails: { tool: 'getCustomerDetails', kind: 'read', required: ['identifier'] },
   getAccountDetails: { tool: 'getAccountDetails', kind: 'read', required: ['identifier'] },
   getCredentials: { tool: 'getCredentials', kind: 'read', required: ['identifier'] },
+  /**
+   * Slice A SHOW_CREDENTIALS: read-only, context-resolved (the actor's
+   * own selected customer/account) — never asks a free identifier, so no
+   * required params. Ambiguity resolves to owned option buttons, never
+   * to a guess or a silent default.
+   */
+  showCredentials: { tool: 'showCredentials', kind: 'read', required: [] },
   getExpired: { tool: 'getExpired', kind: 'read', required: [] },
   getInventory: { tool: 'getInventory', kind: 'read', required: [] },
   getRate: { tool: 'getRate', kind: 'read', required: [] },
@@ -76,6 +83,7 @@ export type IntentMutationPolicy = 'read' | 'draft-shell' | 'guarded-draft' | 'n
 
 export const INTENT_MUTATION_POLICY: Record<IntentName, IntentMutationPolicy> = {
   OPEN_SEARCH: 'read',
+  OPEN_CREDENTIALS: 'read',
   CREATE_TEST_DRAFT: 'guarded-draft',
   CORRECTION: 'draft-shell',
   OPEN_OPERATE: 'draft-shell',

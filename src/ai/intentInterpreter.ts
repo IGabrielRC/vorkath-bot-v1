@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { GoogleGenAI } from '@google/genai';
-import { extractEmbeddedAccount, isExplicitCreateRequest, parseEmail, parseMonths, parsePhone } from '../parser/fast';
+import { extractEmbeddedAccount, isExplicitCreateRequest, parseCredentialsRequest, parseEmail, parseMonths, parsePhone } from '../parser/fast';
 
 /**
  * L3 Gemini intent interpreter: intent-only, never executes.
@@ -14,6 +14,7 @@ import { extractEmbeddedAccount, isExplicitCreateRequest, parseEmail, parseMonth
 
 export const INTENT_NAMES = [
   'OPEN_SEARCH',
+  'OPEN_CREDENTIALS',
   'CREATE_TEST_DRAFT',
   'CORRECTION',
   'OPEN_OPERATE',
@@ -49,6 +50,10 @@ export type Intent = z.infer<typeof intentSchema>;
  *   previous result ("esa misma", "ese", "la anterior") with NO new
  *   identifier; the app resolves it from the actor's own context only,
  * - `months` — month count stated verbatim (corrections / test drafts).
+ * - `service` — `netflix`/`flujotv` ONLY when stated verbatim inside an
+ *   explicit datos request ("datos de Netflix"); the OPEN_CREDENTIALS
+ *   credential fetch itself always runs AFTER interpretation and NEVER
+ *   returns secrets to the model.
  *
  * The interpreter NEVER invents an absent parameter, NEVER mutates
  * anything, and NEVER skips guards: missing stays missing so the app
@@ -96,8 +101,12 @@ const INTENT_JSON_SCHEMA = {
 
 const SYSTEM_PROMPT =
   'You classify Telegram bot messages into intents. ' +
-  'Reply with JSON only: {"name": <OPEN_SEARCH|CREATE_TEST_DRAFT|CORRECTION|OPEN_OPERATE|OPEN_EXPIRED|OPEN_INVENTORY|OPEN_CASH|OPEN_MORE|UNKNOWN>, "params": {...}}. ' +
+  'Reply with JSON only: {"name": <OPEN_SEARCH|OPEN_CREDENTIALS|CREATE_TEST_DRAFT|CORRECTION|OPEN_OPERATE|OPEN_EXPIRED|OPEN_INVENTORY|OPEN_CASH|OPEN_MORE|UNKNOWN>, "params": {...}}. ' +
   'OPEN_SEARCH: user wants to search a customer/account. ' +
+  'OPEN_CREDENTIALS: EXPLICIT access-data request only ("dame los datos", "pásame los datos", "dame usuario y contraseña", "datos de acceso", "cuál es la contraseña", semantic/reference variants like "esa cuenta, pásame la clave"). ' +
+  'params.service = "netflix"/"flujotv" ONLY when the service is stated verbatim ("datos de Netflix"); ' +
+  'params.reference="last" for "esa/ese/la anterior" with no new id. ' +
+  'Interpretation ONLY: never execute, never fetch, never include credentials — the deterministic tool fetches AFTER. ' +
   'CREATE_TEST_DRAFT ONLY for unequivocal creation requests (a creation verb + a test noun: "crea/haz/abre una operacion/prueba/demo/test", optional months). ' +
   'A bare "prueba"/"demo"/"test" or a consult phrase ("revisa/busca/consulta X") is NEVER CREATE_TEST_DRAFT: ' +
   'consult phrases are OPEN_SEARCH (identifier verbatim when stated), bare/ambiguous input is UNKNOWN. ' +
@@ -131,6 +140,45 @@ export class StubIntentInterpreter implements IntentInterpreter {
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
       .toLowerCase();
+    // Explicit datos request (Slice A — SHOW_CREDENTIALS): checked FIRST
+    // so "esa cuenta, dame los datos" never degrades to a plain search.
+    // Semantic/reference variants land here; the deterministic
+    // CredentialTool fetches AFTER — secrets never reach the model.
+    const credentials = parseCredentialsRequest(text);
+    if (credentials !== null) {
+      const hasReference = /(esa|ese|eso|misma|mismo|esta|este|anterior|última|ultima)\b/.test(lowered);
+      return {
+        name: 'OPEN_CREDENTIALS',
+        params: {
+          ...(credentials.service !== undefined ? { service: credentials.service } : {}),
+          ...(hasReference ? { reference: 'last' } : {}),
+        },
+        confidence: 1,
+      };
+    }
+    // Semantic clave variant L2 misses ("¿qué clave tiene esa cuenta?"):
+    // the stub plays Gemini's semantic role, so key/access nouns with no
+    // new identifier become OPEN_CREDENTIALS (reference when esa/ese…).
+    // "palabra clave" (keyword) is never credentials.
+    if (
+      /clave|contrasena|\bdatos\b.*\bacceso\b|\bacceso\b.*\bdatos\b|usuario.*contrasena/.test(folded) &&
+      !/palabra clave/.test(folded)
+    ) {
+      const service = /\bnetflix\b/.test(folded)
+        ? 'netflix'
+        : /\bflujo/.test(folded)
+          ? 'flujotv'
+          : undefined;
+      const hasReference = /(esa|ese|eso|misma|mismo|esta|este|anterior|última|ultima)\b/.test(lowered);
+      return {
+        name: 'OPEN_CREDENTIALS',
+        params: {
+          ...(service !== undefined ? { service } : {}),
+          ...(hasReference ? { reference: 'last' } : {}),
+        },
+        confidence: 1,
+      };
+    }
     const monthsMatch = /(\d{1,2})\s*mes(?:es)?\b/.exec(lowered);
     if (/(mejor|cambia|hazlo|corrige|correcci)/.test(lowered) && monthsMatch?.[1] !== undefined) {
       return { name: 'CORRECTION', params: { months: Number(monthsMatch[1]) }, confidence: 1 };

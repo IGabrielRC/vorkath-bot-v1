@@ -14,6 +14,7 @@ export type FastCommand =
 
 export type FastParseResult =
   | { kind: 'command'; command: FastCommand }
+  | { kind: 'credentials'; service?: 'netflix' | 'flujotv' }
   | { kind: 'email'; value: string }
   | { kind: 'phone'; value: string; raw: string }
   | { kind: 'createTest'; months: number }
@@ -249,6 +250,44 @@ function parseCommand(text: string): { kind: 'command'; command: FastCommand } |
 }
 
 /**
+ * Explicit credential request (Slice A — SHOW_CREDENTIALS, L2
+ * zero-Gemini twin of the 🔐Datos button).
+ *
+ * Matches UNEQUIVOCAL access-data phrases over NORMALIZED text
+ * (accent/case folded): "dame los datos", "pásame los datos", "dame
+ * usuario y contraseña", "datos de acceso", "cuál es la contraseña", …
+ * A stated service ("datos de Netflix") travels as the filter so a
+ * single matching assignment renders direct. Normal search NEVER matches
+ * here — only an explicit datos/contraseña/acceso request opens the
+ * sensitive card.
+ */
+export function parseCredentialsRequest(
+  text: string,
+): { kind: 'credentials'; service?: 'netflix' | 'flujotv' } | null {
+  const n = normalizeText(text);
+  // "palabra clave" (keyword) is never a credential request.
+  if (/\bpalabra clave\b/.test(n)) {
+    return null;
+  }
+  const explicit =
+    /(dame|pasame|muestrame|enviame|comparte|pasa).*(datos|contrasena|clave|acceso)/.test(n) ||
+    /\bdatos de acceso\b/.test(n) ||
+    /\busuario y contrasena\b/.test(n) ||
+    /\bcual es la (contrasena|clave)\b/.test(n) ||
+    /\bmi (contrasena|clave)\b/.test(n);
+  if (!explicit) {
+    return null;
+  }
+  if (/\bnetflix\b/.test(n)) {
+    return { kind: 'credentials', service: 'netflix' };
+  }
+  if (/\bflujo/.test(n)) {
+    return { kind: 'credentials', service: 'flujotv' };
+  }
+  return { kind: 'credentials' };
+}
+
+/**
  * Service-name recognition (Netflix + FlujoTV, case/spacing tolerant).
  * Checked LAST before `none` so more specific kinds always win:
  * "precio netflix" stays a `precio` command, "netflix 414..." stays a
@@ -342,10 +381,14 @@ export function extractEmbeddedAccount(text: string): { kind: 'account'; value: 
 }
 
 /**
- * Deterministic cascade: command → email → phone → createTest →
- * section → embeddedAccount → months → service → account → none. "none"
- * means the router must fall through to L3 (Gemini intent-only).
+ * Deterministic cascade: credentials → command → email → phone →
+ * createTest → section → embeddedAccount → months → service → account →
+ * none. "none" means the router must fall through to L3 (Gemini
+ * intent-only).
  *
+ * `credentials` sits FIRST so an explicit datos request ("dame los datos
+ * de Netflix") reaches the sensitive card instead of the `command`,
+ * `service` or identifier branches — normal search can never open it.
  * `createTest` sits BEFORE `months` so "crea una prueba de 2 meses"
  * opens a draft with months=2 instead of hitting the months-correction
  * branch with no draft open; bare corrections ("hazlo 2 meses", no
@@ -363,6 +406,7 @@ export function parseFast(text: string): FastParseResult {
     return { kind: 'none' };
   }
   return (
+    parseCredentialsRequest(trimmed) ??
     parseCommand(trimmed) ??
     parseEmail(trimmed) ??
     parsePhone(trimmed) ??

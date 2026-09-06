@@ -37,6 +37,7 @@ export type CallbackAction =
   | 'confirm'
   | 'correct'
   | 'cancel'
+  | 'credentials'
   | 'view0'
   | 'view1'
   | 'view2'
@@ -57,6 +58,7 @@ const SHORT_IDS: Record<CallbackAction, string> = {
   confirm: 'ok',
   correct: 'fix',
   cancel: 'no',
+  credentials: 'cred',
   view0: 'w0',
   view1: 'w1',
   view2: 'w2',
@@ -213,32 +215,36 @@ export function sectionKeyboard(section: string, interactionId?: string): Inline
 }
 
 /**
- * Phone-search keyboard: [🔎Buscar otro] re-opens the SAME guided
- * wizard the BUSCAR button opens (same `buscar` action/handler), and
- * [←Volver] returns Home. Used by the read-only phone UX (not-found,
- * single-card, customer detail). NEVER a "Crear cliente" button here —
- * creation belongs exclusively to the explicit new-sale flow
- * (BR-CUS-009).
+ * Phone-search keyboard: [🔐Datos] runs the SAME deterministic
+ * SHOW_CREDENTIALS tool the explicit datos phrases run (button≡NL);
+ * [🔎Buscar otro] re-opens the SAME guided wizard the BUSCAR button
+ * opens (same `buscar` action/handler), and [←Volver] returns Home.
+ * Used by the read-only phone UX (not-found, single-card, customer
+ * detail). NEVER a "Crear cliente" button here — creation belongs
+ * exclusively to the explicit new-sale flow (BR-CUS-009).
  */
 export function phoneSearchKeyboard(interactionId?: string): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
+      [ownedButton('🔐Datos', 'credentials', interactionId)],
       [ownedButton('🔎Buscar otro', 'buscar', interactionId), backButton(interactionId)],
     ],
   };
 }
 
 /**
- * Account-search keyboard: [🔎Buscar otra] re-opens the SAME guided
- * wizard the BUSCAR button opens (same `buscar` action/handler), and
- * [←Volver] returns Home. Used by the read-only account UX
- * (not-found, single-card, account detail). NEVER a "Crear cliente"
- * button here — creation belongs exclusively to the explicit
- * new-sale flow (BR-CUS-009).
+ * Account-search keyboard: [🔐Datos] runs the SAME deterministic
+ * SHOW_CREDENTIALS tool the explicit datos phrases run (button≡NL);
+ * [🔎Buscar otra] re-opens the SAME guided wizard the BUSCAR button
+ * opens (same `buscar` action/handler), and [←Volver] returns Home.
+ * Used by the read-only account UX (not-found, single-card, account
+ * detail). NEVER a "Crear cliente" button here — creation belongs
+ * exclusively to the explicit new-sale flow (BR-CUS-009).
  */
 export function accountSearchKeyboard(interactionId?: string): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
+      [ownedButton('🔐Datos', 'credentials', interactionId)],
       [ownedButton('🔎Buscar otra', 'buscar', interactionId), backButton(interactionId)],
     ],
   };
@@ -280,9 +286,42 @@ export function accountDisambiguationKeyboard(
   return { inline_keyboard: rows };
 }
 
+/**
+ * Minimal credential disambiguation: one owned button per candidate
+ * bundle, labeled from real data (`Netflix · 1 PERFIL (2)`), reusing the
+ * view0–4 actions so ownership, stale-callback and cross-thread guards
+ * apply unchanged, plus ←Volver. Shown only when the actor's context
+ * resolves to N assignments — never a free-text password dump.
+ */
+export function credentialDisambiguationKeyboard(
+  labels: string[],
+  opts?: { interactionId?: string },
+): InlineKeyboardMarkup {
+  const interactionId = opts?.interactionId;
+  const numerals = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+  const rows: InlineKeyboardButton[][] = [];
+  const choiceRow: InlineKeyboardButton[] = [];
+  const shown = Math.min(labels.length, VIEW_ACTIONS.length);
+  for (let index = 0; index < shown; index += 1) {
+    const label = labels[index];
+    const action = VIEW_ACTIONS[index];
+    if (label === undefined || action === undefined) {
+      continue;
+    }
+    choiceRow.push(ownedButton(`${numerals[index] ?? '•'} ${label}`, action, interactionId));
+    if (choiceRow.length === 2) {
+      rows.push(choiceRow.splice(0, 2));
+    }
+  }
+  if (choiceRow.length > 0) {
+    rows.push(choiceRow.splice(0, 2));
+  }
+  rows.push([backButton(interactionId)]);
+  return { inline_keyboard: rows };
+}
+
 /** Draft actions: Confirmar / Corregir / Cancelar + ←Volver to Home. */
-export function draftKeyboard(interactionId?: string): InlineKeyboardMarkup {
-  return {
+export function draftKeyboard(interactionId?: string): InlineKeyboardMarkup {  return {
     inline_keyboard: [
       [
         ownedButton('✅Confirmar', 'confirm', interactionId),
