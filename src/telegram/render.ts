@@ -609,3 +609,170 @@ export function renderCredentialNoContext(): string {
     'Escribe un teléfono, nombre o cuenta para buscar.',
   );
 }
+
+// ---------------------------------------------------------------------------
+// NewSale cards (Slice A — proposal only, NEVER credentials).
+// ---------------------------------------------------------------------------
+
+/** Human modality label — fixed strings, never raw PERFIL values. */
+export function saleModalityLabel(modality: string): string {
+  switch (modality) {
+    case 'netflix-profile':
+      return 'Netflix · Perfil';
+    case 'flujotv-shared':
+      return 'FlujoTV · Compartida';
+    case 'flujotv-complete':
+      return 'FlujoTV · Completa / Exclusiva';
+    default:
+      return modality;
+  }
+}
+
+/** NewSale summary input: plain data, zero secrets by construction. */
+export interface RenderedNewSaleSummary {
+  /** Existing client name, or proposed name when new. */
+  customerName: string;
+  /** Operational phone as given. */
+  phone: string;
+  /** True when the customer is proposed (created only at confirm). */
+  isNewCustomer: boolean;
+  modality: 'netflix-profile' | 'flujotv-shared' | 'flujotv-complete' | string;
+  requestedMonths: number;
+  grantedMonths: number;
+  /** `serviceAccountId · perfil` proposal line — never credentials. */
+  assignment?: string;
+  emergencyPending?: boolean;
+  suggestedAmount: number | null;
+  suggestedCurrency?: string;
+  actualAmount: number | null;
+  currency: string | null;
+  methodLabel: string | null;
+  receivedBy: string | null;
+  reference?: string;
+  pricePolicy?: string;
+}
+
+/**
+ * Single-card sale summary (Slice A): everything the operator stated +
+ * the inventory proposal + suggested-vs-real money. NEVER password/PIN:
+ * the input type carries no credential field, so the card cannot leak
+ * one (pre-confirm secrecy — Slice B confirms before any access data).
+ */
+export function renderNewSaleSummary(input: RenderedNewSaleSummary): string {
+  const lines: string[] = [
+    title('🧾 VENTA NUEVA — BORRADOR'),
+    '',
+    field('Cliente', input.isNewCustomer ? `${input.customerName} (nuevo)` : input.customerName),
+    field('Teléfono', input.phone),
+    field('Servicio', saleModalityLabel(input.modality)),
+    field(
+      'Duración',
+      input.requestedMonths === input.grantedMonths
+        ? `${input.grantedMonths} mes(es)`
+        : `solicitado ${input.requestedMonths} / otorgado ${input.grantedMonths}`,
+    ),
+  ];
+  if (input.assignment !== undefined && input.assignment !== '') {
+    lines.push(field('Asigna', input.assignment));
+  }
+  if (input.emergencyPending === true) {
+    lines.push('⚠️ Inventario de emergencia — falta autorización explícita.');
+  }
+  if (input.suggestedAmount !== null) {
+    const currency = input.suggestedCurrency ?? input.currency ?? '';
+    lines.push(field('Sugerido', `${input.suggestedAmount} ${currency}`.trim()));
+  }
+  if (input.actualAmount !== null) {
+    lines.push(field('Recibido', `${input.actualAmount} ${input.currency ?? ''}`.trim()));
+  }
+  if (input.methodLabel !== null) {
+    lines.push(field('Método', input.methodLabel));
+  }
+  if (input.receivedBy !== null) {
+    lines.push(field('Recibido por', input.receivedBy));
+  }
+  if (input.reference !== undefined && input.reference !== '') {
+    lines.push(field('Referencia', input.reference));
+  }
+  if (input.pricePolicy !== undefined && input.pricePolicy !== '') {
+    lines.push(field('Política', input.pricePolicy));
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Emergency inventory card (BR-NFX-005): explicit ⚠️ warning, separate
+ * from sale confirmation. Shown ONLY when no commercial slot is free;
+ * Slice B attaches [Usar emergencia][Cancelar] to this same card.
+ */
+export function renderEmergencyInventoryCard(input: { identifier: string; perfil: string }): string {
+  return (
+    `${title('⚠️ INVENTARIO DE EMERGENCIA')}\n\n` +
+    `${esc('No queda inventario comercial. Solo hay un perfil de emergencia disponible:')}\n` +
+    `${field('Cuenta', input.identifier)}\n` +
+    `${field('Perfil', input.perfil)}\n\n` +
+    `${esc('Usarlo requiere tu autorización explícita.')}`
+  );
+}
+
+/**
+ * New-customer prompt INSIDE the sale (BR-CUS-009): phone unknown →
+ * complete the sale collecting name+phone (location only if the model
+ * supports it — never blocking). No persistence happens here.
+ */
+export function renderNewCustomerSalePrompt(phone: string): string {
+  return notFound(
+    '🧾 VENTA NUEVA',
+    `No encuentro cliente para ${phone}. Completemos la venta: envía el nombre del cliente para este número.`,
+    'Envía el nombre, o Volver para buscar otro número.',
+  );
+}
+
+/** No-inventory report (BR-SAL-010): inform only, never create anything. */
+export function renderSaleNoInventory(): string {
+  return notFound(
+    '🧾 VENTA NUEVA',
+    'No hay inventario disponible.',
+    'Puedes revisar inventario, volver o cancelar.',
+  );
+}
+
+/** Split-payment refusal (BR-PAY-008 pending): one method per operation. */
+export function renderSaleSplitRefused(): string {
+  return (
+    `${title('🧾 VENTA NUEVA')}\n\n` +
+    `${esc('Por ahora cada venta usa un solo método de pago.')}\n` +
+    `${esc('Dime cuál usamos: Pago Móvil, Zelle o Binance.')}`
+  );
+}
+
+/** Netflix completa report (BR-NFX-007 pending): not sold in Slice A. */
+export function renderSaleUnsupportedNetflixComplete(): string {
+  return (
+    `${title('🧾 VENTA NUEVA')}\n\n` +
+    `${esc('La cuenta completa de Netflix aún no está definida (precio y reglas pendientes).')}\n` +
+    `${esc('Puedo venderte un perfil de Netflix, o FlujoTV compartida/completa.')}`
+  );
+}
+
+/** Ask-only-missing line for one sale field (BR-SAL-003, BR-UX-001). */
+export function renderSaleAskMissing(fieldName: string): string {
+  switch (fieldName) {
+    case 'service':
+      return '🧾 ¿Qué servicio vendemos: Netflix o FlujoTV?';
+    case 'modality':
+      return '🧾 ¿Modalidad de FlujoTV: compartida o completa?';
+    case 'customer':
+      return '🧾 ¿A qué teléfono va la venta? Envía el número.';
+    case 'months':
+      return '🧾 ¿Por cuántos meses? (ej. «2 meses»).';
+    case 'method':
+      return '🧾 ¿Método de pago: Pago Móvil, Zelle o Binance?';
+    case 'amount':
+      return '🧾 ¿Cuánto se recibió? (ej. «recibí 5 USDT»).';
+    case 'receiver':
+      return '🧾 ¿Quién recibió el dinero: Gabriel o Edward?';
+    default:
+      return '🧾 Falta un dato para completar la venta.';
+  }
+}

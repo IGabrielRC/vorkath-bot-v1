@@ -89,6 +89,13 @@ const envSchema = z.object({
   DRAFTS_STATE_PATH: z.string().min(1).default('/data/drafts-state.json'),
   INTERACTIONS_STATE_PATH: z.string().min(1).default('/data/interactions-state.json'),
   /**
+   * Cash-holder display names (RECIBIDO_POR custodians). OPTIONAL CSV —
+   * empty/missing falls back to the documented Gabriel/Edward pair
+   * (see `sale/payments.ts` `resolveCashHolders`). Never the operator
+   * allowlist: holders ≠ operators by design.
+   */
+  CASH_HOLDERS: z.string().default(''),
+  /**
    * OperatorProfile snapshot. Defaults to /data so EasyPanel persists
    * profiles across redeploys with no new variable.
    */

@@ -1,0 +1,331 @@
+/**
+ * NewSaleDraft entity + per-operator store (Slice A — draft & proposal).
+ *
+ * This is NOT the generic demo draft (`drafts/engine.ts`, months-only):
+ * it is the NEW_SALE operation draft (BR-SAL-001) carrying service,
+ * modality, customer, duration, inventory proposal, price/cost snapshots
+ * and payment. Slice A builds and corrects the draft; confirmation
+ * EXECUTION belongs to Slice B — `confirm()` here refuses explicitly and
+ * performs zero side-effects.
+ *
+ * Invariants:
+ * - NO credentials/password/PIN ever enter the draft payload
+ *   (BR-AUD-005; summary renderer asserts the same).
+ * - NO expiry: drafts persist until explicit CONFIRM or CANCEL
+ *   (BR-OPS-001/002). No TTL field exists anywhere in this module.
+ * - One critical draft per operator: creating while one is open
+ *   RECOVERS it, never silently replaces it (existing engine policy).
+ * - New customers live as `proposedCustomer` inside the draft; NOTHING
+ *   persists before confirm — cancel/no-inventory leaves nothing
+ *   (BR-SAL-009/010). The store holds drafts only; there is no customer
+ *   write path in this module at all.
+ * - Service/modality switch INVALIDATES the proposal + snapshots
+ *   (recalculate, never reuse a stale slot/price).
+ */
+
+import { randomBytes } from 'node:crypto';
+import type { PaymentCurrency, PaymentMethod } from './payments';
+import type { CostSnapshot, PriceSnapshot, SaleModality } from './pricePolicy';
+import type { InventoryEvidence, InventoryProposal } from './inventory';
+
+export type NewSaleStatus = 'DRAFT' | 'CANCELLED';
+
+export interface DraftOwner {
+  chatId: number;
+  userId: number;
+  name?: string;
+}
+
+/** New customer collected INSIDE the sale only (BR-CUS-009). */
+export interface ProposedCustomer {
+  name: string;
+  phone: string;
+  location?: string;
+}
+
+export interface NewSaleCustomer {
+  existingCustomerId?: string;
+  proposedCustomer?: ProposedCustomer;
+}
+
+export type SaleService = 'netflix' | 'flujotv';
+
+export interface SaleDuration {
+  /** Null until the operator states months (ask-only-missing, BR-SAL-003). */
+  requestedMonths: number | null;
+  grantedMonths: number | null;
+}
+
+export interface ProposedAssignment {
+  serviceAccountId: string;
+  slotId: string;
+  evidence: InventoryEvidence;
+  /** Emergency slots travel unauthorized until an explicit auth action. */
+  emergencyRequired: boolean;
+  emergencyAuthorized: boolean;
+}
+
+export interface SalePayment {
+  actualAmount: number | null;
+  currency: PaymentCurrency | null;
+  method: PaymentMethod | null;
+  /** Explicit holder only — never defaulted from the operator. */
+  receivedBy: string | null;
+  reference?: string;
+}
+
+export interface NewSaleDraft {
+  operationId: string;
+  kind: 'NEW_SALE';
+  owner: DraftOwner;
+  customer: NewSaleCustomer;
+  /** Operational phone as given (raw); identity matching stays in phone.ts. */
+  phone: string | null;
+  service: SaleService | null;
+  modality: SaleModality | null;
+  duration: SaleDuration;
+  proposal: ProposedAssignment | null;
+  /** `emergency-auth-required` proposals wait for explicit auth (Slice B UI). */
+  proposalAwaitingEmergencyAuth: boolean;
+  price: PriceSnapshot | null;
+  cost: CostSnapshot | null;
+  payment: SalePayment;
+  /** Operator display name derived from the session — never asked. */
+  operator: string;
+  status: NewSaleStatus;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Slice A confirm refusal: the button/path may exist, execution must not. */
+export const SALE_CONFIRM_REFUSED_TEXT =
+  '⏳ La confirmación de ventas se habilita en el siguiente paso (Slice B). El borrador sigue abierto.';
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+export function newOperationId(): string {
+  return `ns-${randomBytes(4).toString('hex')}`;
+}
+
+function keyOf(owner: DraftOwner): string {
+  return `${owner.chatId}:${owner.userId}`;
+}
+
+export function createNewSaleDraft(owner: DraftOwner, operator: string): NewSaleDraft {
+  const stamp = now();
+  return {
+    operationId: newOperationId(),
+    kind: 'NEW_SALE',
+    owner: { ...owner },
+    customer: {},
+    phone: null,
+    service: null,
+    modality: null,
+    duration: { requestedMonths: null, grantedMonths: null },
+    proposal: null,
+    proposalAwaitingEmergencyAuth: false,
+    price: null,
+    cost: null,
+    payment: { actualAmount: null, currency: null, method: null, receivedBy: null },
+    operator,
+    status: 'DRAFT',
+    version: 1,
+    createdAt: stamp,
+    updatedAt: stamp,
+  };
+}
+
+export interface SalePatch {
+  service?: SaleService | null;
+  modality?: SaleModality | null;
+  requestedMonths?: number;
+  phone?: string | null;
+  existingCustomerId?: string | null;
+  proposedCustomer?: ProposedCustomer | null;
+  actualAmount?: number | null;
+  currency?: PaymentCurrency | null;
+  method?: PaymentMethod | null;
+  receivedBy?: string | null;
+  reference?: string | null;
+}
+
+export interface PatchOutcome {
+  draft: NewSaleDraft;
+  /** True when service/modality changed → proposal + snapshots cleared. */
+  proposalInvalidated: boolean;
+}
+
+/**
+ * Conversational correction (BR-OPS-006): patches the SAME draft,
+ * bumps version, clears the proposal + price/cost snapshots when the
+ * service or modality changed. Snapshot recomputation + inventory
+ * reselection run in the tool layer after this pure patch.
+ */
+export function applySalePatch(draft: NewSaleDraft, patch: SalePatch): PatchOutcome {
+  const serviceChanged = patch.service !== undefined && patch.service !== draft.service;
+  const modalityChanged = patch.modality !== undefined && patch.modality !== draft.modality;
+  const proposalInvalidated = serviceChanged || modalityChanged;
+  const customer: NewSaleCustomer = {};
+  if (patch.existingCustomerId !== undefined) {
+    if (patch.existingCustomerId !== null) {
+      customer.existingCustomerId = patch.existingCustomerId;
+    }
+  } else if (draft.customer.existingCustomerId !== undefined) {
+    customer.existingCustomerId = draft.customer.existingCustomerId;
+  }
+  if (patch.proposedCustomer !== undefined) {
+    if (patch.proposedCustomer !== null) {
+      customer.proposedCustomer = patch.proposedCustomer;
+    }
+  } else if (draft.customer.proposedCustomer !== undefined) {
+    customer.proposedCustomer = draft.customer.proposedCustomer;
+  }
+  const next: NewSaleDraft = {
+    ...draft,
+    ...(patch.service !== undefined ? { service: patch.service } : {}),
+    ...(patch.modality !== undefined ? { modality: patch.modality } : {}),
+    ...(patch.requestedMonths !== undefined
+      ? {
+          duration: { requestedMonths: patch.requestedMonths, grantedMonths: patch.requestedMonths },
+        }
+      : {}),
+    ...(patch.phone !== undefined ? { phone: patch.phone } : {}),
+    customer,
+    payment: {
+      actualAmount: patch.actualAmount !== undefined ? patch.actualAmount : draft.payment.actualAmount,
+      currency: patch.currency !== undefined ? patch.currency : draft.payment.currency,
+      method: patch.method !== undefined ? patch.method : draft.payment.method,
+      receivedBy: patch.receivedBy !== undefined ? patch.receivedBy : draft.payment.receivedBy,
+      ...(patch.reference !== undefined
+        ? patch.reference === null
+          ? {}
+          : { reference: patch.reference }
+        : draft.payment.reference !== undefined
+          ? { reference: draft.payment.reference }
+          : {}),
+    },
+    ...(proposalInvalidated
+      ? {
+          proposal: null,
+          proposalAwaitingEmergencyAuth: false,
+          price: null,
+          cost: null,
+        }
+      : {}),
+    version: draft.version + 1,
+    updatedAt: now(),
+  };
+  return { draft: next, proposalInvalidated };
+}
+
+/** Attaches a fresh inventory proposal (+ snapshots set by the caller). */
+export function attachProposal(
+  draft: NewSaleDraft,
+  proposal: InventoryProposal,
+  snapshots: { price: PriceSnapshot; cost: CostSnapshot } | null,
+): NewSaleDraft {
+  if (proposal.kind === 'none') {
+    return {
+      ...draft,
+      proposal: null,
+      proposalAwaitingEmergencyAuth: false,
+      price: null,
+      cost: null,
+      version: draft.version + 1,
+      updatedAt: now(),
+    };
+  }
+  const emergencyRequired = proposal.kind === 'emergency-auth-required';
+  return {
+    ...draft,
+    proposal: {
+      serviceAccountId: proposal.candidate.serviceAccountId,
+      slotId: proposal.candidate.slotId,
+      evidence: proposal.evidence,
+      emergencyRequired,
+      emergencyAuthorized: false,
+    },
+    proposalAwaitingEmergencyAuth: emergencyRequired,
+    ...(snapshots === null ? { price: null, cost: null } : { price: snapshots.price, cost: snapshots.cost }),
+    version: draft.version + 1,
+    updatedAt: now(),
+  };
+}
+
+/** Explicit emergency authorization (separate from sale confirmation). */
+export function authorizeEmergency(draft: NewSaleDraft): NewSaleDraft | undefined {
+  if (draft.proposal === null || !draft.proposal.emergencyRequired) {
+    return undefined;
+  }
+  return {
+    ...draft,
+    proposal: { ...draft.proposal, emergencyAuthorized: true },
+    proposalAwaitingEmergencyAuth: false,
+    version: draft.version + 1,
+    updatedAt: now(),
+  };
+}
+
+export interface SaleConfirmRefusal {
+  ok: false;
+  text: string;
+}
+
+/**
+ * One open NEW_SALE draft per operator. `create` recovers the open
+ * draft (never silently replaces); drafts never expire; `cancel`
+ * REMOVES the draft so nothing persists (BR-SAL-010); `confirm`
+ * REFUSES in Slice A (Slice B executes atomically).
+ */
+export class NewSaleDraftStore {
+  private readonly drafts = new Map<string, NewSaleDraft>();
+
+  create(owner: DraftOwner, operator: string): { draft: NewSaleDraft; resumed: boolean } {
+    const key = keyOf(owner);
+    const existing = this.drafts.get(key);
+    if (existing !== undefined && existing.status === 'DRAFT') {
+      return { draft: existing, resumed: true };
+    }
+    const draft = createNewSaleDraft(owner, operator);
+    this.drafts.set(key, draft);
+    return { draft, resumed: false };
+  }
+
+  get(owner: DraftOwner): NewSaleDraft | undefined {
+    const found = this.drafts.get(keyOf(owner));
+    return found !== undefined && found.status === 'DRAFT' ? found : undefined;
+  }
+
+  save(draft: NewSaleDraft): void {
+    if (draft.status !== 'DRAFT') {
+      return;
+    }
+    this.drafts.set(keyOf(draft.owner), draft);
+  }
+
+  /** Explicit cancel: the draft is dropped — no customer, no reservation. */
+  cancel(owner: DraftOwner): boolean {
+    return this.drafts.delete(keyOf(owner));
+  }
+
+  /** Slice A: confirm exists as a path but never executes (Slice B). */
+  confirm(_owner: DraftOwner): SaleConfirmRefusal {
+    return { ok: false, text: SALE_CONFIRM_REFUSED_TEXT };
+  }
+
+  snapshot(): NewSaleDraft[] {
+    return [...this.drafts.values()];
+  }
+
+  restore(drafts: NewSaleDraft[]): void {
+    this.drafts.clear();
+    for (const draft of drafts) {
+      if (draft.kind === 'NEW_SALE' && draft.status === 'DRAFT') {
+        this.drafts.set(keyOf(draft.owner), { ...draft });
+      }
+    }
+  }
+}
