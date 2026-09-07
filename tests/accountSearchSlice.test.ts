@@ -808,7 +808,9 @@ describe('slice B: account multioperator (41–47)', () => {
       throw new Error('Volver button missing');
     }
     await world.post(acctCallback(world.nextUpdateId(), GABRIEL, volver));
-    expect(world.client.texts().at(-1)).toContain('🏠 Vokath');
+    // Volver pops the nav stack to SEARCH_INPUT (buscar wizard) — Home is
+    // explicit-only, never a fallback. The open draft still survives.
+    expect(world.client.texts().at(-1)).toContain('🔎 BUSCAR');
     expect(world.drafts.get({ chatId: GROUP_CHAT_ID, userId: GABRIEL })?.status).toBe('open');
     await world.app.close();
   });
@@ -852,7 +854,7 @@ describe('slice B: account multioperator (41–47)', () => {
     await world.app.close();
   });
 
-  it('(47) Volver from a single card lands Home — drafts and context survive', async () => {
+  it('(47) Volver from a single card pops to SEARCH_INPUT — drafts and context survive', async () => {
     const world = await createAccountWorld();
     await world.post(acctMessage(world.nextUpdateId(), GABRIEL, 'busca maxnet050'));
     expect(world.client.texts().at(-1)).toContain('Jackson Amaya');
@@ -861,7 +863,9 @@ describe('slice B: account multioperator (41–47)', () => {
       throw new Error('Volver button missing');
     }
     await world.post(acctCallback(world.nextUpdateId(), GABRIEL, volver));
-    expect(world.client.texts().at(-1)).toContain('🏠 Vokath');
+    // Nav-stack pop: exact previous view (SEARCH_INPUT wizard), never Home.
+    expect(world.client.texts().at(-1)).toContain('🔎 BUSCAR');
+    expect(world.client.texts().at(-1)).not.toContain('🏠 Vokath');
     // The SEARCH interaction kept its query: a later "esa misma" still
     // resolves the actor's own searched account.
     await world.post(

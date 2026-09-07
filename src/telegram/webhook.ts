@@ -974,6 +974,110 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
 
     /**
+     * Per-interaction navigation stack (presentation/navigation only).
+     *
+     * Each SEARCH interaction owns an ordered history of semantic views:
+     * HOME (explicit root only) · SEARCH_INPUT (`prompt`) · SEARCH_RESULTS
+     * (`list`/`customer-list`/`account-list`) · CUSTOMER_CARD
+     * (`customer-detail`) · ACCOUNT_CARD (`account-detail`/`detail`) ·
+     * ASSIGNMENT_SELECTOR (`credentials-list`/`whatsapp-list`) ·
+     * CREDENTIAL_CARD (`credentials-detail`/`whatsapp-detail`) ·
+     * PHONE_SELECTOR (`whatsapp-phones`).
+     *
+     * Volver pops the stack and re-renders the exact previous view of the
+     * SAME interaction (same card edit when the tap came from a callback);
+     * Home is NEVER a fallback — it only fires on the explicit `home`
+     * action or from the root SEARCH_INPUT. Stale callbacks ack without
+     * touching the stack; per-actor isolation comes free because the stack
+     * lives inside the owned interaction (chat+thread+actor+interactionId).
+     * External pending drafts are never touched by navigation.
+     */
+    interface NavEntry {
+      view: string;
+      snap: Record<string, unknown>;
+    }
+    const NAV_KEY = 'nav';
+    const NAV_LIMIT = 20;
+    const SNAP_KEYS = [
+      'query',
+      'offset',
+      'total',
+      'selectedCustomer',
+      'selectedAccount',
+      'selectedIndex',
+      'customerId',
+      'accountId',
+      'serviceFilter',
+      'explicitIdentifier',
+      'assignmentKeys',
+      'selectedAssignmentKey',
+      'phones',
+      'optionIndex',
+      'whatsapp',
+    ];
+    function navEntriesOf(interaction: Interaction): NavEntry[] {
+      const raw = interaction.state[NAV_KEY];
+      if (!Array.isArray(raw)) {
+        return [];
+      }
+      return (raw as unknown[]).filter(
+        (entry): entry is NavEntry =>
+          typeof entry === 'object' &&
+          entry !== null &&
+          typeof (entry as { view?: unknown }).view === 'string',
+      );
+    }
+    function snapOf(state: Record<string, unknown>): Record<string, unknown> {
+      const out: Record<string, unknown> = {};
+      for (const key of SNAP_KEYS) {
+        if (state[key] !== undefined) {
+          out[key] = state[key];
+        }
+      }
+      return out;
+    }
+    /**
+     * Records a forward transition: pushes the current view (when it
+     * differs) then stores the next view. Same-view re-renders never push,
+     * so restores and idempotent repeats keep the stack stable.
+     */
+    function transitionTo(
+      interaction: Interaction,
+      nextView: string,
+      patch: Record<string, unknown> = {},
+    ): Interaction {
+      const current =
+        typeof interaction.state['view'] === 'string'
+          ? (interaction.state['view'] as string)
+          : undefined;
+      const nav = navEntriesOf(interaction);
+      let nextNav = nav;
+      if (current !== undefined && current !== nextView) {
+        nextNav = [...nav, { view: current, snap: snapOf(interaction.state) }];
+        if (nextNav.length > NAV_LIMIT) {
+          nextNav = nextNav.slice(nextNav.length - NAV_LIMIT);
+        }
+      }
+      const updated = deps.interactions.touch(interaction.id, {
+        ...patch,
+        view: nextView,
+        [NAV_KEY]: nextNav,
+      });
+      return updated ?? interaction;
+    }
+    /** Seeds the SEARCH_INPUT parent on a freshly created interaction. */
+    function seedNavParent(interaction: Interaction): Interaction {
+      const nav = navEntriesOf(interaction);
+      if (nav.length > 0) {
+        return interaction;
+      }
+      const updated = deps.interactions.touch(interaction.id, {
+        [NAV_KEY]: [{ view: 'prompt', snap: {} }],
+      });
+      return updated ?? interaction;
+    }
+
+    /**
      * Labeled send-or-edit: every interactive message shows its operator.
      * Fresh messages return to the origin topic through the centralized
      * context; `threadOverride` (the owning interaction's stored thread)
@@ -1120,18 +1224,20 @@ export function createWebhookHandler(deps: WebhookDeps) {
      */
     async function runDirectSearch(identifier: string, serviceBrowse = false): Promise<void> {
       // Per-requester search interaction: result buttons reject the peer;
-      // the peer starts their own search. Both coexist.
+      // the peer starts their own search. Both coexist. The SEARCH_INPUT
+      // (`prompt`) is seeded as the Volver parent so results never fall
+      // back to Home — Volver returns to the wizard, Home stays explicit.
       if (!serviceBrowse && containsPhoneCandidate(identifier)) {
-        const interaction = createInteraction('SEARCH', { view: 'customer-list', offset: 0 });
+        const interaction = seedNavParent(createInteraction('SEARCH', { offset: 0 }));
         await renderCustomerSearch(interaction, identifier);
         return;
       }
       if (!serviceBrowse) {
-        const interaction = createInteraction('SEARCH', { view: 'account-list', offset: 0 });
+        const interaction = seedNavParent(createInteraction('SEARCH', { offset: 0 }));
         await renderAccountSearch(interaction, identifier);
         return;
       }
-      const interaction = createInteraction('SEARCH', { view: 'list', offset: 0 });
+      const interaction = seedNavParent(createInteraction('SEARCH', { offset: 0 }));
       await renderSearchPage(interaction, identifier);
     }
 
@@ -1161,7 +1267,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const accounts = await deps.repos.searchServiceAccounts(query);
       const total = accounts.length;
       if (total === 0) {
-        deps.interactions.touch(interaction.id, { query, offset: 0, view: 'account-list' });
+        transitionTo(interaction, 'account-list', { query, offset: 0 });
         persistAll();
         await sendLabeled(
           ACCOUNT_NOT_FOUND_TEXT,
@@ -1173,14 +1279,14 @@ export function createWebhookHandler(deps: WebhookDeps) {
       if (total === 1) {
         const only = accounts[0] as ServiceAccount;
         rememberAccountSelection(only);
-        deps.interactions.touch(interaction.id, {
+        transitionTo(interaction, 'account-detail', {
           query,
-          view: 'account-detail',
           selectedAccount: {
             id: only.id,
             servicio: only.servicio,
             identifier: only.identifier,
           },
+          selectedIndex: 0,
         });
         persistAll();
         await sendLabeled(
@@ -1196,10 +1302,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
           : 0;
       const safeOffset = Math.min(Math.max(offset, 0), Math.max(total - 1, 0));
       const page = accounts.slice(safeOffset, safeOffset + SEARCH_PAGE_SIZE);
-      deps.interactions.touch(interaction.id, {
+      transitionTo(interaction, 'account-list', {
         query,
         offset: safeOffset,
-        view: 'account-list',
         total,
       });
       persistAll();
@@ -1226,14 +1331,14 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return;
       }
       rememberAccountSelection(account);
-      deps.interactions.touch(interaction.id, {
+      transitionTo(interaction, 'account-detail', {
         query,
-        view: 'account-detail',
         selectedAccount: {
           id: account.id,
           servicio: account.servicio,
           identifier: account.identifier,
         },
+        selectedIndex: accountIndex,
       });
       persistAll();
       await sendLabeled(
@@ -1253,7 +1358,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const customers = await deps.repos.searchCustomersByPhone(query);
       const total = customers.length;
       if (total === 0) {
-        deps.interactions.touch(interaction.id, { query, offset: 0, view: 'customer-list' });
+        transitionTo(interaction, 'customer-list', { query, offset: 0 });
         persistAll();
         await sendLabeled(
           PHONE_NOT_FOUND_TEXT,
@@ -1265,10 +1370,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
       if (total === 1) {
         const only = customers[0] as Customer;
         rememberCustomerSelection(only);
-        deps.interactions.touch(interaction.id, {
+        transitionTo(interaction, 'customer-detail', {
           query,
-          view: 'customer-detail',
           selectedCustomer: { id: only.id, nombre: only.nombre },
+          selectedIndex: 0,
         });
         persistAll();
         await sendLabeled(
@@ -1284,10 +1389,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
           : 0;
       const safeOffset = Math.min(Math.max(offset, 0), Math.max(total - 1, 0));
       const page = customers.slice(safeOffset, safeOffset + SEARCH_PAGE_SIZE);
-      deps.interactions.touch(interaction.id, {
+      transitionTo(interaction, 'customer-list', {
         query,
         offset: safeOffset,
-        view: 'customer-list',
         total,
       });
       persistAll();
@@ -1319,10 +1423,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return;
       }
       rememberCustomerSelection(customer);
-      deps.interactions.touch(interaction.id, {
+      transitionTo(interaction, 'customer-detail', {
         query,
-        view: 'customer-detail',
         selectedCustomer: { id: customer.id, nombre: customer.nombre },
+        selectedIndex: customerIndex,
       });
       persistAll();
       await sendLabeled(
@@ -1649,7 +1753,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
           },
         });
       }
-      deps.interactions.touch(interaction.id, { ...refs, view: 'credentials-detail' });
+      transitionTo(interaction, 'credentials-detail', {
+        ...refs,
+        selectedAssignmentKey: credentialAssignmentKey(bundle),
+      });
       persistAll();
       auditor.record({
         chatId: targetChatId,
@@ -1699,10 +1806,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
       viaWhatsApp = false,
     ): Promise<void> {
       const labels = credentialOptionLabels(options);
-      deps.interactions.touch(interaction.id, {
+      transitionTo(interaction, viaWhatsApp ? 'whatsapp-list' : 'credentials-list', {
         ...refs,
         total: options.length,
-        view: 'credentials-list',
         assignmentKeys: options.map((option) => credentialAssignmentKey(option)),
         ...(viaWhatsApp ? { whatsapp: true } : {}),
       });
@@ -1739,10 +1845,48 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
 
     /**
+     * Newest owned SEARCH interaction carrying a credential selection —
+     * the reuse target for bare NL repeats (`dame los datos` with no new
+     * identifier), so the datos card chains onto the client/account card
+     * (same interaction, same-card edits, Volver-safe) instead of opening
+     * a disconnected interaction. Explicit identifiers always open fresh.
+     */
+    function newestOwnSearchInteraction(): Interaction | undefined {
+      let best: Interaction | undefined;
+      for (const candidate of deps.interactions.snapshot()) {
+        if (
+          candidate.chatId !== targetChatId ||
+          candidate.ownerTelegramUserId !== targetActorId ||
+          candidate.type !== 'SEARCH' ||
+          candidate.status !== 'PENDING'
+        ) {
+          continue;
+        }
+        if (
+          targetThreadId !== undefined &&
+          candidate.messageThreadId !== undefined &&
+          candidate.messageThreadId !== targetThreadId
+        ) {
+          continue;
+        }
+        const selection = readCredentialSelection(candidate);
+        if (selection.customer === undefined && selection.account === undefined) {
+          continue;
+        }
+        if (best === undefined || candidate.updatedAt >= best.updatedAt) {
+          best = candidate;
+        }
+      }
+      return best;
+    }
+
+    /**
      * SHOW_CREDENTIALS explicit entry: explicit current-message
      * identifier → interaction selection → prior operator context →
      * ask-missing. Repeats are idempotent (same identifier/context →
-     * same logical card, never draft/Home/stale/UNKNOWN).
+     * same logical card, never draft/Home/stale/UNKNOWN). Single-card:
+     * a button tap reuses its OWN interaction (Volver chain + same-card
+     * edits survive); only fresh NL creates a new interaction.
      */
     async function runCredentialsFlow(
       origin: Interaction | undefined,
@@ -1751,7 +1895,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
     ): Promise<void> {
       const identifier = explicitIdentifier ?? extractIdentifierFromText();
       if (identifier !== undefined) {
-        await runExplicitCredentialsFlow(identifier, serviceFilter, false);
+        await runExplicitCredentialsFlow(identifier, serviceFilter, false, origin);
         return;
       }
       const fromOrigin = readCredentialSelection(origin);
@@ -1770,7 +1914,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
         );
         return;
       }
-      const interaction = createInteraction('SEARCH', { view: 'credentials-list', offset: 0 });
+      const reuse = origin ?? newestOwnSearchInteraction();
+      const interaction =
+        reuse !== undefined
+          ? deps.interactions.get(reuse.id) ?? reuse
+          : seedNavParent(createInteraction('SEARCH', { offset: 0 }));
       let view = resolveCredentialView(bundles, serviceFilter);
       if (view.kind === 'none' && serviceFilter !== undefined) {
         view = resolveCredentialView(bundles, undefined);
@@ -1800,12 +1948,17 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * An explicit identifier matching nothing answers the honest
      * no-context guide — never a stale card, never Home, never UNKNOWN.
      * Unambiguous resolutions mirror into the interaction state so they
-     * become the new operator context.
+     * become the new operator context. Fastest path: an unambiguous
+     * identifier renders the credential card DIRECTLY (no prior card,
+     * no selector) with automatic WhatsApp; multi-assignment renders the
+     * assignment selector FIRST (per-assignment direct buttons, stable
+     * keys, numbering UX-only — never a generic Datos step).
      */
     async function runExplicitCredentialsFlow(
       identifier: string,
       serviceFilter: MockService | undefined,
       viaWhatsApp: boolean,
+      reuse?: Interaction,
     ): Promise<void> {
       const explicit = await bundlesForExplicitIdentifier(identifier);
       if (explicit === null || explicit.bundles.length === 0) {
@@ -1829,10 +1982,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
           identifier: explicit.account.identifier,
         };
       }
-      const interaction = createInteraction('SEARCH', {
-        view: viaWhatsApp ? 'whatsapp-list' : 'credentials-list',
-        offset: 0,
-      });
+      const interaction =
+        reuse !== undefined
+          ? deps.interactions.get(reuse.id) ?? reuse
+          : seedNavParent(createInteraction('SEARCH', { offset: 0 }));
       let view = resolveCredentialView(explicit.bundles, serviceFilter);
       if (view.kind === 'none' && serviceFilter !== undefined) {
         view = resolveCredentialView(explicit.bundles, undefined);
@@ -2054,7 +2207,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
         }
         const text = renderCredentialWhatsAppText(delivered);
         const url = buildWhatsAppUrl(target.identity, text);
-        deps.interactions.touch(interaction.id, { ...refs, view: 'whatsapp-detail' });
+        transitionTo(interaction, 'whatsapp-detail', {
+          ...refs,
+          selectedAssignmentKey: credentialAssignmentKey(bundle),
+        });
         persistAll();
         auditor.record({
           chatId: targetChatId,
@@ -2092,7 +2248,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
       }
       if (target.kind === 'ask') {
         const phones = target.options.map((option) => option.raw);
-        deps.interactions.touch(interaction.id, { ...refs, view: 'whatsapp-phones', phones });
+        transitionTo(interaction, 'whatsapp-phones', {
+          ...refs,
+          phones,
+          selectedAssignmentKey: credentialAssignmentKey(bundle),
+        });
         persistAll();
         logger.info(
           { userId: targetActorId, chatId: targetChatId, updateId, action: 'whatsapp-ask' },
@@ -2105,7 +2265,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         );
         return;
       }
-      deps.interactions.touch(interaction.id, { ...refs, view: 'whatsapp-nolink' });
+      transitionTo(interaction, 'whatsapp-nolink', { ...refs });
       persistAll();
       logger.info(
         { userId: targetActorId, chatId: targetChatId, updateId, action: 'whatsapp-nolink' },
@@ -2141,7 +2301,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
     ): Promise<void> {
       const identifier = explicitIdentifier ?? extractIdentifierFromText();
       if (identifier !== undefined) {
-        await runExplicitCredentialsFlow(identifier, serviceFilter, true);
+        await runExplicitCredentialsFlow(identifier, serviceFilter, true, origin);
         return;
       }
       const fromOrigin = readCredentialSelection(origin);
@@ -2160,7 +2320,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
         );
         return;
       }
-      const interaction = createInteraction('SEARCH', { view: 'whatsapp-list', offset: 0 });
+      const reuse = origin ?? newestOwnSearchInteraction();
+      const interaction =
+        reuse !== undefined
+          ? deps.interactions.get(reuse.id) ?? reuse
+          : seedNavParent(createInteraction('SEARCH', { offset: 0 }));
       let view = resolveCredentialView(bundles, serviceFilter);
       if (view.kind === 'none' && serviceFilter !== undefined) {
         view = resolveCredentialView(bundles, undefined);
@@ -2342,7 +2506,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         // Not-found: report + offer retry/volver. NEVER offer "Crear
         // cliente" here — creation belongs exclusively to the explicit
         // new-sale flow.
-        deps.interactions.touch(interaction.id, { query, offset: 0, view: 'list' });
+        transitionTo(interaction, 'list', { query, offset: 0 });
         persistAll();
         await sendLabeled(
           renderLegacyNotFound(query),
@@ -2353,10 +2517,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
       }
       const safeOffset = Math.min(Math.max(offset, 0), Math.max(total - 1, 0));
       const page = rows.slice(safeOffset, safeOffset + SEARCH_PAGE_SIZE);
-      deps.interactions.touch(interaction.id, {
+      transitionTo(interaction, 'list', {
         query,
         offset: safeOffset,
-        view: 'list',
         total,
       });
       persistAll();
@@ -2383,9 +2546,8 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await ackStale('view');
         return;
       }
-      deps.interactions.touch(interaction.id, {
+      transitionTo(interaction, 'detail', {
         query,
-        view: 'detail',
         selectedIndex: globalIndex,
       });
       persistAll();
@@ -2396,83 +2558,240 @@ export function createWebhookHandler(deps: WebhookDeps) {
       );
     }
 
+    /**
+     * Re-renders a stored nav view WITHOUT pushing (the pop already
+     * restored the snapshot, so same-view transitions stay push-free and
+     * round-trips preserve the stack). Same-card edits via sendLabeled.
+     */
+    async function renderStoredView(target: Interaction, view: string): Promise<void> {
+      const state = (deps.interactions.get(target.id) ?? target).state;
+      const query = typeof state['query'] === 'string' ? (state['query'] as string) : '';
+      switch (view) {
+        case 'prompt': {
+          persistAll();
+          await sendLabeled(
+            SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR',
+            sectionKeyboard('buscar', target.id),
+            target.messageThreadId,
+          );
+          return;
+        }
+        case 'list': {
+          await renderSearchPage(target, query);
+          return;
+        }
+        case 'customer-list': {
+          await renderCustomerSearch(target, query);
+          return;
+        }
+        case 'customer-detail': {
+          const selected = state['selectedCustomer'] as
+            | { id?: unknown; nombre?: unknown }
+            | undefined;
+          const selectedId = typeof selected?.id === 'string' ? selected.id : undefined;
+          const customers = await deps.repos.searchCustomersByPhone(query);
+          let index =
+            typeof state['selectedIndex'] === 'number'
+              ? (state['selectedIndex'] as number)
+              : -1;
+          if (selectedId !== undefined) {
+            const found = customers.findIndex((customer) => customer.id === selectedId);
+            if (found >= 0) {
+              index = found;
+            }
+          }
+          if (index >= 0 && customers[index] !== undefined) {
+            await renderCustomerDetail(target, query, index);
+            return;
+          }
+          if (customers.length > 0) {
+            await renderCustomerSearch(target, query);
+            return;
+          }
+          await ackStale('back');
+          return;
+        }
+        case 'account-list': {
+          await renderAccountSearch(target, query);
+          return;
+        }
+        case 'account-detail': {
+          const selected = state['selectedAccount'] as { id?: unknown } | undefined;
+          const selectedId = typeof selected?.id === 'string' ? selected.id : undefined;
+          const accounts = await deps.repos.searchServiceAccounts(query);
+          let index =
+            typeof state['selectedIndex'] === 'number'
+              ? (state['selectedIndex'] as number)
+              : -1;
+          if (selectedId !== undefined) {
+            const found = accounts.findIndex((account) => account.id === selectedId);
+            if (found >= 0) {
+              index = found;
+            }
+          }
+          if (index >= 0 && accounts[index] !== undefined) {
+            await renderAccountCard(target, query, index);
+            return;
+          }
+          if (accounts.length > 0) {
+            await renderAccountSearch(target, query);
+            return;
+          }
+          await ackStale('back');
+          return;
+        }
+        case 'detail': {
+          const index =
+            typeof state['selectedIndex'] === 'number'
+              ? (state['selectedIndex'] as number)
+              : 0;
+          await renderAccountDetail(target, query, index);
+          return;
+        }
+        case 'credentials-list':
+        case 'whatsapp-list': {
+          await renderCredentialList(target);
+          return;
+        }
+        case 'credentials-detail': {
+          const resolved = await candidateBundlesForState(state);
+          const key =
+            typeof state['selectedAssignmentKey'] === 'string'
+              ? (state['selectedAssignmentKey'] as string)
+              : undefined;
+          const bundle =
+            (key !== undefined
+              ? resolved.bundles.find((candidate) => credentialAssignmentKey(candidate) === key)
+              : undefined) ?? resolved.bundles[0];
+          if (bundle === undefined) {
+            await ackStale('back');
+            return;
+          }
+          const storedFilter = state['serviceFilter'];
+          const refs = credentialRefsFor(
+            resolved.selection,
+            storedFilter === 'netflix' || storedFilter === 'flujotv'
+              ? storedFilter
+              : undefined,
+            resolved.bundles.length,
+          );
+          await renderCredentialDirect(target, bundle, refs);
+          return;
+        }
+        case 'whatsapp-detail': {
+          const resolved = await candidateBundlesForState(state);
+          const key =
+            typeof state['selectedAssignmentKey'] === 'string'
+              ? (state['selectedAssignmentKey'] as string)
+              : undefined;
+          const bundle =
+            (key !== undefined
+              ? resolved.bundles.find((candidate) => credentialAssignmentKey(candidate) === key)
+              : undefined) ?? resolved.bundles[0];
+          if (bundle === undefined) {
+            await ackStale('back');
+            return;
+          }
+          const storedFilter = state['serviceFilter'];
+          const refs = credentialRefsFor(
+            resolved.selection,
+            storedFilter === 'netflix' || storedFilter === 'flujotv'
+              ? storedFilter
+              : undefined,
+            resolved.bundles.length,
+          );
+          await renderWhatsAppDirect(target, bundle, refs, preferredPhoneQuery());
+          return;
+        }
+        case 'whatsapp-phones': {
+          const phones = Array.isArray(state['phones'])
+            ? (state['phones'] as unknown[]).filter(
+                (phone): phone is string => typeof phone === 'string',
+              )
+            : [];
+          if (phones.length === 0) {
+            await renderCredentialList(target);
+            return;
+          }
+          persistAll();
+          await sendLabeled(
+            WHATSAPP_ASK_PHONE_TEXT,
+            credentialDisambiguationKeyboard(phones, { interactionId: target.id }),
+            target.messageThreadId,
+          );
+          return;
+        }
+        case 'whatsapp-nolink': {
+          await renderCredentialList(target);
+          return;
+        }
+        default: {
+          await ackStale('back');
+          return;
+        }
+      }
+    }
+
+    /** Explicit root action: Home always, never via Volver fallback. */
+    async function handleHome(interaction: Interaction): Promise<void> {
+      const home = createInteraction('HOME');
+      persistAll();
+      await sendLabeled(HOME_TEXT, homeKeyboard(home.id), interaction.messageThreadId);
+    }
+
+    /**
+     * Volver: pops the SAME interaction's nav stack and re-renders the
+     * exact previous view (same-card edit when the tap came from a
+     * callback). Empty stack: SEARCH_INPUT's parent is Home (the only
+     * Volver→Home case); any other root view is a safe no-op — never an
+     * arbitrary Home, never a selection change, never stack corruption.
+     * Navigation never touches drafts.
+     */
+    async function handleBack(interaction: Interaction): Promise<void> {
+      const fresh = deps.interactions.get(interaction.id) ?? interaction;
+      const nav = navEntriesOf(fresh);
+      if (nav.length === 0) {
+        const current =
+          typeof fresh.state['view'] === 'string'
+            ? (fresh.state['view'] as string)
+            : undefined;
+        if (current === 'prompt' || current === undefined) {
+          await handleHome(fresh);
+          return;
+        }
+        await ackStale('back');
+        return;
+      }
+      const previous = nav[nav.length - 1] as NavEntry;
+      const rest = nav.slice(0, -1);
+      deps.interactions.touch(fresh.id, {
+        ...previous.snap,
+        view: previous.view,
+        [NAV_KEY]: rest,
+      });
+      persistAll();
+      const target = deps.interactions.get(fresh.id) ?? fresh;
+      auditInteraction('interaction.back', target, {
+        ...(typeof fresh.state['view'] === 'string' ? { fromView: fresh.state['view'] } : {}),
+        toView: previous.view,
+      });
+      await renderStoredView(target, previous.view);
+    }
+
     /** Owned-callback execution: ownership already verified by the caller. */
     async function executeOwned(
       action: string,
       interaction: Interaction,
     ): Promise<void> {
       if (action === 'home' || action === 'back') {
-        if (interaction.type === 'SEARCH' && interaction.state['view'] === 'account-detail') {
-          // Volver from an account card: back to the owned
-          // disambiguation list when one exists (N accounts), Home for
-          // a direct single-card (no list to return to) — drafts and
-          // persistent requirements are never deleted either way.
-          const query =
-            typeof interaction.state['query'] === 'string'
-              ? (interaction.state['query'] as string)
-              : '';
-          const total =
-            typeof interaction.state['total'] === 'number'
-              ? (interaction.state['total'] as number)
-              : 0;
-          if (total > 1) {
-            await renderAccountSearch(interaction, query);
-            return;
-          }
-        } else if (
-          interaction.type === 'SEARCH' &&
-          interaction.state['view'] === 'customer-detail'
-        ) {
-          // Volver from a customer card: back to the owned
-          // disambiguation list when one exists (N results), Home for a
-          // direct single-card (no list to return to) — drafts and
-          // persistent requirements are never deleted either way.
-          const query =
-            typeof interaction.state['query'] === 'string'
-              ? (interaction.state['query'] as string)
-              : '';
-          const total =
-            typeof interaction.state['total'] === 'number'
-              ? (interaction.state['total'] as number)
-              : 0;
-          if (total > 1) {
-            await renderCustomerSearch(interaction, query);
-            return;
-          }
-        } else if (
-          interaction.type === 'SEARCH' &&
-          (interaction.state['view'] === 'credentials-list' ||
-            interaction.state['view'] === 'credentials-detail' ||
-            interaction.state['view'] === 'whatsapp-list' ||
-            interaction.state['view'] === 'whatsapp-detail' ||
-            interaction.state['view'] === 'whatsapp-phones' ||
-            interaction.state['view'] === 'whatsapp-nolink')
-        ) {
-          // Volver from a credential card/list: back to the owned
-          // disambiguation list when one exists (N options), Home for a
-          // direct single-card (no list to return to) — drafts and
-          // persistent requirements are never deleted either way.
-          const total =
-            typeof interaction.state['total'] === 'number'
-              ? (interaction.state['total'] as number)
-              : 0;
-          if (total > 1) {
-            await renderCredentialList(interaction);
-            return;
-          }
-        } else if (interaction.type === 'SEARCH' && interaction.state['view'] === 'detail') {
-          // Volver belongs to the interaction: back to the owned list,
-          // never deleting drafts or persistent requirements.
-          const query =
-            typeof interaction.state['query'] === 'string'
-              ? (interaction.state['query'] as string)
-              : '';
-          await renderSearchPage(interaction, query);
+        if (action === 'home') {
+          // Explicit root action only — never a navigation fallback.
+          await handleHome(interaction);
           return;
-        }        // Navigation never touches drafts — both actors' state survives.
-        const home = createInteraction('HOME');
-        persistAll();
-        await sendLabeled(HOME_TEXT, homeKeyboard(home.id), interaction.messageThreadId);
+        }
+        // Volver = exact previous view of the SAME interaction
+        // (Datos→Servicios→Cliente→Buscar→Home chain via the nav stack).
+        await handleBack(interaction);
         return;
       }
       if (action === 'buscar') {
@@ -2493,10 +2812,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return;
       }
       if (action === 'services') {
-        // [← Servicios]: restores the owned multi-assignment selector
-        // card IN PLACE (same card edit) when one exists (N options) —
-        // never Home, never a new card, never lost context. Without a
-        // selector to restore the tap is a safe no-op.
+        // [← Servicios]: semantic shortcut to ASSIGNMENT_SELECTOR inside
+        // the SAME nav model (pushes the card, renders the selector in
+        // place via the shared list renderer). Without a multi-option
+        // selector to restore the tap is a safe no-op — never Home.
         if (
           interaction.type === 'SEARCH' &&
           (interaction.state['view'] === 'credentials-detail' ||
@@ -2608,7 +2927,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
           await renderAccountCard(interaction, query, offset + viewIndex);
           return;
         }
-        if (interaction.state['view'] === 'credentials-list') {
+        if (
+          interaction.state['view'] === 'credentials-list' ||
+          interaction.state['view'] === 'whatsapp-list'
+        ) {
           await renderCredentialSelection(interaction, viewIndex);
           return;
         }
@@ -2798,6 +3120,18 @@ export function createWebhookHandler(deps: WebhookDeps) {
           return { ok: true };
         }
         if (parse.command === 'volver') {
+          // NL "volver" = Volver (pop the actor's own nav stack), never an
+          // arbitrary Home. No owned SEARCH context → Home as the honest
+          // root reply.
+          const active = deps.interactions.getActive(
+            targetChatId,
+            targetActorId,
+            targetThreadId,
+          );
+          if (active !== undefined && active.type === 'SEARCH') {
+            await handleBack(active);
+            return { ok: true };
+          }
           await respond(HOME_TEXT);
           return { ok: true };
         }

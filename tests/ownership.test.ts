@@ -616,7 +616,7 @@ describe('D. Navigation ownership (21–23)', () => {
     await world.app.close();
   });
 
-  it('(22) own Volver returns Home with the right label', async () => {
+  it('(22) own Volver pops to SEARCH_INPUT with the right label', async () => {
     const world = await createOwnerWorld();
     await world.post(groupMessage(world.nextUpdateId(), GABRIEL, '4145460657'));
     const volver = world.client.findButton('←Volver');
@@ -625,7 +625,9 @@ describe('D. Navigation ownership (21–23)', () => {
     }
     await world.post(groupCallback(world.nextUpdateId(), GABRIEL, volver));
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain(HOME_TEXT);
+    // Nav-stack pop to the wizard (never Home unless the parent is Home).
+    expect(last).toContain('🔎 BUSCAR');
+    expect(last).not.toContain('🏠 Vokath');
     expect(last).toContain('👤 Operador: Gabriel');
     await world.app.close();
   });

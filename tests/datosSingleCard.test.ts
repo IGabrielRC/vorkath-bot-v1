@@ -462,18 +462,22 @@ describe('datos single-card navigation (9–13)', () => {
     expect(world.client.lastText()).toContain('¿Qué datos necesitas? (4)');
   });
 
-  it('(12) [← Volver] semantics: single card → Home, selector → selector', async () => {
+  it('(12) [← Volver] pops the nav stack: single card → wizard, selector → client card', async () => {
     const single = await createDatosWorld();
     await searchPhoneSelect(single, GABRIEL, '4145460657', 'Anny Tovar');
     await single.post(datosMessage(single.nextUpdateId(), GABRIEL, 'dame los datos'));
     await tapButton(single, GABRIEL, '←Volver');
-    expect(single.client.lastText()).toContain(HOME_MARK);
+    // Exact previous view of the SAME interaction (client card), never Home.
+    expect(single.client.lastText()).toContain('Anny Tovar');
+    expect(single.client.lastText()).not.toContain(HOME_MARK);
+    expect(single.client.lastText()).not.toContain('🔐 DATOS DE ACCESO');
 
     const multi = await createDatosWorld();
     await searchPhoneSelect(multi, GABRIEL, '16124418159', 'Rafael minnesota');
     await multi.post(datosMessage(multi.nextUpdateId(), GABRIEL, 'dame los datos'));
     await tapButton(multi, GABRIEL, '←Volver');
-    expect(multi.client.lastText()).toContain('¿Qué datos necesitas? (4)');
+    // Selector pops to the client card it came from — never Home.
+    expect(multi.client.lastText()).toContain('Rafael minnesota');
     expect(multi.client.lastText()).not.toContain(HOME_MARK);
   });
 

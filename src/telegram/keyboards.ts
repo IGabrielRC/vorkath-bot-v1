@@ -247,7 +247,7 @@ export function homeKeyboard(interactionId?: string): InlineKeyboardMarkup {
   };
 }
 
-/** Section placeholder keyboard: contextual text + ←Volver to Home. */
+/** Section placeholder keyboard: contextual text + ←Volver (nav-stack pop). */
 export function sectionKeyboard(section: string, interactionId?: string): InlineKeyboardMarkup {
   void section;
   return {
@@ -259,7 +259,8 @@ export function sectionKeyboard(section: string, interactionId?: string): Inline
  * Phone-search keyboard: [🔐Datos] runs the SAME deterministic
  * SHOW_CREDENTIALS tool the explicit datos phrases run (button≡NL);
  * [🔎Buscar otro] re-opens the SAME guided wizard the BUSCAR button
- * opens (same `buscar` action/handler), and [←Volver] returns Home.
+ * opens (same `buscar` action/handler), and [←Volver] pops the nav
+ * stack to the exact previous view.
  * Used by the read-only phone UX (not-found, single-card, customer
  * detail). NEVER a "Crear cliente" button here — creation belongs
  * exclusively to the explicit new-sale flow (BR-CUS-009).
@@ -277,7 +278,8 @@ export function phoneSearchKeyboard(interactionId?: string): InlineKeyboardMarku
  * Account-search keyboard: [🔐Datos] runs the SAME deterministic
  * SHOW_CREDENTIALS tool the explicit datos phrases run (button≡NL);
  * [🔎Buscar otra] re-opens the SAME guided wizard the BUSCAR button
- * opens (same `buscar` action/handler), and [←Volver] returns Home.
+ * opens (same `buscar` action/handler), and [←Volver] pops the nav
+ * stack to the exact previous view.
  * Used by the read-only account UX (not-found, single-card, account
  * detail). NEVER a "Crear cliente" button here — creation belongs
  * exclusively to the explicit new-sale flow (BR-CUS-009).
@@ -361,7 +363,7 @@ export function credentialDisambiguationKeyboard(
   return { inline_keyboard: rows };
 }
 
-/** Draft actions: Confirmar / Corregir / Cancelar + ←Volver to Home. */
+/** Draft actions: Confirmar / Corregir / Cancelar + ←Volver (nav-stack pop). */
 export function draftKeyboard(interactionId?: string): InlineKeyboardMarkup {  return {
     inline_keyboard: [
       [
