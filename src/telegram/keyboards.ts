@@ -301,6 +301,16 @@ export function accountSearchKeyboard(interactionId?: string): InlineKeyboardMar
  * to N real accounts (e.g. the same identifier in Netflix AND
  * FlujoTV) — never a service question up front.
  */
+/** Controlled button identifier truncation (full value lives on the card; buttons stay legible). */
+export const ACCOUNT_BUTTON_IDENTIFIER_LIMIT = 24;
+
+function shortAccountIdentifier(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.length > ACCOUNT_BUTTON_IDENTIFIER_LIMIT
+    ? `${trimmed.slice(0, ACCOUNT_BUTTON_IDENTIFIER_LIMIT)}…`
+    : trimmed;
+}
+
 export function accountDisambiguationKeyboard(
   accounts: Array<{ servicio: string; identifier: string }>,
   opts?: { interactionId?: string },
@@ -316,7 +326,7 @@ export function accountDisambiguationKeyboard(
     if (account === undefined || action === undefined) {
       continue;
     }
-    const label = `${numerals[index] ?? '•'} ${prettyService(account.servicio)} · ${account.identifier}`;
+    const label = `${numerals[index] ?? '•'} ${prettyService(account.servicio)} · ${shortAccountIdentifier(account.identifier)}`;
     choiceRow.push(ownedButton(label, action, interactionId));
     if (choiceRow.length === 2) {
       rows.push(choiceRow.splice(0, 2));

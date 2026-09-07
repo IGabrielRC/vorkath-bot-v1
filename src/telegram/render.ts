@@ -554,6 +554,18 @@ export interface RenderedCredentialAssignment {
 }
 
 /**
+ * TRANSVERSAL RULE — when choosing between accounts, every option shows
+ * the minimum identifier to recognize it: service + profile/slot +
+ * account identifier (+ expiry + status when those fields really exist,
+ * never invented). Service/type alone is never enough — two options on
+ * the same service stay ambiguous without the identifier, and
+ * same-account options differentiate by profile/slot
+ * (`Netflix · Perfil 1 · cuenta@gmail.com` style). Callers pass the
+ * identifier via `disambiguator` (full value, escaped here); the card
+ * header already names the client when scoped to one, so the client name
+ * is NOT repeated inside the blocks — the identifier is the real
+ * differentiator.
+ *
  * Multi-assignment FIRST card: compact blocks (title bold, blank-line
  * separators, short lines, empty fields omitted — never `País: —`),
  * one per assignment, so the operator picks the assignment directly —

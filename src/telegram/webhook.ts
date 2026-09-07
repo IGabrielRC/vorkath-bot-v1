@@ -1806,6 +1806,14 @@ export function createWebhookHandler(deps: WebhookDeps) {
       viaWhatsApp = false,
     ): Promise<void> {
       const labels = credentialOptionLabels(options);
+      // Single-client scope: the card context already names the client, so
+      // blocks carry service + profile + FULL account identifier only (no
+      // client repetition — the identifier is the real differentiator).
+      // Multi-client scope (shared account): the header names nobody, so
+      // each block prefixes the holding client. Blocks always keep the
+      // full identifier; button labels may truncate (controlled `…`).
+      const multiCustomer =
+        new Set(options.map((option) => option.customerName.trim().toLowerCase())).size > 1;
       transitionTo(interaction, viaWhatsApp ? 'whatsapp-list' : 'credentials-list', {
         ...refs,
         total: options.length,
@@ -1822,16 +1830,13 @@ export function createWebhookHandler(deps: WebhookDeps) {
           options.length,
           options.map((option, index) => {
             const derived = deriveExpiryStatus(option.fechaFin);
-            const base = `${option.serviceLabel} · ${option.profile}`;
-            const label = labels[index] ?? base;
-            const suffix = label.startsWith(base)
-              ? label.slice(base.length).replace(/^ · /, '')
-              : label;
             return {
               numeral: OPTION_NUMERALS[index] ?? '•',
               serviceLabel: option.serviceLabel,
               profile: option.profile,
-              ...(suffix !== '' ? { disambiguator: suffix } : {}),
+              disambiguator: multiCustomer
+                ? `${option.customerName} · ${option.accountIdentifier}`
+                : option.accountIdentifier,
               estatus: derived.estatus,
               dias: derived.dias,
               fechaFin: option.fechaFin,

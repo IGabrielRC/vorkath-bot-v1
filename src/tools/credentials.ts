@@ -59,16 +59,37 @@ export function credentialAssignmentKey(bundle: CredentialBundle): string {
 }
 
 /**
- * Minimal disambiguation label from real data (`Netflix · 1 PERFIL (2)`).
- * When candidates span several clients (a shared account viewed from the
- * account card), the holding client prefixes the label so options stay
- * unambiguous.
+ * Maximum identifier characters shown on a button label. Longer
+ * identifiers truncate visibly with `…` (controlled, legible) — the
+ * credential card and the assignment blocks always keep the FULL
+ * identifier; only the button text truncates. Resolution never reads
+ * the label (stable `credentialAssignmentKey` in interaction state).
+ */
+export const BUTTON_IDENTIFIER_LIMIT = 20;
+
+/** Controlled button-text truncation: full value iff short, else `…`-suffixed. */
+export function shortButtonIdentifier(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.length > BUTTON_IDENTIFIER_LIMIT
+    ? `${trimmed.slice(0, BUTTON_IDENTIFIER_LIMIT)}…`
+    : trimmed;
+}
+
+/**
+ * Minimal disambiguation label from real data — ALWAYS
+ * `Service · Profile · identifier` (e.g. `Netflix · 1 PERFIL (2) ·
+ * dasdsadasda@gmail.com`, `FlujoTV · 1 PERFIL · cmaxnet002`). Service/type
+ * alone is never enough to recognize an account, so the identifier is
+ * unconditional, never collision-gated. When candidates span several
+ * clients (a shared account viewed from the account card), the holding
+ * client prefixes the label so options stay unambiguous.
  */
 export function credentialOptionLabel(
   bundle: CredentialBundle,
   multiCustomer: boolean,
 ): string {
-  const serviceProfile = `${bundle.serviceLabel} · ${bundle.profile}`;
+  const serviceProfile =
+    `${bundle.serviceLabel} · ${bundle.profile} · ${shortButtonIdentifier(bundle.accountIdentifier)}`;
   if (multiCustomer) {
     return `${bundle.customerName} · ${serviceProfile}`;
   }
@@ -76,44 +97,13 @@ export function credentialOptionLabel(
 }
 
 /**
- * One label per bundle with collision disambiguation: identical base
- * labels gain a short safe identifier (the holding client when the
- * candidates share one account, else the account identifier truncated
- * to 20 chars) so similar assignments stay distinguishable. NEVER
+ * One label per bundle, every label carrying its (possibly truncated)
+ * account identifier — service/type alone is never enough. NEVER
  * passwords, PINs or phone-derived data — labels are safe by
  * construction.
  */
 export function credentialOptionLabels(bundles: CredentialBundle[]): string[] {
-  const multiCustomer = new Set(bundles.map((bundle) => bundle.customerName)).size > 1;
-  const base = bundles.map((bundle) => credentialOptionLabel(bundle, multiCustomer));
-  const shortAccount = (bundle: CredentialBundle): string =>
-    bundle.accountIdentifier.length > 20
-      ? `${bundle.accountIdentifier.slice(0, 20)}…`
-      : bundle.accountIdentifier;
-  const count = (labels: string[]): Map<string, number> => {
-    const counts = new Map<string, number>();
-    for (const label of labels) {
-      counts.set(label, (counts.get(label) ?? 0) + 1);
-    }
-    return counts;
-  };
-  // Pass 1: same-account collisions gain the holding client.
-  const pass1 = bundles.map((bundle, index) => {
-    const label = base[index] as string;
-    if (!multiCustomer && (count(base).get(label) ?? 0) > 1) {
-      return `${label} · ${bundle.customerName}`;
-    }
-    return label;
-  });
-  // Pass 2: remaining collisions gain the short account identifier, so
-  // same-client/same-profile assignments (e.g. two `FlujoTV · 1 PERFIL`
-  // on `cmaxnet002` vs `cmaxnet004`) stay distinguishable.
-  const counts1 = count(pass1);
-  return bundles.map((bundle, index) => {
-    const label = pass1[index] as string;
-    if ((counts1.get(label) ?? 0) > 1) {
-      return `${label} · ${shortAccount(bundle)}`;
-    }
-    return label;
-  });
+  const multiCustomer =
+    new Set(bundles.map((bundle) => bundle.customerName.trim().toLowerCase())).size > 1;
+  return bundles.map((bundle) => credentialOptionLabel(bundle, multiCustomer));
 }
