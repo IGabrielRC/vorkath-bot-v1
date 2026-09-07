@@ -41,6 +41,10 @@ export type CallbackAction =
   | 'services'
   | 'saleNew'
   | 'saleEmergency'
+  | 'saleKeep'
+  | 'saleModNetflix'
+  | 'saleModFlujoShared'
+  | 'saleModFlujoComplete'
   | 'view0'
   | 'view1'
   | 'view2'
@@ -65,6 +69,10 @@ const SHORT_IDS: Record<CallbackAction, string> = {
   services: 'svc',
   saleNew: 'snew',
   saleEmergency: 'semg',
+  saleKeep: 'skeep',
+  saleModNetflix: 'snfx',
+  saleModFlujoShared: 'sshr',
+  saleModFlujoComplete: 'sfull',
   view0: 'w0',
   view1: 'w1',
   view2: 'w2',
@@ -449,6 +457,43 @@ export function saleEntryKeyboard(interactionId?: string): InlineKeyboardMarkup 
   };
 }
 
+/**
+ * Sale progress keyboard (incomplete draft — NEVER Confirmar/Corregir):
+ * only ←Volver / ❌Cancelar plus the valid next actions. When the
+ * missing field is service/modality, the three sale option buttons let
+ * the operator answer with one tap (button≡NL with the equivalent
+ * sentence). Shown on ask-missing / new-customer / disambiguate /
+ * clarification / no-inventory cards.
+ */
+export function saleProgressKeyboard(
+  interactionId?: string,
+  missing?: string,
+): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = [];
+  if (missing === 'service' || missing === 'modality') {
+    rows.push([
+      ownedButton('Netflix · Perfil', 'saleModNetflix', interactionId),
+      ownedButton('FlujoTV · Perfil', 'saleModFlujoShared', interactionId),
+    ]);
+    rows.push([ownedButton('FlujoTV · Completa', 'saleModFlujoComplete', interactionId)]);
+  }
+  rows.push([ownedButton('❌Cancelar', 'cancel', interactionId), backButton(interactionId)]);
+  return { inline_keyboard: rows };
+}
+
+/**
+ * Pending-management keyboard (second operation while one is open):
+ * [Continuar venta] re-renders the in-progress draft on the SAME card;
+ * [❌Cancelar venta] drops it. Never a parallel operational card.
+ */
+export function salePendingKeyboard(interactionId?: string): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [ownedButton('▶️ Continuar venta', 'saleKeep', interactionId)],
+      [ownedButton('❌Cancelar venta', 'cancel', interactionId)],
+    ],
+  };
+}
 /**
  * Emergency authorization keyboard (Slice B — BR-NFX-005): [Usar
  * emergencia] authorizes the profile-5 slot EXPLICITLY and separately

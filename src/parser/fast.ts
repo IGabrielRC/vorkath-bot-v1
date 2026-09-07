@@ -238,9 +238,10 @@ export function parseSection(text: string): { kind: 'section'; section: FastSect
  * Sell/renew verbs are CONTRACT-ONLY (future prepareSale/prepareRenewal
  * — tool specs + stubs exist, implementation does not). Until their
  * phase, L2 declines them as `none` so they can never become a search,
- * a draft, or a mutation: L3 maps them to guarded UNKNOWN.
+ * a draft, or a mutation: L3 maps them to guarded UNKNOWN. Renewal
+ * words (`recarga`, `renueva`, …) are likewise reserved — never NEW_SALE.
  */
-const SELL_RENEW_RE = /(vend|renov)/;
+const SELL_RENEW_RE = /(vend|renov|recarg|renuev|renew)/;
 
 function parseCommand(text: string): { kind: 'command'; command: FastCommand } | null {  for (const { command, re } of COMMAND_PATTERNS) {
     if (re.test(text)) {

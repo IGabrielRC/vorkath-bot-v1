@@ -30,18 +30,25 @@ import { credentialAssignmentKey, credentialOptionLabels, resolveCredentialView 
 import type { SaleWebhookDeps } from './saleHandlers';
 import {
   SALE_ENTRY_TEXT,
+  isFreshSaleCue,
   isSaleCue,
   keyboardForSaleResult,
+  renderSalePendingManagement,
   saleTextContinues,
 } from './saleHandlers';
-import { saleEntryKeyboard } from './keyboards';
+import { saleEntryKeyboard, salePendingKeyboard } from './keyboards';
 import {
+  expectedSaleField,
+  prepareNewSaleChoice,
   prepareNewSaleFromAction,
   prepareNewSaleFromText,
+  refreshCurrentSale,
+  RENEWAL_HOLD_TEXT,
   type SaleDeps,
   type SaleResult,
 } from '../sale/newSaleTool';
-import { resolveCashHolders } from '../sale/payments';
+import { resolveCashHolders, matchCashHolder } from '../sale/payments';
+import { isRenewalText, parseSaleExtraction } from '../sale/saleParser';
 import {
   buildWhatsAppUrl,
   resolveWhatsAppTarget,
@@ -50,7 +57,7 @@ import {
   WHATSAPP_PREPARED_TEXT,
 } from '../whatsapp/link';
 import { renderCredentialWhatsAppText } from '../whatsapp/templates';
-import { containsPhoneCandidate, extractEmbeddedAccount, isExplicitCreateRequest, parseEmail, parsePhone } from '../parser/fast';
+import { containsPhoneCandidate, extractEmbeddedAccount, isExplicitCreateRequest, normalizeText, parseEmail, parsePhone } from '../parser/fast';
 import { route } from '../router/hybrid';
 import { SessionStore } from '../session/store';
 import {
@@ -97,6 +104,7 @@ import {
   renderLegacyNotFound,
   renderOwnershipWarning,
   renderPhoneNotFound,
+  renderSaleAskMissing,
   unesc,
 } from './render';
 import {
@@ -812,12 +820,87 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
 
     /**
+     * ONE FOREGROUND INTERACTION — single-card conservation: every sale
+     * continuation edits the SAME card (the stored `cardMessageId` on the
+     * active OPERATION interaction). 1 initial send + N edits; confirmed/
+     * cancelled transforms the same card. Callback-derived renders edit
+     * the tapped message AND adopt it as the card. When no card is stored
+     * yet, the first send captures its `message_id` for all later edits.
+     */
+    function cardMessageIdOf(interaction: Interaction): number | undefined {
+      const fresh = deps.interactions.get(interaction.id) ?? interaction;
+      const stored = fresh.state['cardMessageId'];
+      return typeof stored === 'number' ? stored : undefined;
+    }
+
+    function extractSentMessageId(response: unknown): number | undefined {
+      if (typeof response !== 'object' || response === null) {
+        return undefined;
+      }
+      const direct = (response as { message_id?: unknown }).message_id;
+      if (typeof direct === 'number') {
+        return direct;
+      }
+      const nested = (response as { result?: unknown }).result;
+      if (typeof nested === 'object' && nested !== null) {
+        const nestedId = (nested as { message_id?: unknown }).message_id;
+        if (typeof nestedId === 'number') {
+          return nestedId;
+        }
+      }
+      return undefined;
+    }
+
+    async function sendSaleCard(
+      interaction: Interaction,
+      resultText: string,
+      replyMarkup: InlineKeyboardMarkup,
+      threadOverride?: number,
+    ): Promise<void> {
+      const labeled = withOperator(resultText, targetActorName);
+      if (fromCallback && callbackMessageId !== undefined) {
+        await deps.client.editMessageText({
+          chatId: targetChatId,
+          messageId: callbackMessageId,
+          text: labeled,
+          replyMarkup,
+        });
+        deps.interactions.touch(interaction.id, { cardMessageId: callbackMessageId });
+        persistAll();
+      } else {
+        const cardId = cardMessageIdOf(interaction);
+        if (cardId !== undefined) {
+          await deps.client.editMessageText({
+            chatId: targetChatId,
+            messageId: cardId,
+            text: labeled,
+            replyMarkup,
+          });
+        } else {
+          const thread = threadOverride ?? replyCtx.messageThreadId;
+          const response = await deps.client.sendMessage({
+            chatId: targetChatId,
+            text: labeled,
+            replyMarkup,
+            ...(thread !== undefined ? { messageThreadId: thread } : {}),
+          });
+          const sentId = extractSentMessageId(response);
+          if (sentId !== undefined) {
+            deps.interactions.touch(interaction.id, { cardMessageId: sentId });
+            persistAll();
+          }
+        }
+      }
+      if (callbackId !== undefined) {
+        await deps.client.answerCallbackQuery(callbackId);
+      }
+    }
+
+    /**
      * Sale NL entry: folds one operator sentence into the actor's sale
      * draft (full-sentence → single summary + Confirm; partial →
-     * ask-only-missing; corrections recalc the SAME draft). Sends the
-     * single card with its per-kind keyboard (summary → draft keyboard,
-     * emergency → explicit auth keyboard, confirmed → Fase 3 credential
-     * keyboard with the wa.me button).
+     * ask-only-missing; corrections recalc the SAME draft). Single-card:
+     * every continuation edits the stored card.
      */
     async function runSaleText(input: string, threadOverride?: number): Promise<void> {
       if (saleToolDeps === undefined) {
@@ -827,7 +910,8 @@ export function createWebhookHandler(deps: WebhookDeps) {
       auditSaleResult(result);
       const interaction = activeOperationInteraction() ?? createInteraction('OPERATION');
       persistAll();
-      await sendLabeled(
+      await sendSaleCard(
+        interaction,
         result.text,
         keyboardForSaleResult(result, interaction.id, result.whatsappUrl),
         threadOverride ?? interaction.messageThreadId,
@@ -842,7 +926,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * Sale Confirm entry (button tap or NL `confirmar`): executes the
      * atomic service when a sale draft is open, answers `already
      * confirmed` on repeats (zero new rows). Confirm transforms the SAME
-     * card in place (edit when born from a callback).
+     * card in place.
      */
     async function runSaleConfirmFlow(
       origin: Interaction | undefined,
@@ -860,7 +944,8 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const interaction =
         origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
       persistAll();
-      await sendLabeled(
+      await sendSaleCard(
+        interaction,
         result.text,
         keyboardForSaleResult(result, interaction.id, result.whatsappUrl),
         threadOverride ?? interaction.messageThreadId,
@@ -871,7 +956,10 @@ export function createWebhookHandler(deps: WebhookDeps) {
       }
     }
 
-    /** Sale Cancel entry: drops the open draft, persists nothing. */
+    /**
+     * Sale Cancel entry: drops the open draft and transforms the SAME
+     * card (never a fresh card, never Home navigation).
+     */
     async function runSaleCancelFlow(
       origin: Interaction | undefined,
       threadOverride?: number,
@@ -885,12 +973,15 @@ export function createWebhookHandler(deps: WebhookDeps) {
         saleToolDeps,
       );
       auditSaleResult(result);
+      const interaction =
+        origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
       const home = createInteraction('HOME');
       persistAll();
-      await sendLabeled(
+      await sendSaleCard(
+        interaction,
         result.text,
         homeKeyboard(home.id),
-        threadOverride ?? home.messageThreadId,
+        threadOverride ?? interaction.messageThreadId,
       );
     }
 
@@ -909,11 +1000,285 @@ export function createWebhookHandler(deps: WebhookDeps) {
       );
       auditSaleResult(result);
       persistAll();
-      await sendLabeled(
+      await sendSaleCard(
+        origin,
         result.text,
         keyboardForSaleResult(result, origin.id, result.whatsappUrl),
         threadOverride ?? origin.messageThreadId,
       );
+    }
+
+    /**
+     * Sale choice entry (service/modality option buttons): folds the
+     * structured choice into the SAME open draft, single-card render.
+     */
+    async function runSaleChoiceFlow(
+      origin: Interaction,
+      choice: { service: 'netflix' | 'flujotv'; modality: 'netflix-profile' | 'flujotv-shared' | 'flujotv-complete' },
+      threadOverride?: number,
+    ): Promise<void> {
+      if (saleToolDeps === undefined) {
+        return;
+      }
+      const result = await prepareNewSaleChoice(saleActor(), choice, saleToolDeps);
+      auditSaleResult(result);
+      persistAll();
+      await sendSaleCard(
+        origin,
+        result.text,
+        keyboardForSaleResult(result, origin.id, result.whatsappUrl),
+        threadOverride ?? origin.messageThreadId,
+      );
+    }
+
+    /**
+     * [Continuar venta] / NL `continuar`: re-renders the in-progress
+     * draft on the SAME card (re-settle, zero patch, zero mutation).
+     */
+    async function runSaleResumeFlow(
+      origin: Interaction,
+      threadOverride?: number,
+    ): Promise<void> {
+      if (saleToolDeps === undefined) {
+        return;
+      }
+      const result = await refreshCurrentSale(saleActor(), saleToolDeps);
+      auditSaleResult(result);
+      persistAll();
+      await sendSaleCard(
+        origin,
+        result.text,
+        keyboardForSaleResult(result, origin.id, result.whatsappUrl),
+        threadOverride ?? origin.messageThreadId,
+      );
+    }
+
+    /**
+     * Second-operation guard: an unrelated fresh sale cue while a
+     * substantive draft is open edits the SAME card to GESTIÓN PENDIENTE
+     * with [Continuar venta][Cancelar venta] — never a parallel card,
+     * never a draft touch.
+     */
+    async function runSalePendingFlow(
+      origin: Interaction,
+      threadOverride?: number,
+    ): Promise<void> {
+      persistAll();
+      await sendSaleCard(
+        origin,
+        renderSalePendingManagement(),
+        salePendingKeyboard(origin.id),
+        threadOverride ?? origin.messageThreadId,
+      );
+    }
+
+    /**
+     * ACTIVE-INTERACTION-FIRST text handling (mandatory router order):
+     * while the actor owns an open sale draft, the draft owns EVERY text
+     * message — the global fast-parser/deterministic intents and Gemini
+     * NEVER see it. Order inside the operation:
+     * (0) renewal words → safe hold on the same card (reserved, never
+     *     folded into NEW_SALE);
+     * (1) standalone navigation (`volver`/`cancelar`/`confirmar`/
+     *     `continuar` as the message command) — explicit commands win
+     *     over field fill, otherwise Cancelar could never fire while a
+     *     name is expected;
+     * (2) fresh second sale cue on a substantive draft → GESTIÓN
+     *     PENDIENTE on the same card (no parallel card, draft intact);
+     * (3) any sale field / correction → fold into the SAME draft;
+     * (4) expected-field fill (local parse in field scope: bare holder
+     *     name → receiver; name-like text → customer name);
+     * (5) uninterpretable-inside-operation → same-card fallback naming
+     *     the expected field, draft intact, never a global jump, never
+     *     Gemini.
+     *
+     * This is the "Gabriel Juan" root-cause fix: the new-customer name
+     * answer used to fall through to global search (CUENTA NO ENCONTRADA
+     * + a second card); now it fills `draft.proposedCustomer.name` and
+     * continues to the next missing field on the same card.
+     */
+    async function handleActiveSaleText(input: string): Promise<boolean> {
+      if (saleToolDeps === undefined) {
+        return false;
+      }
+      const open = saleToolDeps.store.get(owner);
+      if (open === undefined) {
+        return false;
+      }
+      const interaction = activeOperationInteraction() ?? createInteraction('OPERATION');
+      const trimmed = input.trim();
+      const n = normalizeText(trimmed);
+
+      if (isRenewalText(trimmed)) {
+        persistAll();
+        await sendSaleCard(
+          interaction,
+          RENEWAL_HOLD_TEXT,
+          keyboardForSaleResult(
+            { kind: 'clarification', draft: open, text: RENEWAL_HOLD_TEXT },
+            interaction.id,
+          ),
+          interaction.messageThreadId,
+        );
+        return true;
+      }
+
+      if (/^(volver|atras|back)\b/.test(n)) {
+        // Volver inside the sale: back to the entry card on the SAME
+        // message, draft intact (external drafts survive).
+        persistAll();
+        await sendSaleCard(
+          interaction,
+          SALE_ENTRY_TEXT,
+          saleEntryKeyboard(interaction.id),
+          interaction.messageThreadId,
+        );
+        return true;
+      }
+      if (/^cancel(ar|o|ado)?\b/.test(n)) {
+        await runSaleCancelFlow(interaction, interaction.messageThreadId);
+        return true;
+      }
+      if (/^confirm(ar|o|ado)?\b/.test(n)) {
+        await runSaleConfirmFlow(interaction, interaction.messageThreadId);
+        return true;
+      }
+      if (/^(continuar|continuo|continua|seguir|sigue)\b/.test(n)) {
+        await runSaleResumeFlow(interaction, interaction.messageThreadId);
+        return true;
+      }
+
+      const substantive =
+        open.service !== null ||
+        open.modality !== null ||
+        open.phone !== null ||
+        open.duration.requestedMonths !== null ||
+        open.payment.method !== null ||
+        open.payment.actualAmount !== null ||
+        open.customer.existingCustomerId !== undefined ||
+        open.customer.proposedCustomer !== undefined;
+      const extraction = parseSaleExtraction(trimmed);
+      if (substantive && isFreshSaleCue(trimmed) && !extraction.isCorrection) {
+        await runSalePendingFlow(interaction, interaction.messageThreadId);
+        return true;
+      }
+
+      const carriesField =
+        extraction.service !== undefined ||
+        extraction.modality !== undefined ||
+        extraction.unsupported !== undefined ||
+        extraction.months !== undefined ||
+        extraction.amount !== undefined ||
+        extraction.method !== undefined ||
+        extraction.phoneRaw !== undefined ||
+        extraction.receiverRaw !== undefined ||
+        extraction.referenceRaw !== undefined ||
+        extraction.isCorrection;
+      if (carriesField) {
+        await runSaleText(trimmed, interaction.messageThreadId);
+        return true;
+      }
+
+      const expected = expectedSaleField(open);
+      if (expected === 'receiver') {
+        const holder = matchCashHolder(trimmed, saleToolDeps.cashHolders ?? resolveCashHolders());
+        if (holder !== undefined) {
+          // Bare holder name inside the receiver scope ("Edward").
+          await runSaleText(`lo recibió ${holder}`, interaction.messageThreadId);
+          return true;
+        }
+      }
+      if (
+        expected === 'customer' &&
+        open.phone !== null &&
+        open.customer.existingCustomerId === undefined &&
+        open.customer.proposedCustomer === undefined &&
+        isNameLikeAnswer(trimmed)
+      ) {
+        // The "Gabriel Juan" fix: the new-customer name answer fills
+        // `draft.proposedCustomer.name` (local parse first, zero Gemini)
+        // and continues to the next missing field on the same card.
+        const result = await prepareNewSaleFromAction(
+          saleActor(),
+          { type: 'provide-name', name: trimmed },
+          saleToolDeps,
+        );
+        auditSaleResult(result);
+        persistAll();
+        await sendSaleCard(
+          interaction,
+          result.text,
+          keyboardForSaleResult(result, interaction.id, result.whatsappUrl),
+          interaction.messageThreadId,
+        );
+        return true;
+      }
+
+      const fallback =
+        expected === null
+          ? `${renderSaleAskMissing('')} El borrador sigue intacto.`
+          : `🧾 Venta nueva — sigo esperando ${saleFieldLabel(open, expected)}: ${renderSaleAskMissing(expected)} El borrador sigue intacto.`;
+      persistAll();
+      await sendSaleCard(
+        interaction,
+        fallback,
+        keyboardForSaleResult(
+          { kind: 'clarification', draft: open, text: fallback, ...(expected !== null ? { missing: expected } : {}) },
+          interaction.id,
+        ),
+        interaction.messageThreadId,
+      );
+      return true;
+    }
+
+    /**
+     * Name-like answer guard (customer-name scope only): letters/spaces
+     * with no digits, not a reserved command word. Runs over folded text
+     * so case/accents never matter; hostiles like "cancelar" stay
+     * commands (navigation wins over fill).
+     */
+    function isNameLikeAnswer(trimmed: string): boolean {
+      if (trimmed.length < 2 || trimmed.length > 80) {
+        return false;
+      }
+      if (/\d/.test(trimmed)) {
+        return false;
+      }
+      if (!/[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(trimmed)) {
+        return false;
+      }
+      const n = ` ${normalizeText(trimmed)} `;
+      if (
+        /\b(volver|atras|back|cancel|confirm|continuar|seguir|venta|vende|vender|vendo|datos|whatsapp|inventario|caja|buscar|operar|tasa|precio|codigo|recarg|renuev|renov)\b/.test(n)
+      ) {
+        return false;
+      }
+      return true;
+    }
+
+    /** Human label for the expected field (fallback card naming). */
+    function saleFieldLabel(
+      draft: import('../sale/newSaleDraft').NewSaleDraft,
+      fieldName: string,
+    ): string {
+      switch (fieldName) {
+        case 'service':
+          return 'el servicio';
+        case 'modality':
+          return 'la modalidad';
+        case 'customer':
+          return draft.phone === null ? 'el teléfono del cliente' : 'el nombre del cliente';
+        case 'months':
+          return 'la duración';
+        case 'method':
+          return 'el método de pago';
+        case 'amount':
+          return 'el monto recibido';
+        case 'receiver':
+          return 'quién recibió el dinero';
+        default:
+          return 'un dato pendiente';
+      }
     }
     const draftEntity = `draft:${targetChatId}:${targetActorId}`;
     const fromCallback = callback !== undefined;
@@ -957,12 +1322,38 @@ export function createWebhookHandler(deps: WebhookDeps) {
     const text = message?.text?.trim() ?? '';
     const callbackData = callback?.data;
     /**
+     * ACTIVE-INTERACTION-FIRST (mandatory router order): while this actor
+     * owns an open sale draft, the draft owns EVERY text message —
+     * expected-field fill, in-operation correction/navigation, valid
+     * in-operation actions, and second-mutation guarding all run BEFORE
+     * the global router. The global fast-parser/deterministic intents
+     * and Gemini run ONLY when no active interaction owns the message,
+     * so global search can NEVER steal an expected-field answer (the
+     * "Gabriel Juan" bug class). Diagnostic commands never enter here.
+     */
+    if (saleToolDeps !== undefined && callbackData === undefined && text.length > 0) {
+      const firstToken = (text.split(/\s+/)[0] ?? '').split('@')[0]?.toLowerCase();
+      if (firstToken !== '/topicid' && firstToken !== '/testalert' && firstToken !== '/start') {
+        if (saleToolDeps.store.get(owner) !== undefined) {
+          const owned = await handleActiveSaleText(text);
+          if (owned) {
+            return { ok: true };
+          }
+        } else if (isRenewalText(text)) {
+          // Renewal with no open draft: safe hold, zero draft, zero
+          // Gemini, zero ledger — reserved, never NEW_SALE.
+          await sendInContext(RENEWAL_HOLD_TEXT);
+          return { ok: true };
+        }
+      }
+    }
+    /**
      * Slice B sale NL interception (additive, pre-router): sale cues
-     * (`quiero vender`, `venta nueva`, `vende…`) and continuations of an
-     * open sale draft (guided replies, corrections) converge on the SAME
-     * draft core as the buttons with ZERO Gemini. Everything else falls
-     * through to the L1/L2/L3 cascade unchanged. Diagnostic commands
-     * never enter the sale flow.
+     * (`quiero vender`, `venta nueva`, `vende…`, `dame/sácame/necesito…
+     * cuenta/perfil…`) and continuations of an open sale draft converge
+     * on the SAME draft core as the buttons with ZERO Gemini. Everything
+     * else falls through to the L1/L2/L3 cascade unchanged. Diagnostic
+     * commands never enter the sale flow.
      */
     if (saleToolDeps !== undefined && callbackData === undefined && text.length > 0) {
       const firstToken = (text.split(/\s+/)[0] ?? '').split('@')[0]?.toLowerCase();
@@ -3247,6 +3638,38 @@ export function createWebhookHandler(deps: WebhookDeps) {
           return;
         }
         await runSaleEmergencyFlow(interaction, interaction.messageThreadId);
+        return;
+      }
+      /**
+       * Foreground sale buttons (button≡NL): [Continuar venta]
+       * re-renders the in-progress draft on the SAME card; the three
+       * service/modality options fold the structured choice into the
+       * SAME open draft (same core as the equivalent NL sentence).
+       */
+      if (action === 'saleKeep') {
+        if (saleToolDeps === undefined || !hasOpenSaleDraft()) {
+          await ackStale('saleKeep');
+          return;
+        }
+        await runSaleResumeFlow(interaction, interaction.messageThreadId);
+        return;
+      }
+      if (
+        action === 'saleModNetflix' ||
+        action === 'saleModFlujoShared' ||
+        action === 'saleModFlujoComplete'
+      ) {
+        if (saleToolDeps === undefined || !hasOpenSaleDraft()) {
+          await ackStale(action);
+          return;
+        }
+        const choice =
+          action === 'saleModNetflix'
+            ? { service: 'netflix' as const, modality: 'netflix-profile' as const }
+            : action === 'saleModFlujoShared'
+              ? { service: 'flujotv' as const, modality: 'flujotv-shared' as const }
+              : { service: 'flujotv' as const, modality: 'flujotv-complete' as const };
+        await runSaleChoiceFlow(interaction, choice, interaction.messageThreadId);
         return;
       }
       const viewIndex = viewIndexFor(action);

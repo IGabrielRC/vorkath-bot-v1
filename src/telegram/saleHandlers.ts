@@ -30,12 +30,14 @@
 import type { MockStore } from '../mock/mockStore';
 import type { AccountStatusResolver } from '../sale/inventory';
 import type { SaleClock } from '../sale/newSaleConfirm';
-import { parseSaleExtraction } from '../sale/saleParser';
+import { isRenewalText, parseSaleExtraction } from '../sale/saleParser';
 import type { SaleResult } from '../sale/newSaleTool';
 import {
   credentialCardKeyboard,
   draftKeyboard,
   saleEmergencyKeyboard,
+  salePendingKeyboard,
+  saleProgressKeyboard,
   type InlineKeyboardMarkup,
 } from './keyboards';
 
@@ -63,19 +65,64 @@ function fold(text: string): string {
 }
 
 /**
- * NL entry cue for the NewSale flow. Matches `venta(s)`, `vende`,
- * `vender`, `vendo`, `vendemos` as whole words — never `vence`,
- * `vencido/a(s)`, `vencimiento`, `por vencer`, `inventario`,
- * `disponible`.
+ * NL entry cue for the NewSale flow. Real sale language (semantic,
+ * case/accent/typo tolerant over folded text):
+ * - classic: `venta(s)`, `vende`, `vender`, `vendo`, `vendemos`;
+ * - natural: `dame`/`sácame`/`necesito`/`quiero` + a sale noun
+ *   (`cuenta nueva`, `perfil`, `completa`, `netflix`, `flujo`…):
+ *   "dame una cuenta nueva netflix", "sácame una netflix",
+ *   "necesito una completa de flujo", "dame un perfil flujo por 30 dias".
+ *
+ * Never matches: `vence`/`vencido`/`vencimiento`/`por vencer`,
+ * `inventario`, credential requests (`dame los datos…` — no sale noun),
+ * or renewal-reserved words (`recarga`/`renueva` — Fase 5, safe hold
+ * reply instead of a draft).
  */
 export function isSaleCue(text: string): boolean {
   const n = ` ${fold(text)} `;
-  return (
+  if (isRenewalText(text)) {
+    return false;
+  }
+  if (
     /\bventas?\b/.test(n) ||
     /\bvende\b/.test(n) ||
     /\bvender\b/.test(n) ||
     /\bvendo\b/.test(n) ||
     /\bvendemos\b/.test(n)
+  ) {
+    return true;
+  }
+  const hasVerb = /\bdame\b|\bdamela\b|\bsacame\b|\bsaca\b|\bnecesito\b|\bquiero\b/.test(n);
+  if (!hasVerb) {
+    return false;
+  }
+  // Credential/delivery requests are never sales ("dame los datos…").
+  if (/\bdatos\b|\bcontrasena\b|\bclave\b|\bacceso\b|\bwhatsapp\b|\bwasap\b|\bwatsap\b|\bguasap\b|\bwsp\b|\bmensaje\b/.test(n)) {
+    return false;
+  }
+  return (
+    /\bnueva\b|\bnuevo\b|\bcompleta\b|\bcompartida\b|\bperfil\b|\bnetflix\b|\bnetflx\b|\bnetlix\b|\bflujo\b|\bflugo\b|\bcuenta\b/.test(n)
+  );
+}
+
+/**
+ * Fresh NEW_SALE cue while a draft is already in progress: a second
+ * operational request (not a correction, not a field answer) that must
+ * NEVER open a parallel card. The caller edits the SAME card to the
+ * GESTIÓN PENDIENTE notice with [Continuar venta][Cancelar venta].
+ */
+export function isFreshSaleCue(text: string): boolean {
+  return isSaleCue(text);
+}
+
+/**
+ * Pending-management notice (same-card edit): the operation stays open,
+ * the draft stays intact, and the operator resumes or cancels from the
+ * SAME card — never a second operational card.
+ */
+export function renderSalePendingManagement(): string {
+  return (
+    '⏳ GESTIÓN PENDIENTE\n\nTienes una venta en curso. Termínala o cancélala antes de abrir otra gestión.'
   );
 }
 
@@ -83,9 +130,13 @@ export function isSaleCue(text: string): boolean {
  * True when one operator sentence carries at least one sale field, so an
  * open draft keeps consuming guided replies/corrections while unrelated
  * searches (no sale field at all) fall through to the normal cascade.
+ * Renewal hints never continue a sale (reserved, safe hold instead).
  */
 export function saleTextContinues(text: string): boolean {
   const extraction = parseSaleExtraction(text);
+  if (extraction.renewalHint === true) {
+    return false;
+  }
   return (
     extraction.service !== undefined ||
     extraction.modality !== undefined ||
@@ -101,9 +152,12 @@ export function saleTextContinues(text: string): boolean {
 }
 
 /**
- * Single-card keyboard per sale result kind. Confirmed cards reuse the
- * Fase 3 credential keyboard EXACTLY (wa.me URL button when prepared);
- * the emergency card never offers Confirmar.
+ * Single-card keyboard per sale result kind. Confirmar/Corregir appear
+ * ONLY on the ready summary; every incomplete state gets the contextual
+ * progress keyboard (Volver/Cancelar + valid next actions, never
+ * Confirmar). Confirmed cards reuse the Fase 3 credential keyboard
+ * EXACTLY (wa.me URL button when prepared); the emergency card never
+ * offers Confirmar.
  */
 export function keyboardForSaleResult(
   result: SaleResult,
@@ -116,7 +170,9 @@ export function keyboardForSaleResult(
     case 'confirmed':
     case 'already-confirmed':
       return credentialCardKeyboard(interactionId, whatsappUrl, { showServices: false });
-    default:
+    case 'summary':
       return draftKeyboard(interactionId);
+    default:
+      return saleProgressKeyboard(interactionId, result.missing);
   }
 }

@@ -98,6 +98,13 @@ export interface SaleExecDeps {
   onAlert?: (alert: { title: string; summary: string }) => void;
 }
 
+/**
+ * Renewal hold reply (Fase 5 reserved): `recarga`/`renueva` sentences
+ * are NEVER a NEW_SALE. Safe response, zero invention, zero draft.
+ */
+export const RENEWAL_HOLD_TEXT =
+  '🔄 Las renovaciones aún no están disponibles. Puedo venderte una cuenta nueva: dime servicio y modalidad.';
+
 export type SaleResultKind =
   | 'summary'
   | 'ask-missing'
@@ -231,6 +238,36 @@ function draftMissingField(draft: NewSaleDraft): string | null {
   return null;
 }
 
+/**
+ * Expected-field design: each sale view declares the ONE field it is
+ * waiting for (the first missing in ask-only-missing order). The webhook
+ * consumes this BEFORE the global router so a natural answer
+ * ("Gabriel Juan", "30 días", "zelle", "Edward"…) fills the draft
+ * instead of being stolen by global search. Exported for the router;
+ * the single source of truth stays `draftMissingField`.
+ */
+export function expectedSaleField(draft: NewSaleDraft): string | null {
+  return draftMissingField(draft);
+}
+
+/**
+ * Confirmar gating: true only when the draft is fully ready —
+ * fields + proposal + price + cost + payment + receiver + customer +
+ * duration, with no pending emergency auth. The keyboard layer shows
+ * Confirmar/Corregir ONLY on ready drafts; incomplete drafts get
+ * Volver/Cancelar + valid next actions.
+ */
+export function isSaleReady(draft: NewSaleDraft): boolean {
+  return (
+    draftMissingField(draft) === null &&
+    draft.proposal !== null &&
+    !draft.proposalAwaitingEmergencyAuth &&
+    !(draft.proposal.emergencyRequired && !draft.proposal.emergencyAuthorized) &&
+    draft.price !== null &&
+    draft.cost !== null
+  );
+}
+
 /** Decides the conversational result for the current draft state. */
 function settle(draft: NewSaleDraft, deps: SaleDeps, customers?: Customer[]): SaleResult {
   if (draft.proposalAwaitingEmergencyAuth && draft.proposal !== null) {
@@ -259,6 +296,19 @@ function settle(draft: NewSaleDraft, deps: SaleDeps, customers?: Customer[]): Sa
       draft,
       customers,
       text: `🧾 Venta nueva — ese número tiene varios clientes. Elige uno:\n${lines.join('\n')}`,
+    };
+  }
+  if (
+    draft.phone !== null &&
+    draft.customer.existingCustomerId === undefined &&
+    draft.customer.proposedCustomer === undefined
+  ) {
+    // Phone known, customer not: the in-sale new-customer prompt (name),
+    // never the generic phone question — BR-CUS-009, Gabriel Juan class.
+    return {
+      kind: 'new-customer',
+      draft,
+      text: renderNewCustomerSalePrompt(draft.phone),
     };
   }
   const missing = draftMissingField(draft);
@@ -301,6 +351,12 @@ export async function prepareNewSaleFromText(
     actor.name,
   );
   const extraction: SaleExtraction = parseSaleExtraction(text);
+
+  if (extraction.renewalHint === true) {
+    // Renewal-reserved (Fase 5): NEVER a NEW_SALE. No draft is created,
+    // nothing is folded — the caller answers the safe hold reply.
+    return { kind: 'clarification', draft: null, text: RENEWAL_HOLD_TEXT };
+  }
 
   if (extraction.unsupported !== undefined) {
     const { draft } = applySalePatch(base, { service: 'netflix', modality: null });
@@ -351,19 +407,54 @@ export async function prepareNewSaleFromText(
     };
   }
 
+  // Phone/customer linking stays BEFORE the precheck so the saved draft
+  // is always complete for confirm revalidation — the precheck only
+  // decides the conversational RESULT (no-inventory/emergency beat the
+  // new-customer prompt and every ask-missing question).
+  let linkedCustomers: Customer[] | undefined;
   if (extraction.phoneRaw !== undefined) {
     const resolved = await resolvePhone(draft, extraction.phoneRaw, deps);
     draft = resolved.draft;
-    deps.store.save(refreshProposal(draft, deps));
+    linkedCustomers = resolved.customers;
+  }
+  // Early inventory precheck: the moment service+modality resolve, the
+  // deterministic precheck runs BEFORE any customer/payment question.
+  // Zero → SIN INVENTARIO (asks nothing else); emergency-only →
+  // emergency card (auth ≠ sale confirm preserved). Confirm still
+  // revalidates at execution time.
+  draft = refreshProposal(draft, deps);
+  deps.store.save(draft);
+  {
     const current = deps.store.get({ chatId: actor.chatId, userId: actor.userId }) ?? draft;
-    if (resolved.customers.length === 0) {
+    if (current.service !== null && current.modality !== null) {
+      if (current.proposalAwaitingEmergencyAuth && current.proposal !== null) {
+        return {
+          kind: 'emergency-auth',
+          draft: current,
+          text:
+            `${renderEmergencyInventoryCard({
+              identifier: current.proposal.serviceAccountId,
+              perfil: current.proposal.evidence.perfil,
+            })}\n\n${summaryText(current, deps)}`,
+        };
+      }
+      if (current.proposal === null) {
+        return { kind: 'no-inventory', draft: current, text: renderSaleNoInventory() };
+      }
+    }
+  }
+
+  if (extraction.phoneRaw !== undefined) {
+    const current = deps.store.get({ chatId: actor.chatId, userId: actor.userId }) ?? draft;
+    const customers = linkedCustomers ?? [];
+    if (customers.length === 0) {
       return {
         kind: 'new-customer',
         draft: current,
         text: renderNewCustomerSalePrompt(extraction.phoneRaw),
       };
     }
-    return settle(current, deps, resolved.customers);
+    return settle(current, deps, customers);
   }
 
   deps.store.save(refreshProposal(draft, deps));
@@ -519,6 +610,51 @@ export async function prepareNewSaleFromAction(
       ...(action.location !== undefined ? { location: action.location } : {}),
     },
   });
+  deps.store.save(refreshProposal(draft, deps));
+  const saved = deps.store.get(owner) ?? draft;
+  return settle(saved, deps);
+}
+
+/**
+ * Resume entry ([Continuar venta] / NL `continuar`): re-renders the
+ * in-progress draft on the same card — re-settle with zero patch, zero
+ * mutation. No open draft → clarification, never a fresh draft.
+ */
+export async function refreshCurrentSale(actor: SaleActor, deps: SaleDeps): Promise<SaleResult> {
+  const owner = { chatId: actor.chatId, userId: actor.userId };
+  const current = deps.store.get(owner);
+  if (current === undefined) {
+    const confirmed = deps.store.confirmed(owner);
+    if (confirmed !== undefined) {
+      return {
+        kind: 'already-confirmed',
+        draft: confirmed,
+        text: renderSaleDraftSummary(confirmed, deps.inventoryRows, deps),
+      };
+    }
+    return { kind: 'clarification', draft: null, text: 'No hay venta abierta que continuar.' };
+  }
+  deps.store.save(refreshProposal(current, deps));
+  const saved = deps.store.get(owner) ?? current;
+  return settle(saved, deps);
+}
+/**
+ * Choice entry: the service/modality option buttons
+ * ([Netflix · Perfil][FlujoTV · Perfil][FlujoTV · Completa]) fold a
+ * structured choice into the SAME open draft (button≡NL with the
+ * equivalent NL sentence). No draft → clarification, never a guess.
+ */
+export async function prepareNewSaleChoice(
+  actor: SaleActor,
+  choice: { service: import('./newSaleDraft').SaleService; modality: import('./pricePolicy').SaleModality },
+  deps: SaleDeps,
+): Promise<SaleResult> {
+  const owner = { chatId: actor.chatId, userId: actor.userId };
+  const current = deps.store.get(owner);
+  if (current === undefined) {
+    return { kind: 'clarification', draft: null, text: 'No hay borrador de venta abierto.' };
+  }
+  const { draft } = applySalePatch(current, { service: choice.service, modality: choice.modality });
   deps.store.save(refreshProposal(draft, deps));
   const saved = deps.store.get(owner) ?? draft;
   return settle(saved, deps);

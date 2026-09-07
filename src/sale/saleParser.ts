@@ -28,6 +28,13 @@ export interface SaleExtraction {
   modality?: SaleModality;
   /** Slice-excluded targets are reported, never coerced (BR-NFX-007). */
   unsupported?: 'netflix-complete';
+  /**
+   * Renewal-reserved words detected (`recarga`, `renueva`, `renovar`…).
+   * When true the sentence is NEVER a NEW_SALE: the caller answers the
+   * safe renewal-hold reply instead of folding any field. Renewal stays
+   * semantically reserved (no Fase 5 implementation here).
+   */
+  renewalHint?: boolean;
   months?: number;
   amount?: number;
   amountCurrency?: PaymentCurrency;
@@ -51,13 +58,26 @@ function fold(text: string): string {
 
 const MONTHS_RE = /(\d{1,2})\s*mes(?:es)?\b/;
 
+/** "30 días/dias" → duration in months (30d ≈ 1 month, rounded, min 1). */
+const DAYS_RE = /(\d{1,3})\s*d[ií]as\b/;
+
+/** "por un mes" / "un mes" — word-form single month. */
+const ONE_MONTH_RE = /\bun\s+mes\b/;
+
+/**
+ * Renewal-reserved words (Fase 5 reserved, NEVER NEW_SALE):
+ * `recarga`, `renueva`, `renovar`, `renovación`… — matched over folded
+ * text so case/accents never slip through.
+ */
+const RENEWAL_RE = /\brecarg|\brenuev|\brenov|\brenew/;
+
 const AMOUNT_EXPLICIT_RE = /(\d+(?:[.,]\d{1,2})?)\s*(usd|usdt|\$|dolares?|bs\.?|bolivares?|ves)\b/;
 
 const AMOUNT_CUE_RE =
   /(?:pago|paga|pagaron|monto|recibi[óo]|recibe|cobro|cuesta|precio|son|de)\w*\s+(?:de\s+)?(\d+(?:[.,]\d{1,2})?)\b/;
 
 const RECEIVER_RE =
-  /(?:recibi[óo]|recibe|recibido\s+por|lo\s+recibi[óo])\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+)?)/;
+  /(?:recibi[óo]|recibe|recibido\s+por|lo\s+recibi[óo]|fue|fueron)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+)?)/;
 
 const REFERENCE_RE = /\bref(?:erencia)?\s*[:#]?\s*([A-Za-z0-9-]{2,32})\b/i;
 
@@ -83,17 +103,42 @@ function currencyFromToken(token: string): PaymentCurrency {
 }
 
 /**
+ * True when the sentence carries renewal-reserved words. Exported so the
+ * webhook entry cue and the interpreter can reserve the semantics in the
+ * same place (single source of truth, never NEW_SALE).
+ */
+export function isRenewalText(text: string): boolean {
+  return RENEWAL_RE.test(fold(text));
+}
+
+/**
  * Deterministic extraction. Never invents: every field is present only
  * when stated verbatim; numbers <7 digits never become phones (parser
  * guard) and 7+-digit runs never become amounts without a currency
  * token or payment cue.
+ *
+ * Real sale language (semantic, typo-tolerant over folded text):
+ * - "dame/sácame/necesito… cuenta/perfil netflix[ por 30 dias]" →
+ *   service + PROFILE modality (Netflix completa is out of scope and
+ *   stays `unsupported`, never asked, never coerced).
+ * - "dame un perfil flujo[gtv][ por 30 dias]" → FLUJOTV shared.
+ * - "cuenta completa [de flujo]" (even with no `flujo` word — only
+ *   COMPLETE modality is sold) → FLUJOTV COMPLETE. Bare "completa" can
+ *   never mean Netflix (out of scope), so no service question follows.
+ * - Renewal words short-circuit everything: renewalHint only, zero
+ *   sale fields — the caller answers the safe hold reply.
  */
 export function parseSaleExtraction(text: string): SaleExtraction {
   const n = fold(text);
   const extraction: SaleExtraction = { splitAttempt: detectSplitPayment(text), isCorrection: false };
 
-  const hasNetflix = /\bnetflix\b/.test(n);
-  const hasFlujo = /\bflujo/.test(n);
+  if (isRenewalText(text)) {
+    extraction.renewalHint = true;
+    return extraction;
+  }
+
+  const hasNetflix = /\bnetflix\b|\bnetflx\b|\bnetlix\b|\bnetflicks?\b/.test(n);
+  const hasFlujo = /\bflujo|\bflugo|\bfluho/.test(n);
   const mentionsComplete = /\bcompleta\b|\bexclusiva\b|\bcuenta completa\b|\bfull\b|\bentera\b/.test(n);
 
   if (hasNetflix && mentionsComplete) {
@@ -106,9 +151,15 @@ export function parseSaleExtraction(text: string): SaleExtraction {
     extraction.service = toDraftService('flujotv');
     if (mentionsComplete) {
       extraction.modality = 'flujotv-complete';
-    } else if (/\bcompartida\b|\bperfil\b/.test(n)) {
+    } else if (/\bcompartida\b|\bperfil\b|\bcuenta\b|\bnueva\b/.test(n)) {
       extraction.modality = 'flujotv-shared';
     }
+  } else if (mentionsComplete) {
+    // Bare "dame una cuenta completa": only COMPLETE is sold, and
+    // Netflix completa is out of scope — FlujoTV complete, never a
+    // service question.
+    extraction.service = toDraftService('flujotv');
+    extraction.modality = 'flujotv-complete';
   }
 
   const months = MONTHS_RE.exec(text);
@@ -116,6 +167,16 @@ export function parseSaleExtraction(text: string): SaleExtraction {
     const count = Number(months[1]);
     if (Number.isInteger(count) && count >= 1 && count <= 24) {
       extraction.months = count;
+    }
+  } else {
+    const days = DAYS_RE.exec(n);
+    if (days?.[1] !== undefined) {
+      const count = Math.max(1, Math.round(Number(days[1]) / 30));
+      if (Number.isInteger(count) && count >= 1 && count <= 24) {
+        extraction.months = count;
+      }
+    } else if (ONE_MONTH_RE.test(n)) {
+      extraction.months = 1;
     }
   }
 

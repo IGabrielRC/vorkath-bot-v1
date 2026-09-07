@@ -206,7 +206,9 @@ export class StubIntentInterpreter implements IntentInterpreter {
     // Sell/renew verbs are CONTRACT-ONLY (future prepareSale/
     // prepareRenewal): no implementation exists, so they stay UNKNOWN
     // and the app executes nothing — never a search, never a draft.
-    if (/(vend|renov)/.test(folded)) {
+    // Renewal words (`recarga`, `renueva`, …) are Fase 5 reserved and
+    // likewise NEVER a new sale.
+    if (/(vend|renov|recarg|renuev|renew)/.test(folded)) {
       return { name: 'UNKNOWN', params: {}, confidence: 1 };
     }
     // Identifier found verbatim in the text → the app searches it
