@@ -778,6 +778,65 @@ export function renderSaleAskMissing(fieldName: string): string {
 }
 
 /**
+ * Batched missing-fields card (smallest-turns invariant): when several
+ * INDEPENDENT fields are missing they are asked ONCE, together, with a
+ * combined example — the operator answers all in ONE message and the
+ * next card shows ONLY the still-missing remainder (never re-asks
+ * resolved fields). A single missing field delegates to
+ * `renderSaleAskMissing` unchanged. Sequential decisions (service/
+ * modality choice, emergency auth) never batch — they keep their own
+ * cards and buttons.
+ */
+export function renderSaleAskMissingBatch(fields: string[]): string {
+  const ordered = fields.filter((field, index) => fields.indexOf(field) === index);
+  if (ordered.length === 0) {
+    return '🧾 Todo listo — preparo el resumen.';
+  }
+  if (ordered.length === 1 && ordered[0] !== undefined) {
+    return renderSaleAskMissing(ordered[0]);
+  }
+  const bullets: string[] = [];
+  const nouns: string[] = [];
+  if (ordered.includes('service')) {
+    bullets.push('• Servicio: ¿Qué servicio vendemos: Netflix o FlujoTV?');
+    nouns.push('servicio');
+  }
+  if (ordered.includes('modality')) {
+    bullets.push('• Modalidad de FlujoTV: compartida o completa.');
+    nouns.push('modalidad');
+  }
+  if (ordered.includes('customer')) {
+    bullets.push('• Teléfono del cliente: envía el número.');
+    nouns.push('teléfono');
+  }
+  if (ordered.includes('months')) {
+    bullets.push('• Duración: ej. «2 meses» o «30 días».');
+    nouns.push('duración');
+  }
+  if (ordered.includes('method')) {
+    bullets.push('• Método de pago: Pago Móvil, Zelle o Binance.');
+    nouns.push('método de pago');
+  }
+  if (ordered.includes('amount')) {
+    bullets.push('• Monto recibido: ej. «recibí 5 USDT».');
+    nouns.push('monto');
+  }
+  if (ordered.includes('receiver')) {
+    bullets.push('• Quién recibió el dinero: Gabriel o Edward.');
+    nouns.push('receptor');
+  }
+  const lines = [
+    `🧾 Venta nueva — faltan ${ordered.length} datos, respóndelos en UN mensaje:`,
+    `Faltan: ${nouns.join(', ')}.`,
+    '',
+    ...bullets,
+    '',
+    'Ej.: «Zelle, 4 dólares, lo recibió Edward».',
+  ];
+  return lines.join('\n');
+}
+
+/**
  * Post-confirm single card (Slice B): the SAME summary the operator
  * confirmed, headed ✅ VENTA CONFIRMADA, followed by the Datos access
  * block. The caller appends the Fase 3 WhatsApp delivery line

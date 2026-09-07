@@ -19,7 +19,13 @@
  */
 
 import { extractPhoneCandidates } from '../parser/fast';
-import { detectSplitPayment, parsePaymentMethod, type PaymentCurrency, type PaymentMethod } from './payments';
+import {
+  currencyForMethod,
+  detectSplitPayment,
+  parsePaymentMethod,
+  type PaymentCurrency,
+  type PaymentMethod,
+} from './payments';
 import type { SaleModality } from './pricePolicy';
 import type { SaleService } from './newSaleDraft';
 
@@ -56,7 +62,7 @@ function fold(text: string): string {
     .toLowerCase();
 }
 
-const MONTHS_RE = /(\d{1,2})\s*mes(?:es)?\b/;
+const MONTHS_RE = /(\d{1,2})\s*mes(?:es)?\b/i;
 
 /** "30 días/dias" → duration in months (30d ≈ 1 month, rounded, min 1). */
 const DAYS_RE = /(\d{1,3})\s*d[ií]as\b/;
@@ -73,11 +79,22 @@ const RENEWAL_RE = /\brecarg|\brenuev|\brenov|\brenew/;
 
 const AMOUNT_EXPLICIT_RE = /(\d+(?:[.,]\d{1,2})?)\s*(usd|usdt|\$|dolares?|bs\.?|bolivares?|ves)\b/;
 
+/** Leading-sign form (`$5`, `$ 5`) → USD. Checked after the trailing form. */
+const AMOUNT_DOLLAR_PREFIX_RE = /\$\s*(\d+(?:[.,]\d{1,2})?)\b/;
+
+/**
+ * Bare amount right after the method word (`zelle 4`, `pago móvil
+ * 1800`): the method implies the currency, so no currency token is
+ * needed and none is re-asked. Guarded to <7 digits so phone runs
+ * (>=7 digits) never become amounts.
+ */
+const AMOUNT_AFTER_METHOD_RE = /(?:zelle|binance|pago\s*movil|pagomovil|movil|usdt)\s+(\d+(?:[.,]\d{1,2})?)\b/i;
+
 const AMOUNT_CUE_RE =
   /(?:pago|paga|pagaron|monto|recibi[óo]|recibe|cobro|cuesta|precio|son|de)\w*\s+(?:de\s+)?(\d+(?:[.,]\d{1,2})?)\b/;
 
 const RECEIVER_RE =
-  /(?:recibi[óo]|recibe|recibido\s+por|lo\s+recibi[óo]|fue|fueron)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+)?)/;
+  /(?:recibi[óo]|recibe|recibido\s+por|lo\s+recibi[óo]|fue|fueron)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+)?)/i;
 
 const REFERENCE_RE = /\bref(?:erencia)?\s*[:#]?\s*([A-Za-z0-9-]{2,32})\b/i;
 
@@ -185,9 +202,28 @@ export function parseSaleExtraction(text: string): SaleExtraction {
     extraction.amount = parseAmountNumber(explicit[1]);
     extraction.amountCurrency = currencyFromToken(explicit[2]);
   } else {
-    const cued = AMOUNT_CUE_RE.exec(n);
-    if (cued?.[1] !== undefined) {
-      extraction.amount = parseAmountNumber(cued[1]);
+    // `$5` / `$ 5`: the sign leads the number (never a phone — amounts
+    // stay <7 digits by the parser guard, phones need >=7 digits).
+    const prefixed = AMOUNT_DOLLAR_PREFIX_RE.exec(text);
+    if (prefixed?.[1] !== undefined) {
+      extraction.amount = parseAmountNumber(prefixed[1]);
+      extraction.amountCurrency = 'USD';
+    } else {
+      // `zelle 4` / `pago móvil 1800`: bare amount after the method —
+      // the method implies the currency (caller fills it in). Phone
+      // runs (>=7 digits) are excluded so numbers stay numbers.
+      const afterMethod = AMOUNT_AFTER_METHOD_RE.exec(n);
+      if (
+        afterMethod?.[1] !== undefined &&
+        afterMethod[1].replace(/\D/g, '').length < 7
+      ) {
+        extraction.amount = parseAmountNumber(afterMethod[1]);
+      } else {
+        const cued = AMOUNT_CUE_RE.exec(n);
+        if (cued?.[1] !== undefined) {
+          extraction.amount = parseAmountNumber(cued[1]);
+        }
+      }
     }
   }
 
@@ -224,6 +260,97 @@ export type MissingSaleField =
   | 'method'
   | 'amount'
   | 'receiver';
+
+/**
+ * Method/currency conflict (never silent conversion): true when the
+ * sentence states BOTH a method and an explicit currency that is NOT
+ * the method's native currency (e.g. `4 dólares por Binance` states
+ * USD against Binance's USDT). The caller asks a minimal
+ * clarification and keeps both stated values — it never reinterprets
+ * one into the other.
+ */
+export function isMethodCurrencyConflict(extraction: SaleExtraction): boolean {
+  if (extraction.method === undefined || extraction.amountCurrency === undefined) {
+    return false;
+  }
+  return currencyForMethod(extraction.method) !== extraction.amountCurrency;
+}
+
+/**
+ * Name-like guard for the customer-name remainder (letters/spaces,
+ * 2–60 chars, no digits, never a reserved command word). Runs over
+ * folded text so case/accents never matter.
+ */
+export function isNameLikeRemainder(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed.length < 2 || trimmed.length > 60) {
+    return false;
+  }
+  if (/\d/.test(trimmed)) {
+    return false;
+  }
+  if (!/[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(trimmed)) {
+    return false;
+  }
+  const n = ` ${fold(trimmed)} `;
+  if (
+    /\b(volver|atras|back|cancel|confirm|continuar|seguir|venta|vende|vender|vendo|datos|whatsapp|wasap|watsap|guasap|wsp|mensaje|inventario|caja|buscar|operar|tasa|precio|codigo|recarg|renuev|renov|zelle|binance|movil|pagomovil|pago|dolar|usdt|usd|ves|bs|bolivar|mes|dias|recibi|recibe|recibio|recibido|recibir)\b/.test(
+      n,
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Customer-name remainder scoped to the draft: strips everything the
+ * deterministic extractors already claimed (receiver clause, phones,
+ * reference, amount/currency, method words, service/modality/duration
+ * tokens, sale verbs, payment fillers) and returns the leftover
+ * name-like segment, if any. Comma-separated answers
+ * (`Zelle, 4 dólares, lo recibió Edward`) collapse to nothing when no
+ * name was stated; `Gabriel Juan lo recibió Edward` yields
+ * `Gabriel Juan`. Never a naive `contains()`: holder matching stays
+ * exact (case-insensitive) at the call site.
+ */
+export function extractNameRemainder(text: string, _extraction: SaleExtraction): string | undefined {
+  let rest = ` ${text} `;
+  const receiverMatch = RECEIVER_RE.exec(text);
+  if (receiverMatch?.[0] !== undefined) {
+    rest = rest.replace(receiverMatch[0], ' ');
+  }
+  for (const candidate of extractPhoneCandidates(text)) {
+    rest = rest.split(candidate.raw).join(' ');
+    rest = rest.split(candidate.digits).join(' ');
+  }
+  const referenceMatch = REFERENCE_RE.exec(text);
+  if (referenceMatch?.[0] !== undefined) {
+    rest = rest.replace(referenceMatch[0], ' ');
+  }
+  // Amount + currency tokens (trailing `4 dólares` and leading `$5` forms).
+  rest = rest.replace(/\d+(?:[.,]\d{1,2})?\s*(usd|usdt|\$|dolares?|bs\.?|bolivares?|ves)\b/gi, ' ');
+  rest = rest.replace(/\$\s*\d+(?:[.,]\d{1,2})?\b/g, ' ');
+  rest = rest.replace(
+    /\b(pago\s*movil|pagomovil|movil|zelle|binance|usdt|usd|ves|bs\.?|bolivares?|dolares?)\b/gi,
+    ' ',
+  );
+  rest = rest.replace(
+    /\b(netflix|netflx|netlix|flujo|flugo|fluho|perfil|compartida|completa|exclusiva|cuenta|nueva|nuevo|vende|vender|vendo|vendemos|dame|damela|sacame|saca|necesito|quiero|para|por|pag[oó]|paga|pagaron|pago|monto|recibi[oó]|recibe|recibido|recibio|lo|fue|fueron|de|del|el|la|los|las|en|un|una|unos|con|al|a|y|e|dame|mes(?:es)?|d[ií]as)\b/gi,
+    ' ',
+  );
+  rest = rest.replace(/\d+/g, ' ');
+  const segments = rest
+    .split(/[,;|\n]+/)
+    .map((part) => part.replace(/^[.\s:—-]+|[.\s:—-]+$/g, '').trim())
+    .filter((part) => part.length > 0);
+  const names = segments.filter((part) => isNameLikeRemainder(part));
+  if (names.length === 0) {
+    return undefined;
+  }
+  names.sort((a, b) => b.length - a.length);
+  return names[0];
+}
 
 /**
  * Ask-only-missing order (BR-SAL-003, BR-UX-001): service → modality →

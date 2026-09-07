@@ -39,6 +39,7 @@ import {
 import { saleEntryKeyboard, salePendingKeyboard } from './keyboards';
 import {
   expectedSaleField,
+  expectedSaleFields,
   prepareNewSaleChoice,
   prepareNewSaleFromAction,
   prepareNewSaleFromText,
@@ -105,6 +106,7 @@ import {
   renderOwnershipWarning,
   renderPhoneNotFound,
   renderSaleAskMissing,
+  renderSaleAskMissingBatch,
   unesc,
 } from './render';
 import {
@@ -1214,10 +1216,18 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return true;
       }
 
+      // Smallest-turns fallback: name every still-missing field (batched
+      // card when several independent fields are open), draft intact,
+      // never a global jump, never Gemini. Sequential decisions
+      // (service/modality) keep their single-question card.
+      const allMissing = expectedSaleFields(open);
+      const sequential = expected === 'service' || expected === 'modality';
       const fallback =
         expected === null
           ? `${renderSaleAskMissing('')} El borrador sigue intacto.`
-          : `🧾 Venta nueva — sigo esperando ${saleFieldLabel(open, expected)}: ${renderSaleAskMissing(expected)} El borrador sigue intacto.`;
+          : sequential || allMissing.length <= 1
+            ? `🧾 Venta nueva — sigo esperando ${saleFieldLabel(open, expected)}: ${renderSaleAskMissing(expected)} El borrador sigue intacto.`
+            : `🧾 Venta nueva — sigo esperando ${allMissing.map((field) => saleFieldLabel(open, field)).join(', ')}: ${renderSaleAskMissingBatch(allMissing)} El borrador sigue intacto.`;
       persistAll();
       await sendSaleCard(
         interaction,

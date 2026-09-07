@@ -17,6 +17,12 @@
  * Lookup safety (BR-CUS-009): customer resolution is READ-ONLY. Unknown
  * phones yield the in-sale new-customer prompt; `proposedCustomer` lives
  * in the draft and no customer write path exists in this module.
+ *
+ * TRANSVERSAL INVARIANT (phases 5-15): ASK ALL CURRENTLY-REQUIRED
+ * MISSING INFO IN THE SMALLEST TURNS — group independent fields into
+ * ONE batched card (`missingFields` + combined example); go sequential
+ * (one primary expected field) ONLY when a decision conditions the
+ * rest (service/modality choice, emergency auth).
  */
 
 import type { Customer } from '../mock/customers';
@@ -28,6 +34,7 @@ import {
   renderNewCustomerSalePrompt,
   renderNewSaleSummary,
   renderSaleAskMissing,
+  renderSaleAskMissingBatch,
   renderSaleNoInventory,
   renderSaleSplitRefused,
   renderSaleUnsupportedNetflixComplete,
@@ -60,7 +67,8 @@ import {
   type AccountStatusResolver,
   type InventoryProposal,
 } from './inventory';
-import { missingSaleFields, parseSaleExtraction, type SaleExtraction } from './saleParser';
+import { missingSaleFields, parseSaleExtraction, extractNameRemainder } from './saleParser';
+import type { SaleExtraction } from './saleParser';
 
 export interface SaleActor extends DraftOwner {
   name: string;
@@ -123,8 +131,10 @@ export interface SaleResult {
   kind: SaleResultKind;
   draft: NewSaleDraft | null;
   text: string;
-  /** Present on `ask-missing` (first missing field). */
+  /** Present on `ask-missing` (primary missing field — sequential decisions only). */
   missing?: string;
+  /** Present on `ask-missing`: ALL currently-required missing fields (batched card). */
+  missingFields?: string[];
   /** Present on `disambiguate` (operator picks one). */
   customers?: Customer[];
   /** Present on `confirmed`/`already-confirmed` (wa.me URL, post-confirm only). */
@@ -213,41 +223,61 @@ function refreshProposal(draft: NewSaleDraft, deps: SaleDeps): NewSaleDraft {
   });
 }
 
-function draftMissingField(draft: NewSaleDraft): string | null {
+/**
+ * ALL currently-required missing fields in ask order (service →
+ * modality → customer/phone → months → method → amount → receiver).
+ * The batched card asks every entry at once; `draftMissingField`
+ * (first entry) stays the primary for sequential scopes only.
+ */
+function missingSaleFieldList(draft: NewSaleDraft): string[] {
+  const missing: string[] = [];
   if (draft.service === null) {
-    return 'service';
+    missing.push('service');
   }
   if (draft.modality === null) {
-    return 'modality';
+    missing.push('modality');
   }
   if (draft.customer.existingCustomerId === undefined && draft.customer.proposedCustomer === undefined) {
-    return 'customer';
+    missing.push('customer');
   }
   if (draft.duration.requestedMonths === null) {
-    return 'months';
+    missing.push('months');
   }
   if (draft.payment.method === null) {
-    return 'method';
+    missing.push('method');
   }
   if (draft.payment.actualAmount === null) {
-    return 'amount';
+    missing.push('amount');
   }
   if (draft.payment.receivedBy === null) {
-    return 'receiver';
+    missing.push('receiver');
   }
-  return null;
+  return missing;
+}
+
+function draftMissingField(draft: NewSaleDraft): string | null {
+  return missingSaleFieldList(draft)[0] ?? null;
 }
 
 /**
- * Expected-field design: each sale view declares the ONE field it is
- * waiting for (the first missing in ask-only-missing order). The webhook
- * consumes this BEFORE the global router so a natural answer
- * ("Gabriel Juan", "30 días", "zelle", "Edward"…) fills the draft
- * instead of being stolen by global search. Exported for the router;
- * the single source of truth stays `draftMissingField`.
+ * Expected-field design: each sale view declares the fields it is
+ * waiting for. `expectedSaleField` (primary = first missing) is kept
+ * for the sequential scopes (service/modality choice, emergency auth,
+ * single-missing fill); `expectedSaleFields` (ALL missing) drives the
+ * batched card and the multi-answer parse. The webhook consumes these
+ * BEFORE the global router so a natural answer (one field or many —
+ * "Gabriel Juan", "30 días", "Zelle, 4 dólares, lo recibió Edward"…)
+ * fills the draft instead of being stolen by global search. Exported
+ * for the router; the single source of truth stays
+ * `missingSaleFieldList`.
  */
 export function expectedSaleField(draft: NewSaleDraft): string | null {
   return draftMissingField(draft);
+}
+
+/** ALL currently-required missing fields (batched card source). */
+export function expectedSaleFields(draft: NewSaleDraft): string[] {
+  return missingSaleFieldList(draft);
 }
 
 /**
@@ -311,9 +341,36 @@ function settle(draft: NewSaleDraft, deps: SaleDeps, customers?: Customer[]): Sa
       text: renderNewCustomerSalePrompt(draft.phone),
     };
   }
-  const missing = draftMissingField(draft);
-  if (missing !== null) {
-    return { kind: 'ask-missing', draft, missing, text: renderSaleAskMissing(missing) };
+  const missing = missingSaleFieldList(draft);
+  // Sequential decisions condition everything downstream (inventory
+  // precheck needs service+modality; emergency auth gates confirm), so
+  // they keep the single-question card with its choice buttons — never
+  // batched with independent fields.
+  if (missing[0] === 'service' || missing[0] === 'modality') {
+    const primary = missing[0];
+    return {
+      kind: 'ask-missing',
+      draft,
+      missing: primary,
+      missingFields: [primary],
+      text: renderSaleAskMissing(primary),
+    };
+  }
+  if (missing.length === 1 && missing[0] !== undefined) {
+    // Single missing: ask only it (primary expected field).
+    return { kind: 'ask-missing', draft, missing: missing[0], missingFields: missing, text: renderSaleAskMissing(missing[0]) };
+  }
+  if (missing.length > 1 && missing[0] !== undefined) {
+    // Independent fields: ONE batched card with ALL of them + a
+    // combined example; the next parse recomputes and shows ONLY the
+    // still-missing remainder (never re-asks resolved fields).
+    return {
+      kind: 'ask-missing',
+      draft,
+      missing: missing[0],
+      missingFields: missing,
+      text: renderSaleAskMissingBatch(missing),
+    };
   }
   return { kind: 'summary', draft, text: summaryText(draft, deps) };
 }
@@ -346,7 +403,7 @@ export async function prepareNewSaleFromText(
   text: string,
   deps: SaleDeps,
 ): Promise<SaleResult> {
-  const { draft: base } = deps.store.create(
+  const { draft: base, resumed } = deps.store.create(
     { chatId: actor.chatId, userId: actor.userId, ...(actor.name !== '' ? { name: actor.name } : {}) },
     actor.name,
   );
@@ -354,7 +411,12 @@ export async function prepareNewSaleFromText(
 
   if (extraction.renewalHint === true) {
     // Renewal-reserved (Fase 5): NEVER a NEW_SALE. No draft is created,
-    // nothing is folded — the caller answers the safe hold reply.
+    // nothing is folded — the caller answers the safe hold reply. A
+    // just-created empty shell is dropped (an open draft from a
+    // previous turn is never touched — the webhook holds its card).
+    if (!resumed) {
+      deps.store.cancel({ chatId: actor.chatId, userId: actor.userId });
+    }
     return { kind: 'clarification', draft: null, text: RENEWAL_HOLD_TEXT };
   }
 
@@ -384,6 +446,45 @@ export async function prepareNewSaleFromText(
   const currency =
     extraction.amountCurrency ?? (method !== undefined ? currencyForMethod(method) : undefined);
 
+  // Scoped name remainder (multifield answers): when the open draft
+  // already holds the phone but no customer, leftover name-like text
+  // fills the proposed name in the SAME parse (`Gabriel Juan lo
+  // recibió Edward` → name + receiver together). Name-vs-holder
+  // collision: an EXACT holder-identity match wins for receiver;
+  // remaining text becomes the customer name (never naive contains() —
+  // `Eduardo` never matches holder `Edward`).
+  let remainderName: string | undefined;
+  if (
+    base.phone !== null &&
+    base.customer.existingCustomerId === undefined &&
+    base.customer.proposedCustomer === undefined &&
+    extraction.phoneRaw === undefined
+  ) {
+    const remainder = extractNameRemainder(text, extraction);
+    if (remainder !== undefined) {
+      const holderHit = matchCashHolder(remainder, holders);
+      if (holderHit !== undefined) {
+        if (receiver === undefined) {
+          receiver = holderHit;
+        }
+      } else {
+        remainderName = remainder;
+      }
+    }
+  }
+
+  // Bare holder word scoped to an open draft (`Edward` answering the
+  // receiver question): exact holder-identity match fills the receiver
+  // (the webhook maps it to `lo recibió …` first; this covers direct
+  // tool entries). Fresh drafts ignore it — a stray name never opens
+  // field state by itself.
+  if (receiver === undefined && extraction.receiverRaw === undefined && resumed) {
+    const bareHit = matchCashHolder(text.trim(), holders);
+    if (bareHit !== undefined) {
+      receiver = bareHit;
+    }
+  }
+
   const patch: SalePatch = {
     ...(extraction.service !== undefined ? { service: extraction.service } : {}),
     ...(extraction.modality !== undefined ? { modality: extraction.modality } : {}),
@@ -393,6 +494,9 @@ export async function prepareNewSaleFromText(
     ...(method !== undefined ? { method } : {}),
     ...(receiver !== undefined ? { receivedBy: receiver } : {}),
     ...(extraction.referenceRaw !== undefined ? { reference: extraction.referenceRaw } : {}),
+    ...(remainderName !== undefined && base.phone !== null
+      ? { proposedCustomer: { name: remainderName, phone: base.phone } }
+      : {}),
   };
   let { draft } = applySalePatch(base, patch);
 
@@ -442,6 +546,34 @@ export async function prepareNewSaleFromText(
         return { kind: 'no-inventory', draft: current, text: renderSaleNoInventory() };
       }
     }
+  }
+
+  // Method/currency conflict (never silent conversion): the sentence
+  // states BOTH a method and an explicit foreign currency (`4 dólares
+  // por Binance` states USD against Binance's native USDT). Both
+  // stated values are kept as-is; a minimal clarification asks the
+  // operator to resolve it — the draft is never silently reinterpreted.
+  // Runs AFTER the inventory precheck (no-inventory/emergency win) and
+  // BEFORE the phone/settle branches, but yields to identity: an
+  // unknown or shared phone still asks customer first, the conflict
+  // resurfacing on the next turn.
+  if (
+    method !== undefined &&
+    extraction.amountCurrency !== undefined &&
+    currencyForMethod(method) !== extraction.amountCurrency &&
+    (linkedCustomers === undefined || linkedCustomers.length === 1)
+  ) {
+    const current = deps.store.get({ chatId: actor.chatId, userId: actor.userId }) ?? draft;
+    const native = currencyForMethod(method);
+    const amountBit = extraction.amount !== undefined ? `${extraction.amount} ` : '';
+    return {
+      kind: 'clarification',
+      draft: current,
+      text:
+        `🧾 «${amountBit}${extraction.amountCurrency} por ${labelForMethod(method)}»: ` +
+        `${labelForMethod(method)} usa ${native}. ¿Confirmamos ${amountBit}${native} ` +
+        `por ${labelForMethod(method)} o fue otro método? Respóndelo en un mensaje.`,
+    };
   }
 
   if (extraction.phoneRaw !== undefined) {
@@ -560,6 +692,7 @@ export async function prepareNewSaleFromAction(
           kind: 'ask-missing',
           draft: outcome.draft,
           missing: outcome.missing,
+          missingFields: [outcome.missing],
           text: renderSaleAskMissing(outcome.missing),
         };
       case 'failed':
