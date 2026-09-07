@@ -22,6 +22,7 @@
 import type { Customer } from '../mock/customers';
 import { groupRowsIntoCustomers } from '../mock/customers';
 import type { MockAccount } from '../mock/excelLoader';
+import type { MockStore } from '../mock/mockStore';
 import {
   renderEmergencyInventoryCard,
   renderNewCustomerSalePrompt,
@@ -32,6 +33,11 @@ import {
   renderSaleUnsupportedNetflixComplete,
   type RenderedNewSaleSummary,
 } from '../telegram/render';
+import {
+  confirmNewSale,
+  type ConfirmFailAt,
+  type SaleClock,
+} from './newSaleConfirm';
 import {
   SALE_CONFIRM_REFUSED_TEXT,
   applySalePatch,
@@ -69,6 +75,27 @@ export interface SaleDeps {
   capacityOverrides?: Record<string, number>;
   /** Resolved holder set; defaults to the documented pair. */
   cashHolders?: string[];
+  /**
+   * Slice B execution seam (opt-in): when present, `confirm-sale` runs
+   * the atomic `confirmNewSale` service against this MockStore.
+   * Absent → Slice A refusal (`confirm-refused`, zero side-effects).
+   */
+  saleExec?: SaleExecDeps;
+}
+
+/**
+ * Slice B execution options for `confirm-sale` (domain/service +
+ * MockStore seam — the Telegram layer never touches these directly).
+ */
+export interface SaleExecDeps {
+  mockStore: MockStore;
+  clock?: SaleClock;
+  statusOf?: AccountStatusResolver;
+  capacityOverrides?: Record<string, number>;
+  priceTable?: import('./pricePolicy').PriceTable;
+  costTable?: import('./pricePolicy').CostTable;
+  failAt?: ConfirmFailAt;
+  onAlert?: (alert: { title: string; summary: string }) => void;
 }
 
 export type SaleResultKind =
@@ -81,6 +108,8 @@ export type SaleResultKind =
   | 'clarification'
   | 'unsupported'
   | 'cancelled'
+  | 'confirmed'
+  | 'already-confirmed'
   | 'confirm-refused';
 
 export interface SaleResult {
@@ -91,13 +120,15 @@ export interface SaleResult {
   missing?: string;
   /** Present on `disambiguate` (operator picks one). */
   customers?: Customer[];
+  /** Present on `confirmed`/`already-confirmed` (wa.me URL, post-confirm only). */
+  whatsappUrl?: string;
 }
 
 function holdersOf(deps: SaleDeps): string[] {
   return deps.cashHolders ?? resolveCashHolders();
 }
 
-function customerDisplayName(draft: NewSaleDraft, deps: SaleDeps): string {
+function customerDisplayName(draft: NewSaleDraft, deps: { inventoryRows: MockAccount[] }): string {
   if (draft.customer.proposedCustomer !== undefined) {
     return draft.customer.proposedCustomer.name;
   }
@@ -113,9 +144,24 @@ function customerDisplayName(draft: NewSaleDraft, deps: SaleDeps): string {
 }
 
 function summaryText(draft: NewSaleDraft, deps: SaleDeps): string {
+  return renderSaleDraftSummary(draft, deps.inventoryRows, deps);
+}
+
+/**
+ * Single-card summary renderer (Slice B export): the SAME summary the
+ * pre-confirm card shows, reused for recalculated + confirmed cards so
+ * the card never forks copy. Credential-free by construction (the input
+ * type carries no secret field).
+ */
+export function renderSaleDraftSummary(
+  draft: NewSaleDraft,
+  rows: MockAccount[],
+  deps?: Pick<SaleDeps, 'inventoryRows'>,
+): string {
+  const source = deps?.inventoryRows ?? rows;
   const granted = draft.duration.grantedMonths;
   const input: RenderedNewSaleSummary = {
-    customerName: customerDisplayName(draft, deps),
+    customerName: customerDisplayName(draft, { inventoryRows: source }),
     phone: draft.phone ?? '—',
     isNewCustomer: draft.customer.proposedCustomer !== undefined,
     modality: draft.modality ?? '?',
@@ -138,7 +184,6 @@ function summaryText(draft: NewSaleDraft, deps: SaleDeps): string {
       ? { pricePolicy: `${draft.price.policyId} ${draft.price.policyVersion}` }
       : {}),
   };
-  void granted;
   return renderNewSaleSummary(input);
 }
 
@@ -355,13 +400,98 @@ export async function prepareNewSaleFromAction(
 ): Promise<SaleResult> {
   const owner = { chatId: actor.chatId, userId: actor.userId };
   if (action.type === 'confirm-sale') {
-    const draft = deps.store.get(owner) ?? null;
-    return { kind: 'confirm-refused', draft, text: SALE_CONFIRM_REFUSED_TEXT };
+    // Slice B execution seam (opt-in): with `saleExec` the confirm runs
+    // the atomic service; without it the Slice A refusal holds (zero
+    // side-effects — locked by the Slice A contract tests).
+    if (deps.saleExec === undefined) {
+      const draft = deps.store.get(owner) ?? null;
+      return { kind: 'confirm-refused', draft, text: SALE_CONFIRM_REFUSED_TEXT };
+    }
+    const summaryFor = (draft: NewSaleDraft): string =>
+      renderSaleDraftSummary(draft, deps.saleExec?.mockStore.accounts ?? deps.inventoryRows, deps);
+    const statusOf = deps.saleExec.statusOf ?? deps.statusOf;
+    const capacityOverrides = deps.saleExec.capacityOverrides ?? deps.capacityOverrides;
+    const outcome = confirmNewSale(
+      { chatId: actor.chatId, userId: actor.userId, ...(actor.name !== '' ? { name: actor.name } : {}) },
+      {
+        drafts: deps.store,
+        store: deps.saleExec.mockStore,
+        ...(statusOf !== undefined ? { statusOf } : {}),
+        ...(capacityOverrides !== undefined ? { capacityOverrides } : {}),
+        ...(deps.saleExec.clock !== undefined ? { clock: deps.saleExec.clock } : {}),
+        ...(deps.saleExec.priceTable !== undefined ? { priceTable: deps.saleExec.priceTable } : {}),
+        ...(deps.saleExec.costTable !== undefined ? { costTable: deps.saleExec.costTable } : {}),
+        ...(deps.saleExec.failAt !== undefined ? { failAt: deps.saleExec.failAt } : {}),
+        ...(deps.saleExec.onAlert !== undefined ? { onAlert: deps.saleExec.onAlert } : {}),
+      },
+      summaryFor,
+    );
+    switch (outcome.kind) {
+      case 'confirmed':
+        return {
+          kind: 'confirmed',
+          draft: deps.store.confirmed(owner) ?? null,
+          text: outcome.text,
+          ...(outcome.confirmation.whatsappUrl !== undefined
+            ? { whatsappUrl: outcome.confirmation.whatsappUrl }
+            : {}),
+        };
+      case 'already-confirmed':
+        return {
+          kind: 'already-confirmed',
+          draft: deps.store.confirmed(owner) ?? null,
+          text: outcome.text,
+          ...(outcome.confirmation.whatsappUrl !== undefined
+            ? { whatsappUrl: outcome.confirmation.whatsappUrl }
+            : {}),
+        };
+      case 'no-inventory':
+        return { kind: 'no-inventory', draft: outcome.draft, text: outcome.text };
+      case 'emergency-auth': {
+        const draft = outcome.draft;
+        return {
+          kind: 'emergency-auth',
+          draft,
+          text:
+            draft.proposal !== null
+              ? `${renderEmergencyInventoryCard({
+                  identifier: draft.proposal.serviceAccountId,
+                  perfil: draft.proposal.evidence.perfil,
+                })}\n\n${summaryFor(draft)}`
+              : outcome.text,
+        };
+      }
+      case 'recalculated':
+      case 'version-conflict':
+        return { kind: 'summary', draft: outcome.draft, text: outcome.text };
+      case 'incomplete':
+        return {
+          kind: 'ask-missing',
+          draft: outcome.draft,
+          missing: outcome.missing,
+          text: renderSaleAskMissing(outcome.missing),
+        };
+      case 'failed':
+        return { kind: 'clarification', draft: outcome.draft, text: outcome.text };
+      case 'no-draft':
+        return { kind: 'clarification', draft: null, text: outcome.text };
+    }
   }
   if (action.type === 'cancel-sale') {
-    const had = deps.store.get(owner) !== undefined;
+    const open = deps.store.get(owner);
+    if (open === undefined) {
+      // A confirmed sale is immutable — cancel never deletes its header
+      // (repeat confirms must keep answering `already confirmed`).
+      if (deps.store.confirmed(owner) !== undefined) {
+        return {
+          kind: 'clarification',
+          draft: null,
+          text: 'La venta ya está confirmada y no se puede cancelar.',
+        };
+      }
+      return { kind: 'cancelled', draft: null, text: 'No hay venta abierta que cancelar.' };
+    }
     deps.store.cancel(owner);
-    void had;
     return { kind: 'cancelled', draft: null, text: '❌ Venta cancelada. No se guardó nada.' };
   }
   const current = deps.store.get(owner);

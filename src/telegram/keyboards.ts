@@ -39,6 +39,8 @@ export type CallbackAction =
   | 'cancel'
   | 'credentials'
   | 'services'
+  | 'saleNew'
+  | 'saleEmergency'
   | 'view0'
   | 'view1'
   | 'view2'
@@ -61,6 +63,8 @@ const SHORT_IDS: Record<CallbackAction, string> = {
   cancel: 'no',
   credentials: 'cred',
   services: 'svc',
+  saleNew: 'snew',
+  saleEmergency: 'semg',
   view0: 'w0',
   view1: 'w1',
   view2: 'w2',
@@ -374,7 +378,8 @@ export function credentialDisambiguationKeyboard(
 }
 
 /** Draft actions: Confirmar / Corregir / Cancelar + ←Volver (nav-stack pop). */
-export function draftKeyboard(interactionId?: string): InlineKeyboardMarkup {  return {
+export function draftKeyboard(interactionId?: string): InlineKeyboardMarkup {
+  return {
     inline_keyboard: [
       [
         ownedButton('✅Confirmar', 'confirm', interactionId),
@@ -426,4 +431,35 @@ export function searchResultsKeyboard(
   }
   rows.push([backButton(interactionId)]);
   return { inline_keyboard: rows };
+}
+
+/**
+ * Sale entry keyboard (Slice B — OPERAR shows only currently-implemented
+ * options): [🛒 Venta nueva] opens the guided NewSale card on the SAME
+ * draft core the sale NL uses (button≡NL), plus ←Volver to Home.
+ * Ownership/topics ride the standard owned-callback path — every button
+ * carries the interaction id.
+ */
+export function saleEntryKeyboard(interactionId?: string): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [ownedButton('🛒 Venta nueva', 'saleNew', interactionId)],
+      [backButton(interactionId)],
+    ],
+  };
+}
+
+/**
+ * Emergency authorization keyboard (Slice B — BR-NFX-005): [Usar
+ * emergencia] authorizes the profile-5 slot EXPLICITLY and separately
+ * from sale confirmation (auth≠sale-confirm); [❌Cancelar] drops the
+ * draft; ←Volver returns to Home. Never a Confirmar button here.
+ */
+export function saleEmergencyKeyboard(interactionId?: string): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [ownedButton('⚠️ Usar emergencia', 'saleEmergency', interactionId)],
+      [ownedButton('❌Cancelar', 'cancel', interactionId), backButton(interactionId)],
+    ],
+  };
 }

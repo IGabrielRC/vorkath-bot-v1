@@ -27,6 +27,21 @@ import type { MockRepositories, SafeAccount } from '../mock/repositories';
 import type { CredentialBundle } from '../mock/credentials';
 import type { MockService } from '../mock/excelLoader';
 import { credentialAssignmentKey, credentialOptionLabels, resolveCredentialView } from '../tools/credentials';
+import type { SaleWebhookDeps } from './saleHandlers';
+import {
+  SALE_ENTRY_TEXT,
+  isSaleCue,
+  keyboardForSaleResult,
+  saleTextContinues,
+} from './saleHandlers';
+import { saleEntryKeyboard } from './keyboards';
+import {
+  prepareNewSaleFromAction,
+  prepareNewSaleFromText,
+  type SaleDeps,
+  type SaleResult,
+} from '../sale/newSaleTool';
+import { resolveCashHolders } from '../sale/payments';
 import {
   buildWhatsAppUrl,
   resolveWhatsAppTarget,
@@ -195,6 +210,16 @@ export interface WebhookDeps {
   interactionsStatePath?: string;
   /** File path for best-effort OperatorProfile persistence; undefined disables it. */
   operatorProfilesStatePath?: string;
+  /**
+   * Slice B NewSale wiring (opt-in): per-operator sale drafts + the live
+   * MOCK store (inventory rows + atomic sale ledger seam). Absent =
+   * legacy behavior unchanged (generic demo drafts, sale NL stays
+   * guarded). Present = OPERAR opens the Venta Nueva entry, sale NL
+   * converges on the same draft core as the buttons, and Confirm
+   * executes the atomic service. Every sale callback travels owned, so
+   * topics/ownership apply unchanged.
+   */
+  sale?: SaleWebhookDeps;
 }
 
 interface TelegramUser {
@@ -667,6 +692,229 @@ export function createWebhookHandler(deps: WebhookDeps) {
       userId: targetActorId,
       ...(targetActorName !== undefined ? { name: targetActorName } : {}),
     };
+
+    /**
+     * Slice B sale deps (additive): the SAME draft core serves button
+     * taps and sale NL (button≡NL). Undefined = legacy behavior
+     * (generic demo drafts only) — every existing test runs this way.
+     */
+    const saleToolDeps: SaleDeps | undefined =
+      deps.sale === undefined
+        ? undefined
+        : {
+            store: deps.sale.saleDrafts,
+            findCustomersByPhone: (raw: string) =>
+              deps.repos.searchCustomersByPhone(raw),
+            inventoryRows: deps.sale.mockStore.accounts,
+            ...(deps.sale.statusOf !== undefined ? { statusOf: deps.sale.statusOf } : {}),
+            ...(deps.sale.capacityOverrides !== undefined
+              ? { capacityOverrides: deps.sale.capacityOverrides }
+              : {}),
+            cashHolders: deps.sale.cashHolders ?? resolveCashHolders(),
+            saleExec: {
+              mockStore: deps.sale.mockStore,
+              ...(deps.sale.clock !== undefined ? { clock: deps.sale.clock } : {}),
+              ...(deps.sale.statusOf !== undefined ? { statusOf: deps.sale.statusOf } : {}),
+              ...(deps.sale.capacityOverrides !== undefined
+                ? { capacityOverrides: deps.sale.capacityOverrides }
+                : {}),
+              onAlert: (alert: { title: string; summary: string }) => {
+                if (deps.sale?.onAlert !== undefined) {
+                  deps.sale.onAlert(alert);
+                  return;
+                }
+                // Technical-failure alerts only (safe summary, no
+                // secrets): fire-and-forget into the alerts topic when
+                // configured, else log. Success never alerts.
+                if (deps.alertsTopicId !== undefined) {
+                  const alerts = new AlertService(deps.client);
+                  void alerts
+                    .sendCriticalAlert(
+                      { chatId: targetChatId, alertsThreadId: deps.alertsTopicId },
+                      {
+                        type: 'sale-failure',
+                        title: alert.title,
+                        summary: alert.summary,
+                        actorName: targetActorName,
+                        timestamp: new Date().toISOString(),
+                      },
+                    )
+                    .catch((error) => {
+                      logger.warn({ error }, 'Sale failure alert failed');
+                    });
+                } else {
+                  logger.warn(
+                    { chatId: targetChatId, title: alert.title },
+                    'Sale failure (alerts topic not configured)',
+                  );
+                }
+              },
+            },
+          };
+
+    function saleActor(): { chatId: number; userId: number; name: string } {
+      return {
+        chatId: targetChatId,
+        userId: targetActorId,
+        name: targetActorName ?? '',
+      };
+    }
+
+    /** True when this actor owns an open OR already-confirmed sale draft. */
+    function hasSaleDraft(): boolean {
+      if (deps.sale === undefined) {
+        return false;
+      }
+      return (
+        deps.sale.saleDrafts.get(owner) !== undefined ||
+        deps.sale.saleDrafts.confirmed(owner) !== undefined
+      );
+    }
+
+    function hasOpenSaleDraft(): boolean {
+      return deps.sale !== undefined && deps.sale.saleDrafts.get(owner) !== undefined;
+    }
+
+    /**
+     * Secret-free sale audit (operationId + safe refs only — never
+     * phones, names, passwords, PINs, or tokens).
+     */
+    function auditSaleResult(result: SaleResult): void {
+      const draft = result.draft;
+      auditor.record({
+        chatId: targetChatId,
+        actorTelegramUserId: targetActorId,
+        ...(targetActorName !== undefined ? { actorName: targetActorName } : {}),
+        actionType: `sale.${result.kind}`,
+        entity: `sale-draft:${targetChatId}:${targetActorId}`,
+        ...(draft === null
+          ? {}
+          : {
+              metadata: {
+                operationId: draft.operationId,
+                version: draft.version,
+                ...(draft.service !== null ? { service: draft.service } : {}),
+                ...(draft.modality !== null ? { modality: draft.modality } : {}),
+                ...(draft.duration.requestedMonths !== null
+                  ? { months: draft.duration.requestedMonths }
+                  : {}),
+                ...(draft.payment.method !== null ? { method: draft.payment.method } : {}),
+                ...(draft.payment.actualAmount !== null
+                  ? { amount: draft.payment.actualAmount }
+                  : {}),
+                ...(draft.payment.currency !== null ? { currency: draft.payment.currency } : {}),
+                ...(draft.payment.receivedBy !== null
+                  ? { receivedBy: draft.payment.receivedBy }
+                  : {}),
+              },
+            }),
+      });
+    }
+
+    /**
+     * Sale NL entry: folds one operator sentence into the actor's sale
+     * draft (full-sentence → single summary + Confirm; partial →
+     * ask-only-missing; corrections recalc the SAME draft). Sends the
+     * single card with its per-kind keyboard (summary → draft keyboard,
+     * emergency → explicit auth keyboard, confirmed → Fase 3 credential
+     * keyboard with the wa.me button).
+     */
+    async function runSaleText(input: string, threadOverride?: number): Promise<void> {
+      if (saleToolDeps === undefined) {
+        return;
+      }
+      const result = await prepareNewSaleFromText(saleActor(), input, saleToolDeps);
+      auditSaleResult(result);
+      const interaction = activeOperationInteraction() ?? createInteraction('OPERATION');
+      persistAll();
+      await sendLabeled(
+        result.text,
+        keyboardForSaleResult(result, interaction.id, result.whatsappUrl),
+        threadOverride ?? interaction.messageThreadId,
+      );
+      if (result.kind === 'confirmed' || result.kind === 'already-confirmed') {
+        deps.interactions.confirm(interaction.id);
+        persistAll();
+      }
+    }
+
+    /**
+     * Sale Confirm entry (button tap or NL `confirmar`): executes the
+     * atomic service when a sale draft is open, answers `already
+     * confirmed` on repeats (zero new rows). Confirm transforms the SAME
+     * card in place (edit when born from a callback).
+     */
+    async function runSaleConfirmFlow(
+      origin: Interaction | undefined,
+      threadOverride?: number,
+    ): Promise<void> {
+      if (saleToolDeps === undefined) {
+        return;
+      }
+      const result = await prepareNewSaleFromAction(
+        saleActor(),
+        { type: 'confirm-sale' },
+        saleToolDeps,
+      );
+      auditSaleResult(result);
+      const interaction =
+        origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
+      persistAll();
+      await sendLabeled(
+        result.text,
+        keyboardForSaleResult(result, interaction.id, result.whatsappUrl),
+        threadOverride ?? interaction.messageThreadId,
+      );
+      if (result.kind === 'confirmed' || result.kind === 'already-confirmed') {
+        deps.interactions.confirm(interaction.id);
+        persistAll();
+      }
+    }
+
+    /** Sale Cancel entry: drops the open draft, persists nothing. */
+    async function runSaleCancelFlow(
+      origin: Interaction | undefined,
+      threadOverride?: number,
+    ): Promise<void> {
+      if (saleToolDeps === undefined) {
+        return;
+      }
+      const result = await prepareNewSaleFromAction(
+        saleActor(),
+        { type: 'cancel-sale' },
+        saleToolDeps,
+      );
+      auditSaleResult(result);
+      const home = createInteraction('HOME');
+      persistAll();
+      await sendLabeled(
+        result.text,
+        homeKeyboard(home.id),
+        threadOverride ?? home.messageThreadId,
+      );
+    }
+
+    /** Sale emergency-auth entry: explicit, separate from confirmation. */
+    async function runSaleEmergencyFlow(
+      origin: Interaction,
+      threadOverride?: number,
+    ): Promise<void> {
+      if (saleToolDeps === undefined) {
+        return;
+      }
+      const result = await prepareNewSaleFromAction(
+        saleActor(),
+        { type: 'authorize-emergency' },
+        saleToolDeps,
+      );
+      auditSaleResult(result);
+      persistAll();
+      await sendLabeled(
+        result.text,
+        keyboardForSaleResult(result, origin.id, result.whatsappUrl),
+        threadOverride ?? origin.messageThreadId,
+      );
+    }
     const draftEntity = `draft:${targetChatId}:${targetActorId}`;
     const fromCallback = callback !== undefined;
     const callbackId = callback?.id;
@@ -708,6 +956,23 @@ export function createWebhookHandler(deps: WebhookDeps) {
 
     const text = message?.text?.trim() ?? '';
     const callbackData = callback?.data;
+    /**
+     * Slice B sale NL interception (additive, pre-router): sale cues
+     * (`quiero vender`, `venta nueva`, `vende…`) and continuations of an
+     * open sale draft (guided replies, corrections) converge on the SAME
+     * draft core as the buttons with ZERO Gemini. Everything else falls
+     * through to the L1/L2/L3 cascade unchanged. Diagnostic commands
+     * never enter the sale flow.
+     */
+    if (saleToolDeps !== undefined && callbackData === undefined && text.length > 0) {
+      const firstToken = (text.split(/\s+/)[0] ?? '').split('@')[0]?.toLowerCase();
+      if (firstToken !== '/topicid' && firstToken !== '/testalert' && firstToken !== '/start') {
+        if (isSaleCue(text) || (hasOpenSaleDraft() && saleTextContinues(text))) {
+          await runSaleText(text);
+          return { ok: true };
+        }
+      }
+    }
     const decision = await route(
       {
         userId: actorId,
@@ -2441,6 +2706,23 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * messages; fresh NL uses the update's own topic.
      */
     async function openOperateDraft(thread?: number): Promise<void> {
+      /**
+       * Slice B entry (additive): with sale wiring, OPERAR shows ONLY
+       * currently-implemented options (Venta nueva — no Renovación, no
+       * full Vencidos/Inventario/Caja, no Bolsa/Cierre). Without sale
+       * wiring the legacy demo draft shell is unchanged.
+       */
+      if (saleToolDeps !== undefined) {
+        const operation = activeOperationInteraction() ?? createInteraction('OPERATION');
+        persistAll();
+        auditDraft('sale.entry', {});
+        await sendLabeled(
+          SALE_ENTRY_TEXT,
+          saleEntryKeyboard(operation.id),
+          thread ?? operation.messageThreadId,
+        );
+        return;
+      }
       const resumed = deps.drafts.isOpen(owner);
       const draft = deps.drafts.create(owner, {
         ...(targetActorName !== undefined ? { ownerName: targetActorName } : {}),
@@ -2789,14 +3071,24 @@ export function createWebhookHandler(deps: WebhookDeps) {
       interaction: Interaction,
     ): Promise<void> {
       if (action === 'home' || action === 'back') {
-        if (action === 'home') {
-          // Explicit root action only — never a navigation fallback.
-          await handleHome(interaction);
+        if (
+          action === 'home' ||
+          saleToolDeps === undefined ||
+          interaction.type !== 'OPERATION'
+        ) {
+          if (action === 'home') {
+            // Explicit root action only — never a navigation fallback.
+            await handleHome(interaction);
+            return;
+          }
+          // Volver = exact previous view of the SAME interaction
+          // (Datos→Servicios→Cliente→Buscar→Home chain via the nav stack).
+          await handleBack(interaction);
           return;
         }
-        // Volver = exact previous view of the SAME interaction
-        // (Datos→Servicios→Cliente→Buscar→Home chain via the nav stack).
-        await handleBack(interaction);
+        // Slice B: Volver from a sale OPERATION root card returns to the
+        // explicit Home root (sale drafts are single-card — no stack).
+        await handleHome(interaction);
         return;
       }
       if (action === 'buscar') {
@@ -2863,6 +3155,21 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return;
       }
       if (action === 'confirm' || action === 'cancel') {
+        /**
+         * Slice B (additive): an open/confirmed sale draft routes Confirm
+         * through the atomic service (repeat taps answer `already
+         * confirmed` with zero new rows); an open sale draft routes
+         * Cancel through the sale cancel (persists nothing). Without a
+         * sale draft the legacy demo path below runs unchanged.
+         */
+        if (saleToolDeps !== undefined && action === 'confirm' && hasSaleDraft()) {
+          await runSaleConfirmFlow(interaction, interaction.messageThreadId);
+          return;
+        }
+        if (saleToolDeps !== undefined && action === 'cancel' && hasOpenSaleDraft()) {
+          await runSaleCancelFlow(interaction, interaction.messageThreadId);
+          return;
+        }
         const kind = action as 'confirm' | 'cancel';
         if (interaction.status !== 'PENDING') {
           // Idempotent repeats: no loop, no recreation, no extra mutation.
@@ -2892,6 +3199,18 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return;
       }
       if (action === 'correct') {
+        // Slice B (additive): sale corrections stay on the SAME sale
+        // draft (the sale NL folds them in); otherwise the legacy guard.
+        if (saleToolDeps !== undefined && hasOpenSaleDraft()) {
+          deps.interactions.touch(interaction.id, { view: 'correct' });
+          persistAll();
+          await sendLabeled(
+            CORRECTION_PROMPT_TEXT,
+            draftKeyboard(interaction.id),
+            interaction.messageThreadId,
+          );
+          return;
+        }
         const blocked = correctGuard();
         if (blocked !== null) {
           const home = createInteraction('HOME');
@@ -2906,6 +3225,28 @@ export function createWebhookHandler(deps: WebhookDeps) {
           draftKeyboard(interaction.id),
           interaction.messageThreadId,
         );
+        return;
+      }
+      /**
+       * Slice B sale buttons (additive): [🛒 Venta nueva] opens the
+       * guided NewSale card on the same draft core the sale NL uses;
+       * [⚠️ Usar emergencia] authorizes profile-5 EXPLICITLY, separate
+       * from sale confirmation. Both travel owned (caller verified).
+       */
+      if (action === 'saleNew') {
+        if (saleToolDeps === undefined) {
+          await ackStale('saleNew');
+          return;
+        }
+        await runSaleText('venta nueva', interaction.messageThreadId);
+        return;
+      }
+      if (action === 'saleEmergency') {
+        if (saleToolDeps === undefined || !hasOpenSaleDraft()) {
+          await ackStale('saleEmergency');
+          return;
+        }
+        await runSaleEmergencyFlow(interaction, interaction.messageThreadId);
         return;
       }
       const viewIndex = viewIndexFor(action);
@@ -3074,11 +3415,19 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return { ok: true };
       }
       if (action === 'confirm') {
+        if (saleToolDeps !== undefined && hasSaleDraft()) {
+          await runSaleConfirmFlow(undefined);
+          return { ok: true };
+        }
         const result = await confirmWithActivity();
         await respondDraft(result.text, true);
         return { ok: true };
       }
       if (action === 'cancel') {
+        if (saleToolDeps !== undefined && hasOpenSaleDraft()) {
+          await runSaleCancelFlow(undefined);
+          return { ok: true };
+        }
         const result = cancelWithIdempotency();
         await respondDraft(result.text, true);
         return { ok: true };
@@ -3115,11 +3464,19 @@ export function createWebhookHandler(deps: WebhookDeps) {
       }
       if (parse.kind === 'command') {
         if (parse.command === 'confirmar') {
+          if (saleToolDeps !== undefined && hasSaleDraft()) {
+            await runSaleConfirmFlow(undefined);
+            return { ok: true };
+          }
           const result = await confirmWithActivity();
           await respondDraft(result.text, true);
           return { ok: true };
         }
         if (parse.command === 'cancelar') {
+          if (saleToolDeps !== undefined && hasOpenSaleDraft()) {
+            await runSaleCancelFlow(undefined);
+            return { ok: true };
+          }
           const result = cancelWithIdempotency();
           await respondDraft(result.text, true);
           return { ok: true };
@@ -3211,6 +3568,12 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return { ok: true };
       }
       if (parse.kind === 'months') {
+        // Slice B (additive): with an open sale draft the month text is
+        // a sale correction on the SAME draft — never the generic demo.
+        if (saleToolDeps !== undefined && hasOpenSaleDraft()) {
+          await runSaleText(text);
+          return { ok: true };
+        }
         // Text input consults ONLY this operator's draft — a peer's
         // pendingInput is never filled, never read, never mutated here.
         const updated = deps.drafts.update(owner, { months: parse.months });
@@ -3357,6 +3720,12 @@ export function createWebhookHandler(deps: WebhookDeps) {
       return { ok: true };
     }
     if (intent.name === 'CORRECTION') {
+      // Slice B (additive): sale corrections fold into the SAME sale
+      // draft; otherwise the legacy generic draft correction.
+      if (saleToolDeps !== undefined && hasOpenSaleDraft()) {
+        await runSaleText(text);
+        return { ok: true };
+      }
       const months = typeof intent.params['months'] === 'number' ? intent.params['months'] : 1;
       const updated = deps.drafts.update(owner, { months });
       if (updated === undefined) {

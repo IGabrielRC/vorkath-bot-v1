@@ -776,3 +776,21 @@ export function renderSaleAskMissing(fieldName: string): string {
       return '🧾 Falta un dato para completar la venta.';
   }
 }
+
+/**
+ * Post-confirm single card (Slice B): the SAME summary the operator
+ * confirmed, headed ✅ VENTA CONFIRMADA, followed by the Datos access
+ * block. The caller appends the Fase 3 WhatsApp delivery line
+ * (`WHATSAPP_PREPARED_TEXT`) plus the `💬 Abrir WhatsApp` URL button via
+ * `credentialCardKeyboard` — this function owns only the header framing
+ * so credential/WhatsApp copy never forks. Repeat confirms pass
+ * `alreadyConfirmed` for the explicit `(ya registrada)` marker.
+ */
+export function renderSaleConfirmed(
+  summary: string,
+  datos: string,
+  alreadyConfirmed = false,
+): string {
+  const head = alreadyConfirmed ? '✅ VENTA CONFIRMADA (ya registrada)' : '✅ VENTA CONFIRMADA';
+  return `${title(head)}\n\n${summary}\n\n${datos}`;
+}

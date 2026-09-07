@@ -8,9 +8,11 @@ import { DraftEngine } from './drafts/engine';
 import { InteractionStore } from './interactions/interactions';
 import { MockStore } from './mock/mockStore';
 import { MockAccountRepositories, type MockRepositories } from './mock/repositories';
+import { NewSaleDraftStore } from './sale/newSaleDraft';
 import { SessionStore } from './session/store';
 import { HttpTelegramClient, type TelegramClient } from './telegram/client';
 import { registerWebhook } from './telegram/setWebhook';
+import type { SaleWebhookDeps } from './telegram/saleHandlers';
 import {
   parseActivityTopicId,
   parseAlertsTopicId,
@@ -53,7 +55,11 @@ export interface AppDeps {
   alertsTopicId?: number;
   /** Draft snapshot path; undefined disables best-effort persist (tests). */
   draftsStatePath?: string;
-  /** Interaction snapshot path; undefined disables best-effort persist (tests). */
+  /**
+   * Slice B NewSale wiring (opt-in): sale drafts + live MOCK store.
+   * Undefined = legacy behavior (generic demo drafts only).
+   */
+  sale?: SaleWebhookDeps;  /** Interaction snapshot path; undefined disables best-effort persist (tests). */
   interactionsStatePath?: string;
   /** OperatorProfile snapshot path; undefined disables best-effort persist (tests). */
   operatorProfilesStatePath?: string;
@@ -93,6 +99,7 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
     operatorTopics,
     ...(activityTopicId !== undefined ? { activityTopicId } : {}),
     ...(alertsTopicId !== undefined ? { alertsTopicId } : {}),
+    ...(deps.sale !== undefined ? { sale: deps.sale } : {}),
     ...(deps.draftsStatePath !== undefined ? { draftsStatePath: deps.draftsStatePath } : {}),
     ...(deps.interactionsStatePath !== undefined
       ? { interactionsStatePath: deps.interactionsStatePath }
@@ -120,6 +127,7 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
 export async function startApp(): Promise<void> {
   const env = loadEnv();
   let repos: MockRepositories;
+  let saleMockStore: MockStore | undefined;
 
   try {
     const store = await MockStore.create({
@@ -127,6 +135,7 @@ export async function startApp(): Promise<void> {
       statePath: env.MOCK_STATE_PATH,
     });
     repos = new MockAccountRepositories(store);
+    saleMockStore = store;
     logger.info({ accounts: store.accounts.length }, 'MOCK store loaded');
   } catch (error) {
     logger.error(error, 'Failed to load MOCK store — booting with empty store');
@@ -168,7 +177,6 @@ export async function startApp(): Promise<void> {
   } catch (error) {
     logger.error(error, 'Failed to load interaction snapshot — booting with empty interactions');
   }
-
   // OperatorProfiles survive redeploys via their own snapshot: a restart
   // keeps every auto-learned display name. Missing file = first boot.
   try {
@@ -188,6 +196,9 @@ export async function startApp(): Promise<void> {
     draftsStatePath: env.DRAFTS_STATE_PATH,
     interactionsStatePath: env.INTERACTIONS_STATE_PATH,
     operatorProfilesStatePath: env.OPERATOR_PROFILES_STATE_PATH,
+    ...(saleMockStore !== undefined
+      ? { sale: { saleDrafts: new NewSaleDraftStore(), mockStore: saleMockStore } }
+      : {}),
   });
   await app.listen({ host: '0.0.0.0', port: env.PORT });
   logger.info({ port: env.PORT }, 'Vokath bot listening');

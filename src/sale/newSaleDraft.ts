@@ -28,7 +28,7 @@ import type { PaymentCurrency, PaymentMethod } from './payments';
 import type { CostSnapshot, PriceSnapshot, SaleModality } from './pricePolicy';
 import type { InventoryEvidence, InventoryProposal } from './inventory';
 
-export type NewSaleStatus = 'DRAFT' | 'CANCELLED';
+export type NewSaleStatus = 'DRAFT' | 'CONFIRMED' | 'CANCELLED';
 
 export interface DraftOwner {
   chatId: number;
@@ -309,6 +309,33 @@ export class NewSaleDraftStore {
   /** Explicit cancel: the draft is dropped — no customer, no reservation. */
   cancel(owner: DraftOwner): boolean {
     return this.drafts.delete(keyOf(owner));
+  }
+
+  /**
+   * Slice B: marks the open draft CONFIRMED (kept for repeat-confirm
+   * lookup — `get` still serves DRAFT-only, `confirmed` serves the
+   * confirmed header). Ledger idempotency lives in MockStore; this flag
+   * only answers "already confirmed" without re-executing.
+   */
+  confirmSale(owner: DraftOwner): NewSaleDraft | undefined {
+    const key = keyOf(owner);
+    const current = this.drafts.get(key);
+    if (current === undefined || current.status !== 'DRAFT') {
+      return undefined;
+    }
+    const confirmed: NewSaleDraft = {
+      ...current,
+      status: 'CONFIRMED',
+      updatedAt: now(),
+    };
+    this.drafts.set(key, confirmed);
+    return confirmed;
+  }
+
+  /** The CONFIRMED header for this owner, if the draft already executed. */
+  confirmed(owner: DraftOwner): NewSaleDraft | undefined {
+    const found = this.drafts.get(keyOf(owner));
+    return found !== undefined && found.status === 'CONFIRMED' ? found : undefined;
   }
 
   /** Slice A: confirm exists as a path but never executes (Slice B). */
