@@ -2,8 +2,11 @@ import pino, { type Logger } from 'pino';
 
 /**
  * Redaction paths covering every secret-bearing field in this service:
- * Telegram token/secret, Gemini key, plus Spanish PII columns
- * (CORREO/CONTRASEÑA) that flow through the MOCK plane.
+ * Telegram token/secret, Gemini key, Spanish PII columns
+ * (CORREO/CONTRASEÑA) that flow through the MOCK plane, plus credential
+ * material (passwords, PINs, WhatsApp URLs/texts). The pino list is a
+ * defense-in-depth backstop — callers must still never log secrets;
+ * see src/audit/audit.ts.
  * See: https://github.com/pinojs/pino/blob/main/docs/redaction.md
  */
 const REDACT_PATHS = [
@@ -13,6 +16,12 @@ const REDACT_PATHS = [
   'api_key',
   'apikey',
   'authorization',
+  'password',
+  'pin',
+  'PIN',
+  'accountPassword',
+  'whatsappUrl',
+  'whatsappText',
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_WEBHOOK_SECRET',
   'GEMINI_API_KEY',
@@ -26,6 +35,12 @@ const REDACT_PATHS = [
   '*.token',
   '*.secret',
   '*.apiKey',
+  '*.password',
+  '*.pin',
+  '*.PIN',
+  '*.accountPassword',
+  '*.whatsappUrl',
+  '*.whatsappText',
   '*.correo',
   '*.contraseña',
   '*.TELEGRAM_BOT_TOKEN',
