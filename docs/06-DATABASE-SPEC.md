@@ -79,11 +79,16 @@ Campos:
 - `id`, `organization_id`;
 - `display_name`;
 - `location_text`;
+- `location_raw` nullable (texto literal indicado);
+- `location_display` nullable (forma limpia para mostrar);
+- `location_city` nullable (solo cuando se afirma, nunca inferida);
+- `location_state_region` nullable (solo cuando se afirma);
+- `location_country` nullable (solo cuando se afirma; `Caracas` sola nunca implica país);
 - `notes`;
 - `status`;
 - timestamps.
 
-No guardar un único teléfono obligatorio en esta tabla.
+No guardar un único teléfono obligatorio en esta tabla. `location_*` es `CUSTOMER_LOCATION`: independiente de `account_country` (`PAIS_CUENTA`) en ambas direcciones —ninguna deriva ni sobrescribe a la otra.
 
 ### `phones`
 

@@ -51,6 +51,7 @@ import {
   attachProposal,
   authorizeEmergency,
   type DraftOwner,
+  type LocationUpdate,
   type NewSaleDraft,
   type NewSaleDraftStore,
   type SalePatch,
@@ -68,8 +69,19 @@ import {
   type AccountStatusResolver,
   type InventoryProposal,
 } from './inventory';
-import { missingSaleFields, parseSaleExtraction, extractNameRemainder, isNameLikeRemainder, unconsumedTurnFragments } from './saleParser';
+import {
+  missingSaleFields,
+  parseSaleExtraction,
+  extractNameRemainder,
+  extractCustomerLocation,
+  buildLocationFromDisplay,
+  isLocationLikeFragment,
+  isLocationShapedLeftover,
+  isNameLikeRemainder,
+  unconsumedTurnFragments,
+} from './saleParser';
 import type { SaleExtraction } from './saleParser';
+import type { CustomerLocation } from '../mock/customers';
 
 export interface SaleActor extends DraftOwner {
   name: string;
@@ -127,6 +139,13 @@ export interface SaleExecDeps {
  */
 export interface ScopedRemainderArgs {
   operation: 'NEW_SALE';
+  /**
+   * Location-only follow-up purpose (Part A): set ONLY on the
+   * OPTIONAL_CUSTOMER_LOCATION_EXTRACTION call, which carries
+   * `allowed: ['location']` and `missing: []` (location is never a
+   * missing field). Never mutates, never touches PAIS_CUENTA.
+   */
+  purpose?: 'OPTIONAL_CUSTOMER_LOCATION_EXTRACTION';
   /** Safe refs only — no phones-as-secrets, no names beyond the draft. */
   known: {
     service?: string;
@@ -218,6 +237,9 @@ export function renderSaleDraftSummary(
 ): string {
   const source = deps?.inventoryRows ?? rows;
   const granted = draft.duration.grantedMonths;
+  const proposedLocation = draft.customer.proposedCustomer?.location ?? null;
+  const pendingLocation = draft.customer.pendingLocation ?? null;
+  const locationUpdate = draft.customer.locationUpdate ?? null;
   const input: RenderedNewSaleSummary = {
     customerName: customerDisplayName(draft, { inventoryRows: source }),
     phone: draft.phone ?? '—',
@@ -227,8 +249,29 @@ export function renderSaleDraftSummary(
     grantedMonths: granted ?? 0,
     ...(draft.proposal !== null
       ? {
-          assignment: `${draft.proposal.serviceAccountId} · ${draft.proposal.evidence.perfil}`,
+          assignmentModality: draft.modality ?? '?',
+          assignmentPerfil: draft.proposal.evidence.perfil,
+          assignmentIdentifier: draft.proposal.serviceAccountId.includes(':')
+            ? (draft.proposal.serviceAccountId.split(':').slice(1).join(':') ??
+              draft.proposal.serviceAccountId)
+            : draft.proposal.serviceAccountId,
           emergencyPending: draft.proposal.emergencyRequired && !draft.proposal.emergencyAuthorized,
+        }
+      : {}),
+    // Presentation shows the human location only: the proposed one for
+    // new customers, the pending one while the name is still collected,
+    // or the explicit update for existing customers. Absent → omitted
+    // (capture-if-provided, never asked).
+    ...(proposedLocation !== null ? { locationDisplay: proposedLocation.display } : {}),
+    ...(proposedLocation === null && pendingLocation !== null
+      ? { locationDisplay: pendingLocation.display }
+      : {}),
+    ...(locationUpdate !== null
+      ? {
+          locationToDisplay: locationUpdate.to.display,
+          ...(locationUpdate.from !== null
+            ? { locationFromDisplay: locationUpdate.from.display }
+            : {}),
         }
       : {}),
     suggestedAmount: draft.price?.suggestedAmount ?? null,
@@ -238,11 +281,88 @@ export function renderSaleDraftSummary(
     methodLabel: draft.payment.method !== null ? labelForMethod(draft.payment.method) : null,
     receivedBy: draft.payment.receivedBy,
     ...(draft.payment.reference !== undefined ? { reference: draft.payment.reference } : {}),
-    ...(draft.price !== null
-      ? { pricePolicy: `${draft.price.policyId} ${draft.price.policyVersion}` }
-      : {}),
   };
   return renderNewSaleSummary(input);
+}
+
+/**
+ * Stored CUSTOMER_LOCATION for the draft's linked existing customer
+ * (`null` when the customer has none or the phone is unavailable).
+ * Read-only lookup — never PAIS_CUENTA, never a write.
+ */
+async function storedLocationFor(
+  draft: NewSaleDraft,
+  deps: SaleDeps,
+): Promise<CustomerLocation | null> {
+  if (draft.customer.existingCustomerId === undefined || draft.phone === null) {
+    return null;
+  }
+  const customers = await deps.findCustomersByPhone(draft.phone);
+  return (
+    customers.find((customer) => customer.id === draft.customer.existingCustomerId)?.ubicacion ??
+    null
+  );
+}
+
+/** Normalizes a parsed location into the domain `CustomerLocation`. */
+function toCustomerLocation(loc: { raw: string; display: string; city?: string; stateRegion?: string; country?: string }): CustomerLocation {
+  return {
+    raw: loc.raw,
+    display: loc.display,
+    ...(loc.city !== undefined ? { city: loc.city } : {}),
+    ...(loc.stateRegion !== undefined ? { stateRegion: loc.stateRegion } : {}),
+    ...(loc.country !== undefined ? { country: loc.country } : {}),
+  };
+}
+
+/**
+ * Folds one explicit current-turn location into the draft
+ * (capture-if-provided, never asked, never blocking):
+ * - proposed new customer → `proposedCustomer.location` (clears any
+ *   pending hold — the name now owns it);
+ * - linked existing customer → `locationUpdate` (keeps the original
+ *   `from`, replaces `to` on repeat mentions);
+ * - phone known but customer unresolved → `pendingLocation` hold until
+ *   the name/selection arrives;
+ * - no anchor at all → unchanged (dropped, never asked).
+ *
+ * Holder collisions (`de Edward`) are ignored: a location that exactly
+ * matches a known cash holder is never stored. PAIS_CUENTA is never
+ * touched — no code path here references it.
+ */
+async function attachSaleLocation(
+  draft: NewSaleDraft,
+  loc: { raw: string; display: string; city?: string; stateRegion?: string; country?: string },
+  deps: SaleDeps,
+): Promise<NewSaleDraft> {
+  const holders = holdersOf(deps);
+  if (matchCashHolder(loc.display, holders) !== undefined) {
+    return draft;
+  }
+  const location = toCustomerLocation(loc);
+  if (draft.customer.proposedCustomer !== undefined) {
+    const { draft: next } = applySalePatch(draft, {
+      proposedCustomer: { ...draft.customer.proposedCustomer, location },
+      pendingLocation: null,
+    });
+    return next;
+  }
+  if (draft.customer.existingCustomerId !== undefined) {
+    const from =
+      draft.customer.locationUpdate?.existingCustomerId === draft.customer.existingCustomerId
+        ? draft.customer.locationUpdate.from
+        : await storedLocationFor(draft, deps);
+    const { draft: next } = applySalePatch(draft, {
+      locationUpdate: { existingCustomerId: draft.customer.existingCustomerId, from, to: location },
+      pendingLocation: null,
+    });
+    return next;
+  }
+  if (draft.phone !== null) {
+    const { draft: next } = applySalePatch(draft, { pendingLocation: location });
+    return next;
+  }
+  return draft;
 }
 
 /** Re-runs inventory + snapshots after any draft change (corrections recalc). */
@@ -572,6 +692,23 @@ export async function prepareNewSaleFromText(
     linkedCustomers = resolved.customers;
   }
 
+  // Pass 1b — optional CUSTOMER_LOCATION (capture-if-provided, never
+  // asked, never blocking): deterministic evident forms first (`de
+  // Caracas`, `Valencia, Carabobo`, `Caracas`…). The claimed span is
+  // stripped from the remainder text so a captured place never becomes
+  // the customer name (`Juan Diaz, Caracas` → name + location).
+  // Holder collisions and anchor-less mentions attach nothing (the
+  // remainder text is then left intact).
+  let remainderText = text;
+  const detectedLocation = extractCustomerLocation(text, extraction);
+  if (detectedLocation !== undefined) {
+    const before = draft;
+    draft = await attachSaleLocation(draft, detectedLocation, deps);
+    if (draft !== before) {
+      remainderText = text.split(detectedLocation.span).join(' ');
+    }
+  }
+
   // Pass 2 — fixed-point extraction (root fix for name-before-needed):
   // parse → fold (above) → resolve dependent state (phone lookup makes
   // customerName required) → recompute missing → re-evaluate UNCONSUMED
@@ -587,8 +724,11 @@ export async function prepareNewSaleFromText(
   // the recibió-family clause, the resumed bare-holder answer, or an
   // exact holder hiding in the leftovers (`Zelle, Edward` → Edward).
   const consumedFragments: string[] = [];
+  if (detectedLocation !== undefined && remainderText !== text) {
+    consumedFragments.push(detectedLocation.span);
+  }
   if (draft.payment.receivedBy === null) {
-    for (const segment of unconsumedTurnFragments(text, extraction)) {
+    for (const segment of unconsumedTurnFragments(remainderText, extraction)) {
       const hit = matchCashHolder(segment, holders);
       if (hit !== undefined) {
         ({ draft } = applySalePatch(draft, { receivedBy: hit }));
@@ -606,7 +746,7 @@ export async function prepareNewSaleFromText(
     ) {
       break;
     }
-    const remainder = extractNameRemainder(text, extraction);
+    const remainder = extractNameRemainder(remainderText, extraction, consumedFragments);
     if (remainder === undefined) {
       break;
     }
@@ -616,8 +756,16 @@ export async function prepareNewSaleFromText(
     if (matchCashHolder(remainder, holders) !== undefined) {
       break;
     }
+    // A held pending location moves into the proposal with the name —
+    // the name now owns it (never duplicated, never asked again).
     ({ draft } = applySalePatch(draft, {
-      proposedCustomer: { name: remainder, phone: draft.phone },
+      proposedCustomer: {
+        name: remainder,
+        phone: draft.phone as string,
+        ...(draft.customer.pendingLocation !== undefined
+          ? { location: draft.customer.pendingLocation }
+          : {}),
+      },
     }));
     consumedFragments.push(remainder);
   }
@@ -636,7 +784,7 @@ export async function prepareNewSaleFromText(
     // never re-enters as ambiguity; inert-by-policy already dropped).
     const consumed = new Set(consumedFragments.map((part) => part.trim()));
     const consumedList = [...consumed];
-    const unconsumed = unconsumedTurnFragments(text, extraction).filter(
+    const unconsumed = unconsumedTurnFragments(remainderText, extraction).filter(
       (part) =>
         !consumed.has(part.trim()) &&
         !consumedList.some((used) => used !== '' && part.trim().startsWith(`${used} `)),
@@ -687,6 +835,71 @@ export async function prepareNewSaleFromText(
           }));
         } else if (decided.field === 'reference' && decided.value.trim() !== '') {
           ({ draft } = applySalePatch(draft, { reference: decided.value.trim() }));
+        }
+      }
+    }
+    // Pass 3b — OPTIONAL_CUSTOMER_LOCATION_EXTRACTION (genuinely-needed
+    // ONLY, at most one call): deterministic extraction ran first; this
+    // fires only when a customer anchor exists, no location is on the
+    // draft yet, and a location-SHAPED leftover remains (capitalized —
+    // lowercase noise like `precio` never fires it; exact holder matches
+    // never fire it). Multi-word phrases fire ONLY when the customer is
+    // already resolved, so a name answer is never stolen as a place.
+    // `missing: []` because location is never a missing field; `allowed:
+    // ['location']` because NOTHING else may come back. Fail-closed:
+    // non-geo values, holder collisions and any other field are
+    // ignored (never asked, never blocking). PAIS_CUENTA is never
+    // touched — this call has no pais channel at all.
+    const locationAbsent =
+      draft.customer.proposedCustomer?.location === undefined &&
+      draft.customer.locationUpdate === undefined &&
+      draft.customer.pendingLocation === undefined;
+    const anchorPresent =
+      draft.phone !== null ||
+      draft.customer.proposedCustomer !== undefined ||
+      draft.customer.existingCustomerId !== undefined;
+    const customerResolved =
+      draft.customer.proposedCustomer?.name !== undefined ||
+      draft.customer.existingCustomerId !== undefined;
+    if (locationAbsent && anchorPresent) {
+      const holderSet = holdersOf(deps);
+      const locationLeftovers = unconsumedTurnFragments(
+        remainderText,
+        extraction,
+        consumedFragments,
+      ).filter(
+        (part) =>
+          isLocationShapedLeftover(part) &&
+          matchCashHolder(part, holderSet) === undefined &&
+          (isLocationLikeFragment(part) || customerResolved),
+      );
+      if (locationLeftovers.length > 0) {
+        const located = await deps.scopedRemainder.interpretRemainder({
+          operation: 'NEW_SALE',
+          purpose: 'OPTIONAL_CUSTOMER_LOCATION_EXTRACTION',
+          known: {
+            ...(draft.service !== null ? { service: draft.service } : {}),
+            ...(draft.modality !== null ? { modality: draft.modality } : {}),
+            ...(draft.duration.requestedMonths !== null
+              ? { months: draft.duration.requestedMonths }
+              : {}),
+            ...(draft.payment.method !== null ? { method: draft.payment.method } : {}),
+            ...(draft.payment.actualAmount !== null ? { amount: draft.payment.actualAmount } : {}),
+            ...(draft.payment.currency !== null ? { currency: draft.payment.currency } : {}),
+          },
+          missing: [],
+          unconsumed: locationLeftovers,
+          allowed: ['location'],
+          currentTurnOnly: true,
+        });
+        if (located !== null && located.field === 'location') {
+          const mapped = buildLocationFromDisplay(located.value);
+          if (
+            mapped !== undefined &&
+            matchCashHolder(mapped.display, holdersOf(deps)) === undefined
+          ) {
+            draft = await attachSaleLocation(draft, mapped, deps);
+          }
         }
       }
     }
@@ -769,7 +982,7 @@ export async function prepareNewSaleFromText(
 }
 
 export type SaleAction =
-  | { type: 'provide-name'; name: string; location?: string }
+  | { type: 'provide-name'; name: string; location?: CustomerLocation }
   | { type: 'select-customer'; customerId: string }
   | { type: 'authorize-emergency' }
   | { type: 'cancel-sale' }
@@ -894,16 +1107,40 @@ export async function prepareNewSaleFromAction(
     return settle(authorized, deps);
   }
   if (action.type === 'select-customer') {
-    const { draft } = applySalePatch(current, { existingCustomerId: action.customerId });
+    // A held pending location converts into the explicit update (same
+    // operation, no separate step): `from` reads the stored value.
+    const pending = current.customer.pendingLocation;
+    let locationUpdate: LocationUpdate | undefined;
+    if (pending !== undefined) {
+      let from: CustomerLocation | null = null;
+      if (current.phone !== null) {
+        const candidates = await deps.findCustomersByPhone(current.phone);
+        from = candidates.find((candidate) => candidate.id === action.customerId)?.ubicacion ?? null;
+      }
+      locationUpdate = { existingCustomerId: action.customerId, from, to: pending };
+    }
+    const { draft } = applySalePatch(current, {
+      existingCustomerId: action.customerId,
+      ...(locationUpdate !== undefined ? { locationUpdate } : {}),
+    });
     deps.store.save(refreshProposal(draft, deps));
     const saved = deps.store.get(owner) ?? draft;
     return settle(saved, deps);
   }
+  // Explicit button location wins; otherwise a held pending location
+  // moves into the proposal with the name (never asked again). Holder
+  // collisions are dropped (never stored as a place).
+  const rawButtonLocation = action.location ?? current.customer.pendingLocation;
+  const buttonLocation =
+    rawButtonLocation !== undefined &&
+    matchCashHolder(rawButtonLocation.display, holdersOf(deps)) !== undefined
+      ? undefined
+      : rawButtonLocation;
   const { draft } = applySalePatch(current, {
     proposedCustomer: {
       name: action.name,
       phone: current.phone ?? '',
-      ...(action.location !== undefined ? { location: action.location } : {}),
+      ...(buttonLocation !== undefined ? { location: buttonLocation } : {}),
     },
   });
   deps.store.save(refreshProposal(draft, deps));

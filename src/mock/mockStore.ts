@@ -55,6 +55,12 @@ export interface SaleLedgerOperation {
   customerId: string;
   customerName: string;
   phone: string;
+  /**
+   * Optional CUSTOMER_LOCATION final value (new-customer proposal or
+   * applied existing-customer update). Display/detail only — never
+   * PAIS_CUENTA, which lives on the slot rows untouched.
+   */
+  customerLocation?: import('./customers').CustomerLocation;
   service: SaleService;
   modality: SaleModality;
   monthsRequested: number;
@@ -364,12 +370,20 @@ export class MockStore {
 
   /**
    * Assigns a free slot row to the confirmed customer: NOMBRE + NUMERO +
-   * FECHA DE INICIO/FIN only. Legacy DIAS/ESTATUS columns are never read
-   * or written here. Returns the prev row copy for rollback.
+   * FECHA DE INICIO/FIN only (+ UBICACION display when the sale carries
+   * one — new-customer location persists ONLY here, at confirm).
+   * Legacy DIAS/ESTATUS columns are never read or written here. Returns
+   * the prev row copy for rollback.
    */
   assignSaleSlot(
     rowIndex: number,
-    patch: { nombre: string; numero: string; fechaInicio: string; fechaFin: string },
+    patch: {
+      nombre: string;
+      numero: string;
+      fechaInicio: string;
+      fechaFin: string;
+      ubicacion?: string | null;
+    },
   ): MockAccount {
     const row = this.accounts[rowIndex];
     if (row === undefined) {
@@ -380,7 +394,34 @@ export class MockStore {
     row.numero = patch.numero;
     row.fechaInicio = patch.fechaInicio;
     row.fechaFin = patch.fechaFin;
+    if (patch.ubicacion !== undefined) {
+      if (patch.ubicacion === null || patch.ubicacion.trim() === '') {
+        delete row.ubicacion;
+      } else {
+        row.ubicacion = patch.ubicacion;
+      }
+    }
     return prev;
+  }
+
+  /**
+   * Applies a confirmed existing-customer location update to EVERY row
+   * owned by that customer (normalized-name match — the MOCK grouping
+   * key). Returns prev copies for rollback. Cancel/no-inventory never
+   * call this (the draft update dies with the draft).
+   */
+  updateCustomerUbicacion(
+    customerId: string,
+    display: string,
+  ): Array<{ rowIndex: number; prev: MockAccount }> {
+    const touched: Array<{ rowIndex: number; prev: MockAccount }> = [];
+    this.accounts.forEach((row, rowIndex) => {
+      if (row.nombre.trim().toLowerCase() === customerId) {
+        touched.push({ rowIndex, prev: { ...row } });
+        row.ubicacion = display;
+      }
+    });
+    return touched;
   }
 
   /** Rollback: restores one slot row from its prev copy. */

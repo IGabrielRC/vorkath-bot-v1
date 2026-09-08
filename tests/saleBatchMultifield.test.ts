@@ -520,7 +520,8 @@ describe('sale new-customer (26–30)', () => {
       fixtureDeps(new NewSaleDraftStore(), rows, repos),
     );
     expect(result.kind).toBe('new-customer');
-    expect(result.text).toContain('nombre del cliente');
+    // Part B: deduped batch card — the name bullet keeps the wording, capitalized.
+    expect(result.text).toContain('Nombre del cliente');
     expect(result.draft?.phone).toBe(UNKNOWN_PHONE);
   });
 

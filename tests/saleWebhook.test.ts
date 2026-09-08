@@ -228,7 +228,8 @@ describe('sale topics (64–69)', () => {
       saleMessage(world.nextUpdateId(), GABRIEL, 'quiero vender un perfil de netflix', T_GABRIEL),
     );
     expect(world.interpreter.calls).toBe(0);
-    expect(world.client.texts().at(-1)).toContain('teléfono');
+    // Part B: deduped batch card — the phone bullet keeps the wording, capitalized.
+    expect(world.client.texts().at(-1)).toContain('Teléfono');
     expect(
       world.saleDrafts.get({ chatId: GROUP_CHAT_ID, userId: GABRIEL }),
     ).not.toBeUndefined();

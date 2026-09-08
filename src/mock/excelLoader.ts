@@ -31,6 +31,12 @@ export interface MockAccount {
   estado: string;
   numero: string;
   pais: string;
+  /**
+   * Optional CUSTOMER_LOCATION display text (MOCK row carry only —
+   * structured detail lives in the draft/ledger; fixture rows omit it
+   * and old persisted state without it still loads).
+   */
+  ubicacion?: string;
 }
 
 interface SheetBinding {
@@ -128,6 +134,7 @@ export function loadFixtureAccounts(fixturePath: string): MockAccount[] {
         estado: asText(get('ESTADO')),
         numero,
         pais: asText(get('PAIS')),
+        ...(asText(get('UBICACION')) !== '' ? { ubicacion: asText(get('UBICACION')) } : {}),
       });
     }
   }

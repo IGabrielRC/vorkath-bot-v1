@@ -467,7 +467,7 @@ describe('sale price/cost (20–27)', () => {
     expect(pendingPriceDecisions().some((d) => d.startsWith('BR-FLW-006'))).toBe(true);
   });
 
-  it('(27) draft price snapshot pins the policy version used', async () => {
+  it('(27) draft price snapshot pins the policy version used (audit-only, never on the card)', async () => {
     const { repos, rows } = await fixtureWorld();
     const store = new NewSaleDraftStore();
     const result = await prepareNewSaleFromText(
@@ -477,7 +477,13 @@ describe('sale price/cost (20–27)', () => {
     );
     expect(result.draft?.price?.policyVersion).toBe('v1');
     expect(result.draft?.cost?.policyVersion).toBe('v1');
-    expect(result.text).toContain('sale-price-policy v1');
+    // Part B: internal metadata (policy ids/versions) never renders —
+    // the snapshots stay on the draft/audit only. The card shows the
+    // human assignment lines + identifier instead.
+    expect(result.text).not.toContain('sale-price-policy');
+    expect(result.text).not.toContain('Política');
+    expect(result.text).toContain('📺 Netflix · Perfil 4');
+    expect(result.text).toContain('📧 hfghfgbghfghg@hotmail.com');
   });
 });
 
@@ -644,7 +650,9 @@ describe('sale draft (38–46)', () => {
     expect(result.kind).toBe('ask-missing');
     expect(result.missing).toBe('customer');
     expect(result.draft?.service).toBe('netflix');
-    expect(result.text).toContain('teléfono');
+    // Part B: the batch card lists each missing field once (deduped —
+    // the phone bullet keeps the `Teléfono` wording, capitalized).
+    expect(result.text).toContain('Teléfono');
   });
 
   it('(40) month correction recalcs the SAME draft (operationId stable, version up)', async () => {

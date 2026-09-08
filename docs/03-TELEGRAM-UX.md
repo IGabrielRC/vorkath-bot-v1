@@ -122,6 +122,8 @@ No tratar inicialmente el correo como búsqueda de cliente. Si existen coinciden
 7. En una transacción: crear/actualizar cliente y teléfono, crear venta/suscripción, asignar slot, registrar pago/caja y auditar.
 8. Generar mensaje de acceso y enlace WhatsApp.
 
+La ubicación del cliente se captura solo si el operador la indica en el mensaje (p. ej. `de Caracas`); nunca se pregunta, nunca bloquea ni añade turnos. Un cliente existente con ubicación explícita muestra la actualización compacta en el resumen (`📍 Ubicación: Caracas → Valencia`) y la aplica al confirmar, sin operación separada.
+
 ### 6.3 Inventario de emergencia
 
 Si solo queda perfil 5 de Netflix:

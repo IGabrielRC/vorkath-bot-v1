@@ -447,6 +447,11 @@ export function confirmNewSale(
 
   const prevRow = { ...(liveRows[proposal.evidence.rowIndex] as MockAccount) };
   const cursor = deps.store.saleLedgerLengths();
+  const ubicacionTouched: Array<{ rowIndex: number; prev: MockAccount }> = [];
+  // Final CUSTOMER_LOCATION (display/detail only — PAIS_CUENTA on the
+  // rows is never read or written by this path).
+  const finalLocation =
+    draft.customer.proposedCustomer?.location ?? draft.customer.locationUpdate?.to;
   try {
     fail('assignment', deps.failAt);
     deps.store.assignSaleSlot(proposal.evidence.rowIndex, {
@@ -454,7 +459,26 @@ export function confirmNewSale(
       numero: customerPhone,
       fechaInicio: startsOn,
       fechaFin: expiresOn,
+      // New-customer location persists ONLY here, at confirm (BR-SAL-009
+      // — cancel/no-inventory never reach this call).
+      ...(draft.customer.proposedCustomer?.location !== undefined
+        ? { ubicacion: draft.customer.proposedCustomer.location.display }
+        : {}),
     });
+    // Existing-customer update: applied on confirm across the
+    // customer's rows (no separate operation); kept (untouched) on
+    // cancel because cancel never reaches this call.
+    if (
+      draft.customer.existingCustomerId !== undefined &&
+      draft.customer.locationUpdate !== undefined
+    ) {
+      ubicacionTouched.push(
+        ...deps.store.updateCustomerUbicacion(
+          draft.customer.existingCustomerId,
+          draft.customer.locationUpdate.to.display,
+        ),
+      );
+    }
     fail('subscription', deps.failAt);
     fail('payment', deps.failAt);
     fail('movement', deps.failAt);
@@ -487,6 +511,7 @@ export function confirmNewSale(
       customerId,
       customerName,
       phone: customerPhone,
+      ...(finalLocation !== undefined ? { customerLocation: { ...finalLocation } } : {}),
       service,
       modality,
       monthsRequested: draft.duration.requestedMonths as number,
@@ -560,6 +585,9 @@ export function confirmNewSale(
     };
   } catch (error) {
     deps.store.restoreSaleSlot(proposal.evidence.rowIndex, prevRow);
+    for (const touched of ubicacionTouched) {
+      deps.store.restoreSaleSlot(touched.rowIndex, touched.prev);
+    }
     deps.store.truncateSaleLedger(cursor);
     const reason = error instanceof Error ? error.message : 'unknown confirm failure';
     deps.onAlert?.({

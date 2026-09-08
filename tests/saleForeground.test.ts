@@ -245,10 +245,11 @@ describe('expected-field 1–6 (Gabriel Juan regression + continuation)', () => 
   it('(1) unknown phone asks the customer name on the sale card (zero Gemini)', async () => {
     const world = await createForegroundWorld();
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'dame una cuenta nueva netflix'));
-    expect(world.client.texts().at(-1)).toContain('teléfono');
+    // Part B: deduped batch card — bullets keep the wording, capitalized.
+    expect(world.client.texts().at(-1)).toContain('Teléfono');
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, '04149990001'));
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('nombre del cliente');
+    expect(last).toContain('Nombre del cliente');
     expect(last).not.toContain('CUENTA NO ENCONTRADA');
     expect(world.interpreter.calls).toBe(0);
     await world.app.close();
@@ -349,7 +350,8 @@ describe('single-card 7–16 (1 send + N edits, 1 foreground max)', () => {
     ]);
     expect(ids.size).toBe(1);
     const stepTexts = world.client.texts();
-    expect(stepTexts[1]).toContain('nombre del cliente');
+    // Part B: deduped batch card — the name bullet keeps the wording, capitalized.
+    expect(stepTexts[1]).toContain('Nombre del cliente');
     expect(stepTexts[2]).toContain('meses');
     expect(stepTexts[3]).toContain('Método de pago');
     expect(stepTexts[6]).toContain('VENTA NUEVA');
@@ -429,7 +431,8 @@ describe('single-card 7–16 (1 send + N edits, 1 foreground max)', () => {
     await walkToNameQuestion(world);
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'continuar'));
     expect(world.client.sends()).toHaveLength(1);
-    expect(world.client.texts().at(-1)).toContain('nombre del cliente');
+    // Part B: deduped batch card — the name bullet keeps the wording, capitalized.
+    expect(world.client.texts().at(-1)).toContain('Nombre del cliente');
     expect(world.saleDrafts.get(ownerOf(world, GABRIEL))).not.toBeUndefined();
     await world.app.close();
   });
@@ -538,7 +541,8 @@ describe('real sale language 23–31 (phrase→intent/params matrix)', () => {
     expect(draft?.service).toBe('netflix');
     expect(draft?.modality).toBe('netflix-profile');
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('teléfono');
+    // Part B: deduped batch card — the phone bullet keeps the wording, capitalized.
+    expect(last).toContain('Teléfono');
     expect(last).not.toMatch(/perfil o completa|compartida o completa/i);
     expect(world.interpreter.calls).toBe(0);
     await world.app.close();

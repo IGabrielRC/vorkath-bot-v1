@@ -33,7 +33,7 @@
 import type { MockStore } from '../mock/mockStore';
 import type { AccountStatusResolver } from '../sale/inventory';
 import type { SaleClock } from '../sale/newSaleConfirm';
-import { isRenewalText, parseSaleExtraction } from '../sale/saleParser';
+import { extractCustomerLocation, isRenewalText, parseSaleExtraction } from '../sale/saleParser';
 import type { SaleResult } from '../sale/newSaleTool';
 import {
   credentialCardKeyboard,
@@ -134,11 +134,16 @@ export function renderSalePendingManagement(): string {
  * open draft keeps consuming guided replies/corrections while unrelated
  * searches (no sale field at all) fall through to the normal cascade.
  * Renewal hints never continue a sale (reserved, safe hold instead).
+ * An explicit location (`vive en Valencia`) continues the draft too —
+ * it folds capture-if-provided (never asked, never blocking).
  */
 export function saleTextContinues(text: string): boolean {
   const extraction = parseSaleExtraction(text);
   if (extraction.renewalHint === true) {
     return false;
+  }
+  if (extractCustomerLocation(text, extraction) !== undefined) {
+    return true;
   }
   return (
     extraction.service !== undefined ||

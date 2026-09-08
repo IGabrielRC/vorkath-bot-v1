@@ -33,6 +33,35 @@ export interface CustomerSubscription {
   numeroRaw: string;
 }
 
+/**
+ * Optional customer location (CUSTOMER_LOCATION — Part A).
+ *
+ * Where the customer lives/operates: free-form residence text, NEVER an
+ * exact address/street/GPS, NEVER geocoded. Fully optional and
+ * backward-compatible: rows/state without it stay valid (`ubicacion`
+ * simply undefined).
+ *
+ * CUSTOMER_LOCATION ≠ PAIS_CUENTA in BOTH directions (BR-CUS-006):
+ * `paisCuenta` (per subscription) is the SERVICE account country;
+ * this is the CUSTOMER's place. Neither ever fills, derives, or
+ * overwrites the other — no code path connects them.
+ */
+export interface CustomerLocation {
+  /** Verbatim as stated (`de Caracas`, `Valencia, Carabobo`). */
+  raw: string;
+  /** Cleaned human display (`Caracas`, `Valencia, Carabobo`). */
+  display: string;
+  /** City as stated — set ONLY when the text asserts it (never inferred). */
+  city?: string;
+  /** State/region as stated — never inferred from the city alone. */
+  stateRegion?: string;
+  /**
+   * Country as stated — set ONLY when the text asserts it (`Bogotá,
+   * Colombia` → Colombia). `Caracas` alone never implies a country.
+   */
+  country?: string;
+}
+
 export interface Customer {
   /** MOCK-stable id: the normalized grouping name (see limit above). */
   id: string;
@@ -40,6 +69,8 @@ export interface Customer {
   /** Individual numbers across every owned row/cell, stable order. */
   phones: string[];
   subscriptions: CustomerSubscription[];
+  /** Optional CUSTOMER_LOCATION (never PAIS_CUENTA — see above). */
+  ubicacion?: CustomerLocation;
 }
 
 export type DerivedStatus = 'Vigente' | 'Por vencer' | 'Vencido' | 'Sin dato';
@@ -96,6 +127,12 @@ export function groupRowsIntoCustomers(rows: MockAccount[]): Customer[] {
     if (customer === undefined) {
       customer = { id: key, nombre: row.nombre.trim(), phones: [], subscriptions: [] };
       byName.set(key, customer);
+    }
+    // First non-empty row location wins (MOCK display derivation only —
+    // the structured draft/ledger record is authoritative in-sale).
+    if (customer.ubicacion === undefined && row.ubicacion !== undefined && row.ubicacion.trim() !== '') {
+      const display = row.ubicacion.trim();
+      customer.ubicacion = { raw: display, display };
     }
     for (const phone of splitStoredNumbers(row.numero)) {
       if (!customer.phones.includes(phone)) {

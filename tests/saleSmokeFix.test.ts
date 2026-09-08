@@ -286,7 +286,8 @@ describe('smoke tool: new-customer converges into the batch path', () => {
     expect(result.missingFields).toEqual(['customer', 'method', 'amount', 'receiver']);
     expect(result.draft?.phone).toBeNull();
     expect(result.text).toContain('UN mensaje');
-    expect(result.text).toContain('teléfono');
+    // Part B: deduped batch card — the phone bullet keeps the wording, capitalized.
+    expect(result.text).toContain('Teléfono');
   });
 
   it('(S2) unknown phone + 3 more missing → ONE name batch (4 shown), same op', async () => {
@@ -405,7 +406,8 @@ describe('smoke webhook: previous context never fills a fresh sale', () => {
     expect(draft?.phone).toBeNull();
     expect(draft?.customer.existingCustomerId).toBeUndefined();
     expect(draft?.customer.proposedCustomer).toBeUndefined();
-    expect(world.client.lastText()).toContain('teléfono');
+    // Part B: deduped batch card — the phone bullet keeps the wording, capitalized.
+    expect(world.client.lastText()).toContain('Teléfono');
     expect(world.client.lastText()).not.toContain('Anny Tovar');
     expect(world.interpreter.calls).toBe(0);
     await world.app.close();
@@ -427,7 +429,8 @@ describe('smoke webhook: previous context never fills a fresh sale', () => {
     );
     const gabriel = world.saleDrafts.get(ownerOf(GABRIEL));
     expect(gabriel?.phone).toBeNull();
-    expect(world.client.lastText()).toContain('teléfono');
+    // Part B: deduped batch card — the phone bullet keeps the wording, capitalized.
+    expect(world.client.lastText()).toContain('Teléfono');
 
     // Same actor after his OWN finished sale: close it explicitly
     // (cancel drops the draft whatever state the ledger left), then a
@@ -440,7 +443,8 @@ describe('smoke webhook: previous context never fills a fresh sale', () => {
     );
     const second = world.saleDrafts.get(ownerOf(GABRIEL));
     expect(second?.phone).toBeNull();
-    expect(world.client.lastText()).toContain('teléfono');
+    // Part B: deduped batch card — the phone bullet keeps the wording, capitalized.
+    expect(world.client.lastText()).toContain('Teléfono');
     expect(world.interpreter.calls).toBe(0);
     await world.app.close();
   });

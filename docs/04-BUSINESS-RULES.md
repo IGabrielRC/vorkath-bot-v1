@@ -23,6 +23,7 @@ Cada regla posee un identificador estable. Las pruebas y decisiones futuras debe
 - **BR-CUS-007:** Normalizar un teléfono NO debe destruir su valor original ni asignar un país sin evidencia.
 - **BR-CUS-008:** Si una búsqueda normal por teléfono no encuentra clientes, Vorkath solo debe informar “no encontrado” y permitir escribir otro número o volver.
 - **BR-CUS-009:** La búsqueda normal por teléfono NO debe ofrecer crear cliente. La creación solo puede ocurrir dentro del flujo explícito de Venta nueva.
+- **BR-CUS-010:** La ubicación del cliente (`CUSTOMER_LOCATION`) se captura solo si el operador la indica —NUNCA se pregunta, nunca bloquea ni añade turnos. No es dirección exacta/calle/GPS y no se geocodifica. `CUSTOMER_LOCATION` ≠ `PAIS_CUENTA` en ambas direcciones: ninguna deriva ni sobrescribe a la otra.
 
 ## 4. Servicios, cuentas y slots
 

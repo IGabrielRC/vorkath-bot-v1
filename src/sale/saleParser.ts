@@ -94,7 +94,7 @@ const AMOUNT_CUE_RE =
   /(?:pago|paga|pagaron|monto|recibi[óo]|recibe|cobro|cuesta|precio|son|de)\w*\s+(?:de\s+)?(\d+(?:[.,]\d{1,2})?)\b/;
 
 const RECEIVER_RE =
-  /(?:recibi[óo]|recibe|recibido\s+por|lo\s+recibi[óo]|fue|fueron)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+)?)/i;
+  /(?:recibi[óo]|recibe|recibido\s+por|lo\s+recibi[óo]|fue|fueron)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+(?!de\b|del\b|en\b|para\b|por\b|con\b)[A-Za-zÁÉÍÓÚÑáéíóúñ]+)?)/i;
 
 const REFERENCE_RE = /\bref(?:erencia)?\s*[:#]?\s*([A-Za-z0-9-]{2,32})\b/i;
 
@@ -258,7 +258,16 @@ export function parseSaleExtraction(text: string): SaleExtraction {
 
   const receiver = RECEIVER_RE.exec(text);
   if (receiver?.[1] !== undefined) {
-    extraction.receiverRaw = receiver[1].trim();
+    // A trailing location preposition belongs to the place, never to
+    // the holder (`lo recibió Edward de Caracas` → receiver `Edward`,
+    // `Caracas` stays for the location pass).
+    const name = receiver[1]
+      .trim()
+      .replace(/\s+(de|del|en|para|por|con)\s*$/i, '')
+      .trim();
+    if (name !== '') {
+      extraction.receiverRaw = name;
+    }
   }
 
   // Case-preserving: references are opaque tokens, never folded.
@@ -323,12 +332,13 @@ export function isNameLikeRemainder(value: string): boolean {
 }
 
 /**
- * Location-inert tokens (domain rule: the current sale model has NO
- * customerLocation requirement — PAIS_CUENTA belongs to credentials,
- * never to NEW_SALE). These fragments stay unused: stripped from
- * remainder edges, never filling fields, never blocking, never
- * persisting. Extend ONLY via an approved domain rule — never by
- * guessing cities.
+ * Location-inert tokens (domain rule, NARROWED by Part A): lowercase or
+ * unanchored city noise stays unused — stripped from remainder edges,
+ * never filling fields, never blocking, never persisting. CAPITALIZED
+ * evident forms (`Caracas`, `de Caracas`, `vive en Caracas`,
+ * `Valencia, Carabobo`…) are captured by `extractCustomerLocation`
+ * instead (capture-if-provided, never asked). Extend ONLY via an
+ * approved domain rule — never by guessing cities.
  */
 const LOCATION_INERT_TOKENS: ReadonlySet<string> = new Set(['caracas']);
 
@@ -354,8 +364,16 @@ function dropInertEdges(tokens: string[]): string[] {
  * also the `unconsumed` contract for the scoped remainder interpreter
  * (genuinely-ambiguous leftovers only; inert-by-policy counts as
  * consumed, never as ambiguity).
+ *
+ * `excludedSpans` (optional, additive): verbatim spans already claimed
+ * by the location extractor — dropped here so a captured `Caracas`
+ * never re-enters as name ambiguity. Compared folded.
  */
-export function unconsumedTurnFragments(text: string, _extraction: SaleExtraction): string[] {
+export function unconsumedTurnFragments(
+  text: string,
+  _extraction: SaleExtraction,
+  excludedSpans: string[] = [],
+): string[] {
   let rest = ` ${text} `;
   const receiverMatch = RECEIVER_RE.exec(text);
   if (receiverMatch?.[0] !== undefined) {
@@ -383,30 +401,41 @@ export function unconsumedTurnFragments(text: string, _extraction: SaleExtractio
     ' ',
   );
   rest = rest.replace(/\d+/g, ' ');
+  const excluded = new Set(excludedSpans.map((span) => fold(span)));
   return rest
     .split(/[,;|\n]+/)
     .map((part) => part.replace(/^[.\s:—-]+|[.\s:—-]+$/g, '').trim())
     .filter((part) => part.length > 0)
     .map((part) => dropInertEdges(part.split(/\s+/).filter(Boolean)).join(' '))
-    .filter((part) => part.length > 0);
+    .filter((part) => part.length > 0)
+    .filter((part) => !excluded.has(fold(part)));
 }
 
 /**
  * Customer-name remainder scoped to the draft: the leading two-word
- * unit of each unconsumed segment, when name-like. Trailing noise stays
- * inert (`Juan Diaz caracas` → `Juan Diaz`; a lone `caracas` → unused).
- * Comma-separated answers (`Zelle, 4 dólares, lo recibió Edward`)
- * collapse to nothing when no name was stated; `Gabriel Juan lo recibió
- * Edward` yields `Gabriel Juan`. Never a naive `contains()`: holder
- * matching stays exact (case-insensitive) at the call site.
+ * unit of each unconsumed segment, when name-like. Lowercase trailing
+ * noise stays inert (`Juan Diaz caracas` → `Juan Diaz`; a lone
+ * `caracas` → unused). CAPITALIZED evident locations (`Juan Diaz,
+ * Caracas`) are claimed by `extractCustomerLocation` BEFORE this runs
+ * (the caller strips the location span from the text first), so they
+ * never reach this function. Comma-separated answers (`Zelle,
+ * 4 dólares, lo recibió Edward`) collapse to nothing when no name was
+ * stated; `Gabriel Juan lo recibió Edward` yields `Gabriel Juan`.
+ * Never a naive `contains()`: holder matching stays exact
+ * (case-insensitive) at the call site.
  *
  * Trade-off (documented): 3+-word names keep their first two words
- * (`Juan Carlos Pérez` → `Juan Carlos`) — location-noise stripping wins
- * over full-length names per the no-location-field domain rule.
+ * (`Juan Carlos Pérez` → `Juan Carlos`); single-word fragments inside
+ * payment-context turns read as places (see `extractCustomerLocation`
+ * L4 — `Caracas, Zelle, 4 dólares, Edward` → location, never name).
  */
-export function extractNameRemainder(text: string, extraction: SaleExtraction): string | undefined {
+export function extractNameRemainder(
+  text: string,
+  extraction: SaleExtraction,
+  excludedSpans: string[] = [],
+): string | undefined {
   const names: string[] = [];
-  for (const segment of unconsumedTurnFragments(text, extraction)) {
+  for (const segment of unconsumedTurnFragments(text, extraction, excludedSpans)) {
     const candidate = segment.split(/\s+/).filter(Boolean).slice(0, 2).join(' ');
     if (candidate.length > 0 && isNameLikeRemainder(candidate)) {
       names.push(candidate);
@@ -420,10 +449,395 @@ export function extractNameRemainder(text: string, extraction: SaleExtraction): 
 }
 
 /**
+ * Optional CUSTOMER_LOCATION extraction — deterministic, evident forms
+ * first (Part A: capture-if-provided, NEVER asked, never blocking).
+ *
+ * Capture order (first hit wins, caller strips `span` before the name
+ * pass so places never become names):
+ * - L1 strong prepositions (`vive en`, `reside en`, `radicado en`,
+ *   `ubicado en`, `está en`, `soy de`, `es de`, `desde`): the value is
+ *   always a place (single token, `Ciudad, Región` pair, or a
+ *   multi-word place like `San Juan de los Morros`).
+ * - L2 weak preposition + pair (`de Valencia, Carabobo`).
+ * - L3 bare pair with a single-token left side (`Valencia, Carabobo`,
+ *   `Miami, Florida`, `Bogotá, Colombia`). A two-word left side
+ *   (`Juan Diaz, Caracas`) is NOT a pair — the right side falls to L5.
+ * - L4 weak preposition + single token (`de Caracas`, `en Caracas`).
+ * - L5 single capitalized token (`Caracas`, `Chile`): a one-word
+ *   comma segment that is location-like. The caller gates this on
+ *   anchor context (phone/method/amount/receiver in the turn or a
+ *   customer already on the draft) — a bare `Caracas` answering the
+ *   name question stays a NAME.
+ *
+ * Conservative by construction (never hallucinated hierarchy):
+ * - A single token sets ONLY `city` (`Caracas` never implies a
+ *   country).
+ * - A pair sets `city` + (`country` when the right side names a known
+ *   country, else `stateRegion`). `KNOWN_COUNTRIES` is a display-mapping
+ *   aid ONLY — capture never depends on it (no whitelist).
+ * - Values must start uppercase in the ORIGINAL text: lowercase noise
+ *   (`caracas`) stays inert (the T7/T9 contract holds).
+ * - Service words (`Netflix`), sale/payment words and digits are never
+ *   places. Cash-holder collisions (`de Edward`) are dropped by the
+ *   caller (it owns the holder set) — never here.
+ *
+ * Trade-off (documented): inside payment-context turns a one-word
+ * fragment reads as a place even if it could be a first name (`Ana,
+ * Zelle, 4 dólares, Edward` → location Ana). Two-word names are never
+ * affected (`Juan Pérez, Zelle, …` → name). PAIS_CUENTA is never
+ * touched: this function has no pais parameter, no pais return, and no
+ * caller may map its output into a pais field.
+ */
+export interface ParsedCustomerLocation {
+  /** Verbatim as stated (`de Caracas`, `Valencia, Carabobo`). */
+  raw: string;
+  /** Cleaned human display (`Caracas`, `Valencia, Carabobo`). */
+  display: string;
+  city?: string;
+  stateRegion?: string;
+  country?: string;
+  /** Exact span the caller strips before the name pass. */
+  span: string;
+}
+
+/** Display-mapping aid ONLY (pair right-side → country vs region). */
+const KNOWN_COUNTRIES: ReadonlySet<string> = new Set(
+  [
+    'venezuela',
+    'colombia',
+    'chile',
+    'argentina',
+    'peru',
+    'ecuador',
+    'mexico',
+    'brasil',
+    'espana',
+    'panama',
+    'republica dominicana',
+    'dominicana',
+    'estados unidos',
+    'usa',
+    'eeuu',
+    'uruguay',
+    'paraguay',
+    'bolivia',
+    'costa rica',
+    'portugal',
+    'italia',
+    'francia',
+    'alemania',
+    'canada',
+  ].map((entry) => entry),
+);
+
+/** Words that can never be (part of) a place value. */
+const LOCATION_BLOCKED_FOLDED: ReadonlySet<string> = new Set([
+  'netflix',
+  'netflx',
+  'netlix',
+  'flujo',
+  'flugo',
+  'fluho',
+  'perfil',
+  'compartida',
+  'completa',
+  'exclusiva',
+  'cuenta',
+  'nueva',
+  'nuevo',
+  'zelle',
+  'binance',
+  'movil',
+  'pagomovil',
+  'pago',
+  'dolar',
+  'dolares',
+  'usdt',
+  'usd',
+  'ves',
+  'bs',
+  'bolivar',
+  'bolivares',
+  'mes',
+  'meses',
+  'dias',
+  'recibi',
+  'recibe',
+  'recibio',
+  'recibido',
+  'recibir',
+]);
+
+const GEO_WORD_RE = /^[A-Za-zÁÉÍÓÚÑáéíóúñ][A-Za-zÁÉÍÓÚÑáéíóúñ.\-]*$/;
+const GEO_CONNECTOR_RE = /^(de|del|la|el|los|las|y)$/;
+
+function isGeoPart(value: string, maxWords: number): boolean {
+  const words = value.split(/\s+/).filter(Boolean);
+  if (words.length === 0 || words.length > maxWords) {
+    return false;
+  }
+  const first = words[0];
+  if (first === undefined || !GEO_WORD_RE.test(first)) {
+    return false;
+  }
+  // Uppercase start REQUIRED in the original text (lowercase noise
+  // stays inert).
+  if (first[0] !== first[0]?.toUpperCase()) {
+    return false;
+  }
+  for (const word of words) {
+    if (GEO_CONNECTOR_RE.test(fold(word))) {
+      continue;
+    }
+    if (!GEO_WORD_RE.test(word)) {
+      return false;
+    }
+    if (LOCATION_BLOCKED_FOLDED.has(fold(word))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Comma-cleaned working text (commas preserved for pair detection). */
+function stripForLocation(text: string): string {
+  let rest = ` ${text} `;
+  const receiverMatch = RECEIVER_RE.exec(text);
+  if (receiverMatch?.[0] !== undefined) {
+    rest = rest.replace(receiverMatch[0], ' ');
+  }
+  for (const candidate of extractPhoneCandidates(text)) {
+    rest = rest.split(candidate.raw).join(' ');
+    rest = rest.split(candidate.digits).join(' ');
+  }
+  const referenceMatch = REFERENCE_RE.exec(text);
+  if (referenceMatch?.[0] !== undefined) {
+    rest = rest.replace(referenceMatch[0], ' ');
+  }
+  rest = rest.replace(/\d+(?:[.,]\d{1,2})?\s*(usd|usdt|\$|dolares?|bs\.?|bolivares?|ves)(?![A-Za-z0-9_])/gi, ' ');
+  rest = rest.replace(/\$\s*\d+(?:[.,]\d{1,2})?\b/g, ' ');
+  rest = rest.replace(
+    /\b(pago\s*movil|pagomovil|movil|zelle|binance|usdt|usd|ves|bs\.?|bolivares?|dolares?)\b/gi,
+    ' ',
+  );
+  rest = rest.replace(/\d+/g, ' ');
+  return rest;
+}
+
+function buildPairLocation(
+  raw: string,
+  left: string,
+  right: string,
+  leftMaxWords = 1,
+): ParsedCustomerLocation | undefined {
+  const city = left.trim();
+  const second = right.trim();
+  // Both sides single tokens (pairs never swallow names: `Juan Diaz,
+  // Caracas` is name + place, never `city: Juan Diaz`). Strong
+  // prepositions alone allow a multi-word left side (`vive en San
+  // Juan, Puerto Rico`).
+  if (!isGeoPart(city, leftMaxWords) || !isGeoPart(second, 1)) {
+    return undefined;
+  }
+  const display = `${city}, ${second}`;
+  const base: ParsedCustomerLocation = { raw: raw.trim(), display, city, span: raw.trim() };
+  if (KNOWN_COUNTRIES.has(fold(second))) {
+    return { ...base, country: second };
+  }
+  return { ...base, stateRegion: second };
+}
+
+function buildSingleLocation(raw: string, value: string, maxWords: number): ParsedCustomerLocation | undefined {
+  const display = value.trim();
+  if (!isGeoPart(display, maxWords)) {
+    return undefined;
+  }
+  const single = display.split(/\s+/).filter(Boolean).length === 1;
+  const location: ParsedCustomerLocation = { raw: raw.trim(), display, span: raw.trim() };
+  if (single) {
+    // Single tokens assert ONLY the city — never a country (Caracas
+    // alone implies nothing beyond itself).
+    return { ...location, city: display };
+  }
+  return location;
+}
+
+const PREP_STRONG =
+  'vive\\s+en|vivo\\s+en|reside\\s+en|radicad[oa]\\s+en|ubicad[oa]\\s+en|est[aá]\\s+en|soy\\s+de|es\\s+de|desde';
+const GEO_ONE = '[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ.\\-]*';
+const GEO_WORD = `(?:${GEO_ONE}|de|del|la|el|los|las|y)`;
+const PAIR_END = '(?=\\s*[,;]|\\s*$)';
+/** L1a: strong prep + pair (`vive en Bogotá, Colombia`; right side ALWAYS single). */
+const STRONG_PREP_PAIR_RE = new RegExp(
+  `\\b(${PREP_STRONG})\\s+(${GEO_ONE}(?:\\s+${GEO_WORD}){0,4})\\s*,\\s*(${GEO_ONE})${PAIR_END}`,
+);
+/** L1b: strong prep + place without comma (`vive en Caracas`, `reside en San Juan de los Morros`). */
+const STRONG_PREP_SINGLE_RE = new RegExp(
+  `\\b(${PREP_STRONG})\\s+(${GEO_ONE}(?:\\s+${GEO_WORD}){0,4})${PAIR_END}`,
+);
+/** L2: weak prep + single-single pair (`de Valencia, Carabobo` — never `de Caracas, Juan Diaz`). */
+const WEAK_PREP_PAIR_RE = new RegExp(`\\b(de|en)\\s+(${GEO_ONE})\\s*,\\s*(${GEO_ONE})${PAIR_END}`);
+/** L3: bare single-single pair (`Miami, Florida` — never `Juan Diaz, Caracas`). */
+const BARE_PAIR_RE = new RegExp(`(^|[,;])\\s*(${GEO_ONE})\\s*,\\s*(${GEO_ONE})${PAIR_END}`, 'g');
+/** L4: weak prep + single token (`de Caracas`). */
+const WEAK_PREP_SINGLE_RE = new RegExp(`\\b(de|en)\\s+(${GEO_ONE})${PAIR_END}`);
+
+export function extractCustomerLocation(
+  text: string,
+  _extraction: SaleExtraction,
+): ParsedCustomerLocation | undefined {
+  const clean = stripForLocation(text);
+  // L1a: strong preposition + pair (multi-word left allowed ONLY here).
+  const strongPair = STRONG_PREP_PAIR_RE.exec(clean);
+  if (strongPair?.[0] !== undefined && strongPair?.[2] !== undefined && strongPair?.[3] !== undefined) {
+    const pair = buildPairLocation(strongPair[0], strongPair[2], strongPair[3], 5);
+    if (pair !== undefined) {
+      return pair;
+    }
+  }
+  // L1b: strong preposition + comma-less place.
+  const strong = STRONG_PREP_SINGLE_RE.exec(clean);
+  if (strong?.[0] !== undefined && strong?.[2] !== undefined) {
+    const single = buildSingleLocation(strong[0], strong[2], 5);
+    if (single !== undefined) {
+      return single;
+    }
+  }
+  // L2: weak preposition + pair (`de Valencia, Carabobo`).
+  const weakPair = WEAK_PREP_PAIR_RE.exec(clean);
+  if (weakPair?.[0] !== undefined && weakPair?.[2] !== undefined && weakPair?.[3] !== undefined) {
+    const pair = buildPairLocation(weakPair[0], weakPair[2], weakPair[3]);
+    if (pair !== undefined) {
+      return pair;
+    }
+  }
+  // L3: bare pair with single-token sides (`Miami, Florida` —
+  // never `Juan Diaz, Caracas`, whose left side is a name).
+  for (const match of clean.matchAll(BARE_PAIR_RE)) {
+    const left = match[2] ?? '';
+    const right = match[3] ?? '';
+    if (left.split(/\s+/).filter(Boolean).length !== 1) {
+      continue;
+    }
+    const pair = buildPairLocation(`${left}, ${right}`, left, right);
+    if (pair !== undefined) {
+      return pair;
+    }
+  }
+  // L4: weak preposition + single token (`de Caracas`).
+  const weakSingle = WEAK_PREP_SINGLE_RE.exec(clean);
+  if (weakSingle?.[0] !== undefined && weakSingle?.[2] !== undefined) {
+    const single = buildSingleLocation(weakSingle[0], weakSingle[2], 1);
+    if (single !== undefined) {
+      return single;
+    }
+  }
+  // L5: single capitalized token among the comma segments (`Caracas`
+  // in `Caracas, Zelle, 4 dólares, Edward` — method/amount/receiver
+  // already stripped above, so only true leftovers are scanned).
+  for (const segment of clean
+    .split(/[,;|\n]+/)
+    .map((part) => part.replace(/^[.\s:—-]+|[.\s:—-]+$/g, '').trim())
+    .filter((part) => part.length > 0)) {
+    const tokens = segment.split(/\s+/).filter(Boolean);
+    if (tokens.length !== 1 || tokens[0] === undefined) {
+      continue;
+    }
+    const single = buildSingleLocation(tokens[0], tokens[0], 1);
+    if (single !== undefined) {
+      return single;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * True when a fragment is location-shaped (capitalized, geo-like):
+ * the gate for the OPTIONAL_CUSTOMER_LOCATION_EXTRACTION scoped call
+ * (genuinely-needed only — lowercase noise like `precio` never fires
+ * it) and for location-aware sale continuation.
+ */
+export function isLocationLikeFragment(value: string): boolean {
+  const trimmed = value.trim().replace(/^[.\s:—-]+|[.\s:—-]+$/g, '');
+  if (trimmed === '' || trimmed.includes(',')) {
+    return false;
+  }
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  if (tokens.length !== 1 || tokens[0] === undefined) {
+    return false;
+  }
+  return isGeoPart(tokens[0], 1);
+}
+
+/**
+ * True when a leftover fragment is shaped like an unparsed place the
+ * deterministic pass could not claim: single capitalized tokens (rare
+ * — L5 usually claims them) or multi-word capitalized phrases with
+ * only geo connectors (`San Juan de los Morros`). Lowercase noise,
+ * digits, sale/service words and holder-like collisions never qualify
+ * (the caller additionally drops exact holder matches — it owns the
+ * holder set). The caller fires the scoped call for multi-word phrases
+ * ONLY when the customer is already resolved, so a name answer can
+ * never be stolen as a place.
+ */
+export function isLocationShapedLeftover(value: string): boolean {
+  const trimmed = value.trim().replace(/^[.\s:—-]+|[.\s:—-]+$/g, '');
+  if (trimmed === '' || /\d/.test(trimmed)) {
+    return false;
+  }
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 5) {
+    return false;
+  }
+  if (tokens.length === 1) {
+    return isLocationLikeFragment(trimmed);
+  }
+  return isGeoPart(trimmed, 5);
+}
+
+/**
+ * Maps a scoped-interpreter `location` value (or any stated display)
+ * into a conservative `CustomerLocation`: pair → city + country/region
+ * (country ONLY when asserted), single token → city only, longer geo
+ * phrases → display only (never inferred hierarchy). Returns undefined
+ * for non-geo values (fail-closed: never invents).
+ */
+export function buildLocationFromDisplay(
+  stated: string,
+): import('../mock/customers').CustomerLocation | undefined {
+  const display = stated.trim().replace(/^[.\s:—-]+|[.\s:—-]+$/g, '');
+  if (display === '') {
+    return undefined;
+  }
+  if (display.includes(',')) {
+    const [left = '', right = ''] = display.split(',', 2).map((part) => part.trim());
+    if (!isGeoPart(left, 1) || !isGeoPart(right, 3)) {
+      return undefined;
+    }
+    const shown = `${left}, ${right}`;
+    if (KNOWN_COUNTRIES.has(fold(right))) {
+      return { raw: stated.trim(), display: shown, city: left, country: right };
+    }
+    return { raw: stated.trim(), display: shown, city: left, stateRegion: right };
+  }
+  if (!isGeoPart(display, 5)) {
+    return undefined;
+  }
+  if (display.split(/\s+/).filter(Boolean).length === 1) {
+    return { raw: stated.trim(), display, city: display };
+  }
+  return { raw: stated.trim(), display };
+}
+
+/**
  * Ask-only-missing order (BR-SAL-003, BR-UX-001): service → modality →
  * customer/phone → months → method → amount → receiver. Fields already
  * on the draft never re-ask. `unsupported` short-circuits everything:
  * the caller reports instead of asking.
+ *
+ * NOTE: `location` is deliberately ABSENT — CUSTOMER_LOCATION is
+ * capture-if-provided, never asked, never blocking, and adds zero
+ * turns (Part A).
  */
 export function missingSaleFields(extraction: SaleExtraction): MissingSaleField[] | { unsupported: 'netflix-complete' } {
   if (extraction.unsupported !== undefined) {

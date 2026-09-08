@@ -639,9 +639,28 @@ export interface RenderedNewSaleSummary {
   modality: 'netflix-profile' | 'flujotv-shared' | 'flujotv-complete' | string;
   requestedMonths: number;
   grantedMonths: number;
-  /** `serviceAccountId · perfil` proposal line — never credentials. */
+  /**
+   * Structured proposal (preferred): renders the human assignment
+   * lines (`📺 Netflix · Perfil 4` + `📧 cuenta`, FlujoTV
+   * perfil/completa equivalents, identifier always shown).
+   */
+  assignmentModality?: 'netflix-profile' | 'flujotv-shared' | 'flujotv-complete' | string;
+  /** PERFIL as stored (Netflix parenthesized number is humanized). */
+  assignmentPerfil?: string;
+  /** Service account identifier (email/username/code) — always shown. */
+  assignmentIdentifier?: string;
+  /**
+   * Legacy `serviceAccountId · perfil` line: fallback ONLY when the
+   * structured fields are absent (never carries policy ids, versions,
+   * internal enums, or repo ids — those never render, audit keeps them).
+   */
   assignment?: string;
   emergencyPending?: boolean;
+  /** Optional CUSTOMER_LOCATION display — omitted when absent. */
+  locationDisplay?: string;
+  /** Explicit existing-customer update (`from → to`; `from` absent → `to` only). */
+  locationFromDisplay?: string;
+  locationToDisplay?: string;
   suggestedAmount: number | null;
   suggestedCurrency?: string;
   actualAmount: number | null;
@@ -649,7 +668,46 @@ export interface RenderedNewSaleSummary {
   methodLabel: string | null;
   receivedBy: string | null;
   reference?: string;
-  pricePolicy?: string;
+}
+
+/**
+ * Human slot line for the sale proposal (presentation only): Netflix
+ * shows the commercial profile number (`Netflix · Perfil 4`), FlujoTV
+ * keeps its own model (`FlujoTV · 1 PERFIL` shared, `FlujoTV ·
+ * Completa` exclusive). Takes RAW values, escapes internally.
+ */
+export function saleAssignmentHead(modality: string, perfil: string): string {
+  if (modality === 'flujotv-complete') {
+    return 'FlujoTV · Completa';
+  }
+  if (modality === 'flujotv-shared') {
+    return `FlujoTV · ${perfil}`;
+  }
+  const perfilNumber = /\(\s*(\d+)\s*\)/.exec(perfil)?.[1];
+  return `Netflix · Perfil ${perfilNumber ?? perfil}`;
+}
+
+/**
+ * Per-method money formatting (presentation only, no conversion —
+ * the amount and currency are shown exactly as captured/suggested;
+ * rates are never invented here):
+ * - USD → `$8.00 USD` (Zelle);
+ * - USDT → `5.00 USDT` (Binance);
+ * - VES → `Bs 1.800,00 VES` (Pago Móvil, es-419 grouping).
+ */
+export function formatSaleMoney(amount: number, currency: string | null): string {
+  const fixed = amount.toFixed(2);
+  if (currency === 'USD') {
+    return `$${fixed} USD`;
+  }
+  if (currency === 'USDT') {
+    return `${fixed} USDT`;
+  }
+  if (currency === 'VES') {
+    const [int = '0', dec = '00'] = fixed.split('.');
+    return `Bs ${int.replace(/\B(?=(\d{3})+(?!\d))/g, '.')},${dec} VES`;
+  }
+  return currency === null || currency === '' ? fixed : `${fixed} ${currency}`;
 }
 
 /**
@@ -657,6 +715,14 @@ export interface RenderedNewSaleSummary {
  * the inventory proposal + suggested-vs-real money. NEVER password/PIN:
  * the input type carries no credential field, so the card cannot leak
  * one (pre-confirm secrecy — Slice B confirms before any access data).
+ *
+ * Presentation contract (Part B redesign, behavior intact):
+ * - NO internal metadata anywhere on the card (no policy ids/versions,
+ *   no internal enums, no repo ids — audit/ledger still keep them).
+ * - Human assignment lines + identifier always shown; empty fields
+ *   omitted (no `—` placeholders, no `País: —` style gaps).
+ * - Money block per method with explicit currency formatting.
+ * - Optional `📍 Ubicación` line ONLY when the draft carries one.
  */
 export function renderNewSaleSummary(input: RenderedNewSaleSummary): string {
   const lines: string[] = [
@@ -664,26 +730,49 @@ export function renderNewSaleSummary(input: RenderedNewSaleSummary): string {
     '',
     field('Cliente', input.isNewCustomer ? `${input.customerName} (nuevo)` : input.customerName),
     field('Teléfono', input.phone),
-    field('Servicio', saleModalityLabel(input.modality)),
+  ];
+  if (input.locationToDisplay !== undefined && input.locationToDisplay !== '') {
+    lines.push(
+      input.locationFromDisplay !== undefined && input.locationFromDisplay !== ''
+        ? `📍 Ubicación: ${esc(input.locationFromDisplay)} → ${esc(input.locationToDisplay)}`
+        : `📍 Ubicación: ${esc(input.locationToDisplay)}`,
+    );
+  } else if (input.locationDisplay !== undefined && input.locationDisplay !== '') {
+    lines.push(`📍 Ubicación: ${esc(input.locationDisplay)}`);
+  }
+  lines.push(field('Servicio', saleModalityLabel(input.modality)));
+  lines.push(
     field(
       'Duración',
       input.requestedMonths === input.grantedMonths
         ? `${input.grantedMonths} mes(es)`
         : `solicitado ${input.requestedMonths} / otorgado ${input.grantedMonths}`,
     ),
-  ];
-  if (input.assignment !== undefined && input.assignment !== '') {
+  );
+  if (
+    input.assignmentModality !== undefined &&
+    input.assignmentPerfil !== undefined &&
+    input.assignmentIdentifier !== undefined &&
+    input.assignmentIdentifier !== ''
+  ) {
+    lines.push(`📺 ${esc(saleAssignmentHead(input.assignmentModality, input.assignmentPerfil))}`);
+    lines.push(`📧 ${esc(input.assignmentIdentifier)}`);
+  } else if (input.assignment !== undefined && input.assignment !== '') {
     lines.push(field('Asigna', input.assignment));
   }
   if (input.emergencyPending === true) {
     lines.push('⚠️ Inventario de emergencia — falta autorización explícita.');
   }
   if (input.suggestedAmount !== null) {
-    const currency = input.suggestedCurrency ?? input.currency ?? '';
-    lines.push(field('Sugerido', `${input.suggestedAmount} ${currency}`.trim()));
+    lines.push(
+      field(
+        'Sugerido',
+        formatSaleMoney(input.suggestedAmount, input.suggestedCurrency ?? input.currency),
+      ),
+    );
   }
   if (input.actualAmount !== null) {
-    lines.push(field('Recibido', `${input.actualAmount} ${input.currency ?? ''}`.trim()));
+    lines.push(field('Recibido', formatSaleMoney(input.actualAmount, input.currency)));
   }
   if (input.methodLabel !== null) {
     lines.push(field('Método', input.methodLabel));
@@ -693,9 +782,6 @@ export function renderNewSaleSummary(input: RenderedNewSaleSummary): string {
   }
   if (input.reference !== undefined && input.reference !== '') {
     lines.push(field('Referencia', input.reference));
-  }
-  if (input.pricePolicy !== undefined && input.pricePolicy !== '') {
-    lines.push(field('Política', input.pricePolicy));
   }
   return lines.join('\n');
 }
@@ -786,6 +872,10 @@ export function renderSaleAskMissing(fieldName: string): string {
  * `renderSaleAskMissing` unchanged. Sequential decisions (service/
  * modality choice, emergency auth) never batch — they keep their own
  * cards and buttons.
+ *
+ * No duplication: ONE header names the count, then ONLY the current
+ * missing bullets + the combined example (never a second `Faltan: …`
+ * recap line repeating the same list).
  */
 export function renderSaleAskMissingBatch(
   fields: string[],
@@ -799,14 +889,11 @@ export function renderSaleAskMissingBatch(
     return renderSaleAskMissing(ordered[0]);
   }
   const bullets: string[] = [];
-  const nouns: string[] = [];
   if (ordered.includes('service')) {
     bullets.push('• Servicio: ¿Qué servicio vendemos: Netflix o FlujoTV?');
-    nouns.push('servicio');
   }
   if (ordered.includes('modality')) {
     bullets.push('• Modalidad de FlujoTV: compartida o completa.');
-    nouns.push('modalidad');
   }
   if (ordered.includes('customer')) {
     // New-customer convergence: phone unknown → ask the phone; phone
@@ -817,31 +904,24 @@ export function renderSaleAskMissingBatch(
       bullets.push(
         `• Nombre del cliente para ${opts.customerNameForPhone}: envíalo en un mensaje.`,
       );
-      nouns.push('nombre del cliente');
     } else {
       bullets.push('• Teléfono del cliente: envía el número.');
-      nouns.push('teléfono');
     }
   }
   if (ordered.includes('months')) {
     bullets.push('• Duración: ej. «2 meses» o «30 días».');
-    nouns.push('duración');
   }
   if (ordered.includes('method')) {
     bullets.push('• Método de pago: Pago Móvil, Zelle o Binance.');
-    nouns.push('método de pago');
   }
   if (ordered.includes('amount')) {
     bullets.push('• Monto recibido: ej. «recibí 5 USDT».');
-    nouns.push('monto');
   }
   if (ordered.includes('receiver')) {
     bullets.push('• Quién recibió el dinero: Gabriel o Edward.');
-    nouns.push('receptor');
   }
   const lines = [
     `🧾 Venta nueva — faltan ${ordered.length} datos, respóndelos en UN mensaje:`,
-    `Faltan: ${nouns.join(', ')}.`,
     '',
     ...bullets,
     '',

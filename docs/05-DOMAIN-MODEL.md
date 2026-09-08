@@ -53,6 +53,8 @@ En alcance inicial basta `OWNER`. El modelo debe permitir permisos futuros, sin 
 
 Persona o entidad atendida. Contiene nombre, ubicación y estado general. No contiene un único teléfono ni credenciales.
 
+La ubicación (`CUSTOMER_LOCATION`, opcional) conserva el texto indicado más ciudad/región/país solo cuando el texto los afirma —nunca inferidos, nunca dirección exacta ni GPS. Es independiente de `PAIS_CUENTA` en ambas direcciones (BR-CUS-006/BR-CUS-010).
+
 ### Phone
 
 Número canónico y valor original. Puede vincularse a varios clientes.

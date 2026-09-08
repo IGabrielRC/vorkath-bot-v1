@@ -51,7 +51,7 @@ import {
   type SaleResult,
 } from '../sale/newSaleTool';
 import { resolveCashHolders, matchCashHolder } from '../sale/payments';
-import { isRenewalText, parseSaleExtraction } from '../sale/saleParser';
+import { isRenewalText, parseSaleExtraction, extractCustomerLocation } from '../sale/saleParser';
 import {
   buildWhatsAppUrl,
   resolveWhatsAppTarget,
@@ -1326,7 +1326,8 @@ export function createWebhookHandler(deps: WebhookDeps) {
         extraction.phoneRaw !== undefined ||
         extraction.receiverRaw !== undefined ||
         extraction.referenceRaw !== undefined ||
-        extraction.isCorrection;
+        extraction.isCorrection ||
+        extractCustomerLocation(trimmed, extraction) !== undefined;
       if (carriesField) {
         await runSaleText(trimmed, interaction.messageThreadId);
         return true;
@@ -1350,10 +1351,44 @@ export function createWebhookHandler(deps: WebhookDeps) {
       ) {
         // The "Gabriel Juan" fix: the new-customer name answer fills
         // `draft.proposedCustomer.name` (local parse first, zero Gemini)
-        // and continues to the next missing field on the same card.
+        // and continues to the next missing field on the same card. An
+        // explicit location rides along (`Gabriel Juan de Caracas` →
+        // name + location); a location-ONLY turn (`vive en Valencia`)
+        // folds the location via the tool and keeps asking the name —
+        // location never answers the name question, never adds a turn.
+        const nameExtraction = parseSaleExtraction(trimmed);
+        const nameLocation = extractCustomerLocation(trimmed, nameExtraction);
+        const nameText =
+          nameLocation !== undefined ? trimmed.split(nameLocation.span).join(' ').trim() : trimmed;
+        if (nameText === '') {
+          await runSaleText(trimmed, interaction.messageThreadId);
+          return true;
+        }
+        if (!isNameLikeAnswer(nameText)) {
+          await runSaleText(trimmed, interaction.messageThreadId);
+          return true;
+        }
         const result = await prepareNewSaleFromAction(
           saleActor(),
-          { type: 'provide-name', name: trimmed },
+          {
+            type: 'provide-name',
+            name: nameText,
+            ...(nameLocation !== undefined
+              ? {
+                  location: {
+                    raw: nameLocation.raw,
+                    display: nameLocation.display,
+                    ...(nameLocation.city !== undefined ? { city: nameLocation.city } : {}),
+                    ...(nameLocation.stateRegion !== undefined
+                      ? { stateRegion: nameLocation.stateRegion }
+                      : {}),
+                    ...(nameLocation.country !== undefined
+                      ? { country: nameLocation.country }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
           saleToolDeps,
         );
         auditSaleResult(result);

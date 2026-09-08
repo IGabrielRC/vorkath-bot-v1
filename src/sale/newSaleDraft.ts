@@ -24,6 +24,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import type { CustomerLocation } from '../mock/customers';
 import type { PaymentCurrency, PaymentMethod } from './payments';
 import type { CostSnapshot, PriceSnapshot, SaleModality } from './pricePolicy';
 import type { InventoryEvidence, InventoryProposal } from './inventory';
@@ -40,12 +41,44 @@ export interface DraftOwner {
 export interface ProposedCustomer {
   name: string;
   phone: string;
-  location?: string;
+  /**
+   * Optional CUSTOMER_LOCATION (capture-if-provided, never asked):
+   * lives in the draft, persists ONLY on confirm. Never PAIS_CUENTA.
+   */
+  location?: CustomerLocation;
+}
+
+/**
+ * Existing-customer location update proposed INSIDE the sale (no
+ * separate operation): explicit in-sale location for a known customer
+ * is shown compactly in the summary (`📍 Ubicación: Caracas →
+ * Valencia`), applied on confirm, kept (untouched) on cancel.
+ */
+export interface LocationUpdate {
+  existingCustomerId: string;
+  /** Stored location before the sale (`null` when the customer has none). */
+  from: CustomerLocation | null;
+  /** Explicit in-sale location (never inherited across operations). */
+  to: CustomerLocation;
 }
 
 export interface NewSaleCustomer {
   existingCustomerId?: string;
   proposedCustomer?: ProposedCustomer;
+  /**
+   * In-sale location update for the linked existing customer (set ONLY
+   * from an explicit current-turn location; never inherited, never
+   * asked). Cleared with the customer linkage on phone re-resolution.
+   */
+  locationUpdate?: LocationUpdate;
+  /**
+   * Location captured while the phone is known but the customer is not
+   * yet resolved (unknown/shared phone): held in the draft, folded into
+   * `proposedCustomer` when the name arrives or converted to
+   * `locationUpdate` on explicit customer selection. Never asked, never
+   * blocking, dropped on cancel with everything else.
+   */
+  pendingLocation?: CustomerLocation;
 }
 
 export type SaleService = 'netflix' | 'flujotv';
@@ -145,6 +178,8 @@ export interface SalePatch {
   phone?: string | null;
   existingCustomerId?: string | null;
   proposedCustomer?: ProposedCustomer | null;
+  locationUpdate?: LocationUpdate | null;
+  pendingLocation?: CustomerLocation | null;
   actualAmount?: number | null;
   currency?: PaymentCurrency | null;
   method?: PaymentMethod | null;
@@ -182,6 +217,27 @@ export function applySalePatch(draft: NewSaleDraft, patch: SalePatch): PatchOutc
     }
   } else if (draft.customer.proposedCustomer !== undefined) {
     customer.proposedCustomer = draft.customer.proposedCustomer;
+  }
+  // Location state travels with the linkage: re-resolving the phone
+  // (existingCustomerId/proposedCustomer explicitly reset) drops stale
+  // updates — a new linkage never inherits a previous location.
+  // Untouched linkages keep their location state across unrelated
+  // patches (amount, receiver, …).
+  const linkageReset =
+    patch.existingCustomerId !== undefined || patch.proposedCustomer !== undefined;
+  if (patch.locationUpdate !== undefined) {
+    if (patch.locationUpdate !== null) {
+      customer.locationUpdate = patch.locationUpdate;
+    }
+  } else if (!linkageReset && draft.customer.locationUpdate !== undefined) {
+    customer.locationUpdate = draft.customer.locationUpdate;
+  }
+  if (patch.pendingLocation !== undefined) {
+    if (patch.pendingLocation !== null) {
+      customer.pendingLocation = patch.pendingLocation;
+    }
+  } else if (!linkageReset && draft.customer.pendingLocation !== undefined) {
+    customer.pendingLocation = draft.customer.pendingLocation;
   }
   const next: NewSaleDraft = {
     ...draft,
