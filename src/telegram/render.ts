@@ -817,7 +817,7 @@ export function renderNewCustomerSalePrompt(phone: string): string {
 /** No-inventory report (BR-SAL-010): inform only, never create anything. */
 export function renderSaleNoInventory(): string {
   return notFound(
-    '🧾 VENTA NUEVA',
+    '🧾 VENTA NUEVA · SIN INVENTARIO',
     'No hay inventario disponible.',
     'Puedes revisar inventario, volver o cancelar.',
   );

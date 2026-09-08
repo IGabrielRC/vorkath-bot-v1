@@ -53,7 +53,7 @@ import type {
   SaleLedgerOperation,
   SaleLedgerPayment,
 } from '../mock/mockStore';
-import { renderCredentialCard, renderSaleConfirmed } from '../telegram/render';
+import { renderCredentialCard, renderSaleConfirmed, renderSaleNoInventory } from '../telegram/render';
 import {
   buildWhatsAppUrl,
   resolveWhatsAppTarget,
@@ -391,7 +391,7 @@ export function confirmNewSale(
         ok: false,
         kind: 'no-inventory',
         draft: cleared,
-        text: '🧾 VENTA NUEVA\n\nNo hay inventario disponible.\n\nPuedes revisar inventario, volver o cancelar.',
+        text: renderSaleNoInventory(),
       };
     }
     const next = attachProposal(draft, fresh, {

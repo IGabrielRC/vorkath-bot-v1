@@ -833,7 +833,7 @@ describe('sale one-card batch lineage (31–37)', () => {
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, FULL_COMBO));
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'vende otra cuenta netflix'));
     expect(world.client.sends()).toHaveLength(1);
-    expect(world.client.lastText()).toContain('GESTIÓN PENDIENTE');
+    expect(world.client.lastText()).toContain('Tienes una gestión pendiente');
     await world.app.close();
   });
 

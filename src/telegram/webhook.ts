@@ -111,8 +111,6 @@ import {
   renderOwnershipWarning,
   renderPhoneNotFound,
   renderRecoverableSaleError,
-  renderSaleAskMissing,
-  renderSaleAskMissingBatch,
   SALE_CONFIRMING_TEXT,
   SALE_TERMINAL_STALE_TEXT,
   unesc,
@@ -1388,6 +1386,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         kind: 'clarification',
         draft: open,
         text: renderRecoverableSaleError(),
+        retryable: true,
       };
       auditSaleResult(result);
       await sendSaleResult(
@@ -1457,14 +1456,27 @@ export function createWebhookHandler(deps: WebhookDeps) {
         }
         confirmInFlight.add(key);
         let slowTimer: ReturnType<typeof setTimeout> | undefined;
+        // CONFIRMING guard: the transient `⏳ Confirmando…` is NEVER
+        // terminal. `settled` flips once the confirm result is about to
+        // render, so a late transient edit (which could otherwise land
+        // after the real result on a slow op) becomes a no-op — the card
+        // always ends on the actual confirm outcome, never on "Confirmando".
+        let settled = false;
         try {
           const interaction =
             origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
           slowTimer = setTimeout(() => {
             void (async () => {
               try {
+                if (settled) {
+                  return;
+                }
                 const cardId = cardMessageIdOf(interaction);
                 if (cardId !== undefined) {
+                  await Promise.resolve();
+                  if (settled) {
+                    return;
+                  }
                   await deps.client.editMessageText({
                     chatId: targetChatId,
                     messageId: cardId,
@@ -1486,6 +1498,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
             saleToolDeps,
           );
           auditSaleResult(result);
+          settled = true;
           await sendSaleResult(
             interaction,
             result,
@@ -1493,7 +1506,30 @@ export function createWebhookHandler(deps: WebhookDeps) {
           );
         } catch (error) {
           logger.warn({ error }, 'Sale confirm flow failed');
-          await sendSaleRecoverable(origin, threadOverride);
+          // Unknown-commit reconcile (idempotency by operationId): the
+          // atomic commit may have succeeded even though rendering it
+          // failed (e.g. the confirmed-card edit threw after the rows
+          // were written). If the sale DID commit, show the committed
+          // data (credentials/WhatsApp) and send the fresh Home — never
+          // a misleading "draft intact" error, never a resell. Otherwise
+          // the draft is intact → recoverable retry card.
+          if (saleToolDeps.store.confirmed(owner) !== undefined) {
+            const interaction =
+              origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
+            const committed = await prepareNewSaleFromAction(
+              saleActor(),
+              { type: 'confirm-sale' },
+              saleToolDeps,
+            );
+            auditSaleResult(committed);
+            await sendSaleResult(
+              interaction,
+              committed,
+              threadOverride ?? interaction.messageThreadId,
+            );
+          } else {
+            await sendSaleRecoverable(origin, threadOverride);
+          }
         } finally {
           if (slowTimer !== undefined) {
             clearTimeout(slowTimer);
@@ -1671,6 +1707,18 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const trimmed = input.trim();
       const n = normalizeText(trimmed);
 
+      // Bare-greeting short-circuit (the "hola" defect): a standalone
+      // greeting while a sale is active is NEVER a field answer, a
+      // command, or a fresh NEW_SALE — it is intercepted HERE, before
+      // any command/name/new-sale branch, and updates the SAME card to
+      // the pending-management notice (draft intact, no cancel, no Home,
+      // no second card). Real customer-name answers are unaffected
+      // (isGreetingText never matches them).
+      if (isGreetingText(trimmed)) {
+        await runSalePendingFlow(interaction, interaction.messageThreadId);
+        return true;
+      }
+
       if (isRenewalText(trimmed)) {
         const renewal: SaleResult = {
           kind: 'clarification',
@@ -1800,39 +1848,64 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return true;
       }
 
-      // Smallest-turns fallback: name every still-missing field (batched
-      // card when several independent fields are open), draft intact,
-      // never a global jump, never Gemini. Sequential decisions
-      // (service/modality) keep their single-question card. The customer
-      // bullet converges with the batch renderer: phone known asks the
-      // NAME for that number (never the phone again).
-      const allMissing = expectedSaleFields(open);
-      const sequential = expected === 'service' || expected === 'modality';
-      const fallback =
-        expected === null
-          ? `${renderSaleAskMissing('')} El borrador sigue intacto.`
-          : sequential || allMissing.length <= 1
-            ? `🧾 Venta nueva — sigo esperando ${saleFieldLabel(open, expected)}: ${renderSaleAskMissing(expected)} El borrador sigue intacto.`
-            : `🧾 Venta nueva — sigo esperando ${allMissing.map((field) => saleFieldLabel(open, field)).join(', ')}: ${renderSaleAskMissingBatch(allMissing, { ...(open.phone !== null ? { customerNameForPhone: open.phone } : {}) })} El borrador sigue intacto.`;
-      const fallbackResult: SaleResult = {
-        kind: 'clarification',
-        draft: open,
-        text: fallback,
-        ...(expected !== null ? { missing: expected } : {}),
-      };
-      await sendSaleResult(
-        interaction,
-        fallbackResult,
-        interaction.messageThreadId,
-      );
+      // Unrelated SEARCH/READ/UNKNOWN while the sale is active: never a
+      // second card, never a cancel, never silence — the SAME card shows
+      // the pending-management notice (draft intact) so the operator
+      // resumes or cancels. Global search/Gemini never see the message.
+      await runSalePendingFlow(interaction, interaction.messageThreadId);
       return true;
     }
 
     /**
+     * Bare-greeting classifier (active-sale UNKNOWN): a standalone
+     * greeting ("hola", "buenos dias", "que tal", "saludos"…) is NOT a
+     * customer name. While a sale waits for a name, a greeting must fall
+     * through to the pending-management notice on the SAME card instead
+     * of being folded into `proposedCustomer.name` (the "hola" defect).
+     * Real name answers ("Gabriel Juan", "Ana Ruiz") are unaffected.
+     */
+    function isGreetingText(trimmed: string): boolean {
+      const n = normalizeText(trimmed)
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (n === '') {
+        return false;
+      }
+      const exact = new Set([
+        'hola',
+        'holi',
+        'hello',
+        'hi',
+        'hey',
+        'buenas',
+        'buenos',
+        'buen dia',
+        'buenos dias',
+        'buenas dias',
+        'buenas tardes',
+        'buenas noches',
+        'que tal',
+        'q tal',
+        'como estas',
+        'como andas',
+        'como va',
+        'saludos',
+        'que hubo',
+        'hola buenas',
+      ]);
+      if (exact.has(n)) {
+        return true;
+      }
+      // Repeated-letter variants: "holaaa", "heeyy", "hii".
+      return /^(h+o+l+a+|h+i+|h+e+y+|h+e+l+l+o+)$/.test(n);
+    }
+
+    /**
      * Name-like answer guard (customer-name scope only): letters/spaces
-     * with no digits, not a reserved command word. Runs over folded text
-     * so case/accents never matter; hostiles like "cancelar" stay
-     * commands (navigation wins over fill).
+     * with no digits, not a reserved command word, not a bare greeting.
+     * Runs over folded text so case/accents never matter; hostiles like
+     * "cancelar" stay commands (navigation wins over fill).
      */
     function isNameLikeAnswer(trimmed: string): boolean {
       if (trimmed.length < 2 || trimmed.length > 80) {
@@ -1842,6 +1915,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return false;
       }
       if (!/[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(trimmed)) {
+        return false;
+      }
+      if (isGreetingText(trimmed)) {
         return false;
       }
       const n = ` ${normalizeText(trimmed)} `;

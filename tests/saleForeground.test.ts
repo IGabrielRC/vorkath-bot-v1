@@ -315,7 +315,7 @@ describe('expected-field 1–6 (Gabriel Juan regression + continuation)', () => 
     }
   });
 
-  it('(6) uninterpretable-inside-operation keeps the card naming the field, draft intact', async () => {
+  it('(6) uninterpretable-inside-operation keeps the card on pending-management, draft intact', async () => {
     const world = await createForegroundWorld();
     await walkToNameQuestion(world);
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'Gabriel Juan'));
@@ -325,8 +325,8 @@ describe('expected-field 1–6 (Gabriel Juan regression + continuation)', () => 
     expect(draftAfter?.operationId).toBe(draftBefore?.operationId);
     expect(draftAfter?.version).toBe(draftBefore?.version);
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('duración');
-    expect(last).toContain('borrador sigue intacto');
+    expect(last).toContain('Tienes una gestión pendiente');
+    expect(last).toContain('Continúa o cancela');
     expect(world.interpreter.calls).toBe(0);
     await world.app.close();
   });
@@ -510,7 +510,7 @@ describe('routing 17–22 (active-first priorities)', () => {
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'vende otra cuenta netflix'));
     expect(world.client.sends()).toHaveLength(1);
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('GESTIÓN PENDIENTE');
+    expect(last).toContain('Tienes una gestión pendiente');
     const draftAfter = world.saleDrafts.get(ownerOf(world, GABRIEL));
     expect(draftAfter?.operationId).toBe(draftBefore?.operationId);
     expect(draftAfter?.service).toBe('netflix');
@@ -533,14 +533,14 @@ describe('routing 17–22 (active-first priorities)', () => {
     await world.app.close();
   });
 
-  it('(22) UNKNOWN-in-operation keeps the card, names the field, zero Gemini', async () => {
+  it('(22) UNKNOWN-in-operation keeps the card, shows pending-management, zero Gemini', async () => {
     const world = await createForegroundWorld();
     await walkToNameQuestion(world);
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'Gabriel Juan'));
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'xyzzy plugh'));
     expect(world.client.sends()).toHaveLength(1);
     const last = world.client.texts().at(-1) ?? '';
-    expect(last).toContain('duración');
+    expect(last).toContain('Tienes una gestión pendiente');
     expect(world.saleDrafts.get(ownerOf(world, GABRIEL))).not.toBeUndefined();
     expect(world.interpreter.calls).toBe(0);
     await world.app.close();
@@ -849,7 +849,7 @@ describe('buttons 38–41 (contextual gating)', () => {
     const world = await createForegroundWorld();
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, FULL_COMBO));
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'vende otra cuenta netflix'));
-    expect(world.client.texts().at(-1)).toContain('GESTIÓN PENDIENTE');
+    expect(world.client.texts().at(-1)).toContain('Tienes una gestión pendiente');
     const cancel = world.client.findButton('❌Cancelar venta');
     await world.post(tap(world.nextUpdateId(), GABRIEL, cancel as string));
     expect(world.saleDrafts.get(ownerOf(world, GABRIEL))).toBeUndefined();

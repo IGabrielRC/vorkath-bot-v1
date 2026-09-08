@@ -29,19 +29,19 @@ describe('contextual UNKNOWN (never bare)', () => {
     }
   });
 
-  it('names the expected sale field when a sale draft is open', async () => {
+  it('shows pending-management feedback when an unknown intent hits an open sale draft', async () => {
     const world = await createTwinWorld({ sale: true });
     try {
       expect(world.saleDrafts).toBeDefined();
       world.saleDrafts?.create({ chatId: GROUP_CHAT_ID, userId: GABRIEL }, 'Gabriel');
       await sendText(world, GABRIEL, 'blorpt zzz qqq');
       const last = world.client.texts().at(-1) ?? '';
-      // The sale scope answers first (draft intact, fields named) —
-      // still never a bare global fallback.
+      // The sale scope answers first, on the SAME card: the unknown
+      // intent never cancels, never opens a second card, and is never
+      // silent — it shows the pending-management notice (draft intact).
       expect(last).not.toBe(UNKNOWN_TEXT);
-      expect(last).toContain('sigo esperando');
-      // A fresh draft is missing the service first.
-      expect(last).toContain('el servicio');
+      expect(last).toContain('Tienes una gestión pendiente');
+      expect(last).toContain('Continúa o cancela');
       expect(world.saleDrafts?.get({ chatId: GROUP_CHAT_ID, userId: GABRIEL })).toBeDefined();
     } finally {
       await world.app.close();

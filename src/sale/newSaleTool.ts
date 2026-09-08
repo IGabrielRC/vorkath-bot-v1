@@ -206,6 +206,12 @@ export interface SaleResult {
   customers?: Customer[];
   /** Present on `confirmed`/`already-confirmed` (wa.me URL, post-confirm only). */
   whatsappUrl?: string;
+  /**
+   * Present on recoverable technical failures (`failed` confirm, recoverable
+   * error card): the card keeps the draft and offers a retry (re-render →
+   * re-confirm) plus cancel — never a dead end.
+   */
+  retryable?: boolean;
 }
 
 function holdersOf(deps: SaleDeps): string[] {
@@ -1133,7 +1139,7 @@ export async function prepareNewSaleFromAction(
           text: renderSaleAskMissing(outcome.missing),
         };
       case 'failed':
-        return { kind: 'clarification', draft: outcome.draft, text: outcome.text };
+        return { kind: 'clarification', draft: outcome.draft, text: outcome.text, retryable: true };
       case 'no-draft':
         return { kind: 'clarification', draft: null, text: outcome.text };
     }

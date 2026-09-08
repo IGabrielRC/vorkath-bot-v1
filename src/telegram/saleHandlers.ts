@@ -121,12 +121,12 @@ export function isFreshSaleCue(text: string): boolean {
 /**
  * Pending-management notice (same-card edit): the operation stays open,
  * the draft stays intact, and the operator resumes or cancels from the
- * SAME card — never a second operational card.
+ * SAME card — never a second operational card, never silence. Exact
+ * copy is the canonical "gestión pendiente" hint shown for ANY unrelated
+ * intent (fresh sale cue, SEARCH/READ/UNKNOWN) while a sale is active.
  */
 export function renderSalePendingManagement(): string {
-  return (
-    '⏳ GESTIÓN PENDIENTE\n\nTienes una venta en curso. Termínala o cancélala antes de abrir otra gestión.'
-  );
+  return 'Tienes una gestión pendiente. Continúa o cancela.';
 }
 
 /**
@@ -175,6 +175,12 @@ export function keyboardForSaleResult(
   interactionId: string,
   whatsappUrl?: string,
 ): InlineKeyboardMarkup {
+  // Recoverable technical failure: keep the draft and offer a retry
+  // ([▶️ Continuar venta] re-renders it → re-confirm) plus cancel — the
+  // card never dead-ends and never shows a Confirmar it can't execute.
+  if (result.retryable === true) {
+    return salePendingKeyboard(interactionId);
+  }
   switch (result.kind) {
     case 'emergency-auth':
       return saleEmergencyKeyboard(interactionId);

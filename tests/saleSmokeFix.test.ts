@@ -473,7 +473,7 @@ describe('smoke webhook: prior draft + new intent is managed, never merged', () 
     expect(saleNew).toBeDefined();
     await world.post(tap(world.nextUpdateId(), GABRIEL, saleNew as string));
 
-    expect(world.client.lastText()).toContain('GESTIÓN PENDIENTE');
+    expect(world.client.lastText()).toContain('Tienes una gestión pendiente');
     // Same card: no parallel operational card was opened (only the
     // summary send and the /start Home send exist; entry + pending
     // are in-place edits).
