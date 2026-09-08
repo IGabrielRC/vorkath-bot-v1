@@ -77,7 +77,7 @@ const ONE_MONTH_RE = /\bun\s+mes\b/;
  */
 const RENEWAL_RE = /\brecarg|\brenuev|\brenov|\brenew/;
 
-const AMOUNT_EXPLICIT_RE = /(\d+(?:[.,]\d{1,2})?)\s*(usd|usdt|\$|dolares?|bs\.?|bolivares?|ves)\b/;
+const AMOUNT_EXPLICIT_RE = /(\d+(?:[.,]\d{1,2})?)\s*(usd|usdt|\$|dolares?|bs\.?|bolivares?|ves)(?![A-Za-z0-9_])/;
 
 /** Leading-sign form (`$5`, `$ 5`) → USD. Checked after the trailing form. */
 const AMOUNT_DOLLAR_PREFIX_RE = /\$\s*(\d+(?:[.,]\d{1,2})?)\b/;
@@ -126,6 +126,25 @@ function currencyFromToken(token: string): PaymentCurrency {
  */
 export function isRenewalText(text: string): boolean {
   return RENEWAL_RE.test(fold(text));
+}
+
+/**
+ * Duration claims its digits before phone-run joining: without this,
+ * "04248723454 1 mes" would glue into the phantom phone "042487234541".
+ * Spaced single numbers ("414 546 0657", no duration words) still join.
+ */
+const DURATION_SPAN_RES = [
+  /(\d{1,2})\s*mes(?:es)?\b/gi,
+  /(\d{1,3})\s*d[ií]as\b/gi,
+  /\bun\s+mes\b/gi,
+];
+
+function stripDurationSpans(text: string): string {
+  let out = text;
+  for (const re of DURATION_SPAN_RES) {
+    out = out.replace(re, ' ');
+  }
+  return out;
 }
 
 /**
@@ -232,7 +251,7 @@ export function parseSaleExtraction(text: string): SaleExtraction {
     extraction.method = method;
   }
 
-  const candidates = extractPhoneCandidates(text);
+  const candidates = extractPhoneCandidates(stripDurationSpans(text));
   if (candidates[0] !== undefined) {
     extraction.phoneRaw = candidates[0].raw;
   }
@@ -304,17 +323,39 @@ export function isNameLikeRemainder(value: string): boolean {
 }
 
 /**
- * Customer-name remainder scoped to the draft: strips everything the
- * deterministic extractors already claimed (receiver clause, phones,
- * reference, amount/currency, method words, service/modality/duration
- * tokens, sale verbs, payment fillers) and returns the leftover
- * name-like segment, if any. Comma-separated answers
- * (`Zelle, 4 dólares, lo recibió Edward`) collapse to nothing when no
- * name was stated; `Gabriel Juan lo recibió Edward` yields
- * `Gabriel Juan`. Never a naive `contains()`: holder matching stays
- * exact (case-insensitive) at the call site.
+ * Location-inert tokens (domain rule: the current sale model has NO
+ * customerLocation requirement — PAIS_CUENTA belongs to credentials,
+ * never to NEW_SALE). These fragments stay unused: stripped from
+ * remainder edges, never filling fields, never blocking, never
+ * persisting. Extend ONLY via an approved domain rule — never by
+ * guessing cities.
  */
-export function extractNameRemainder(text: string, _extraction: SaleExtraction): string | undefined {
+const LOCATION_INERT_TOKENS: ReadonlySet<string> = new Set(['caracas']);
+
+function dropInertEdges(tokens: string[]): string[] {
+  let start = 0;
+  let end = tokens.length;
+  while (start < end && LOCATION_INERT_TOKENS.has(fold(tokens[start] ?? ''))) {
+    start += 1;
+  }
+  while (end > start && LOCATION_INERT_TOKENS.has(fold(tokens[end - 1] ?? ''))) {
+    end -= 1;
+  }
+  return tokens.slice(start, end);
+}
+
+/**
+ * UNCONSUMED current-turn fragments (transient, never persisted): the
+ * raw turn text minus everything the deterministic extractors already
+ * claimed (receiver clause, phones, reference, amount/currency, method
+ * words, service/modality/duration tokens, sale verbs, payment fillers,
+ * politeness fillers, location-inert edges). Comma-separated segments;
+ * name filtering happens in `extractNameRemainder`, NOT here — this is
+ * also the `unconsumed` contract for the scoped remainder interpreter
+ * (genuinely-ambiguous leftovers only; inert-by-policy counts as
+ * consumed, never as ambiguity).
+ */
+export function unconsumedTurnFragments(text: string, _extraction: SaleExtraction): string[] {
   let rest = ` ${text} `;
   const receiverMatch = RECEIVER_RE.exec(text);
   if (receiverMatch?.[0] !== undefined) {
@@ -328,23 +369,49 @@ export function extractNameRemainder(text: string, _extraction: SaleExtraction):
   if (referenceMatch?.[0] !== undefined) {
     rest = rest.replace(referenceMatch[0], ' ');
   }
-  // Amount + currency tokens (trailing `4 dólares` and leading `$5` forms).
-  rest = rest.replace(/\d+(?:[.,]\d{1,2})?\s*(usd|usdt|\$|dolares?|bs\.?|bolivares?|ves)\b/gi, ' ');
+  // Amount + currency tokens (trailing `4 dólares`/`4$` and leading `$5`
+  // forms). The currency lookahead (not `\b`) mirrors
+  // AMOUNT_EXPLICIT_RE: `\b` can never follow a trailing `$`.
+  rest = rest.replace(/\d+(?:[.,]\d{1,2})?\s*(usd|usdt|\$|dolares?|bs\.?|bolivares?|ves)(?![A-Za-z0-9_])/gi, ' ');
   rest = rest.replace(/\$\s*\d+(?:[.,]\d{1,2})?\b/g, ' ');
   rest = rest.replace(
     /\b(pago\s*movil|pagomovil|movil|zelle|binance|usdt|usd|ves|bs\.?|bolivares?|dolares?)\b/gi,
     ' ',
   );
   rest = rest.replace(
-    /\b(netflix|netflx|netlix|flujo|flugo|fluho|perfil|compartida|completa|exclusiva|cuenta|nueva|nuevo|vende|vender|vendo|vendemos|dame|damela|sacame|saca|necesito|quiero|para|por|pag[oó]|paga|pagaron|pago|monto|recibi[oó]|recibe|recibido|recibio|lo|fue|fueron|de|del|el|la|los|las|en|un|una|unos|con|al|a|y|e|dame|mes(?:es)?|d[ií]as)\b/gi,
+    /\b(netflix|netflx|netlix|flujo|flugo|fluho|perfil|compartida|completa|exclusiva|cuenta|nueva|nuevo|vende|vender|vendo|vendemos|dame|damela|sacame|saca|necesito|quiero|para|por|pag[oó]|paga|pagaron|pago|monto|recibi[oó]|recibe|recibido|recibio|lo|fue|fueron|de|del|el|la|los|las|en|un|una|unos|con|al|a|y|e|dame|favor|gracias|urgente|mes(?:es)?|d[ií]as)\b/gi,
     ' ',
   );
   rest = rest.replace(/\d+/g, ' ');
-  const segments = rest
+  return rest
     .split(/[,;|\n]+/)
     .map((part) => part.replace(/^[.\s:—-]+|[.\s:—-]+$/g, '').trim())
+    .filter((part) => part.length > 0)
+    .map((part) => dropInertEdges(part.split(/\s+/).filter(Boolean)).join(' '))
     .filter((part) => part.length > 0);
-  const names = segments.filter((part) => isNameLikeRemainder(part));
+}
+
+/**
+ * Customer-name remainder scoped to the draft: the leading two-word
+ * unit of each unconsumed segment, when name-like. Trailing noise stays
+ * inert (`Juan Diaz caracas` → `Juan Diaz`; a lone `caracas` → unused).
+ * Comma-separated answers (`Zelle, 4 dólares, lo recibió Edward`)
+ * collapse to nothing when no name was stated; `Gabriel Juan lo recibió
+ * Edward` yields `Gabriel Juan`. Never a naive `contains()`: holder
+ * matching stays exact (case-insensitive) at the call site.
+ *
+ * Trade-off (documented): 3+-word names keep their first two words
+ * (`Juan Carlos Pérez` → `Juan Carlos`) — location-noise stripping wins
+ * over full-length names per the no-location-field domain rule.
+ */
+export function extractNameRemainder(text: string, extraction: SaleExtraction): string | undefined {
+  const names: string[] = [];
+  for (const segment of unconsumedTurnFragments(text, extraction)) {
+    const candidate = segment.split(/\s+/).filter(Boolean).slice(0, 2).join(' ');
+    if (candidate.length > 0 && isNameLikeRemainder(candidate)) {
+      names.push(candidate);
+    }
+  }
   if (names.length === 0) {
     return undefined;
   }

@@ -59,6 +59,7 @@ import {
   currencyForMethod,
   labelForMethod,
   matchCashHolder,
+  parsePaymentMethod,
   resolveCashHolders,
 } from './payments';
 import { costSnapshotFor, priceSnapshotFor, type SaleModality } from './pricePolicy';
@@ -67,7 +68,7 @@ import {
   type AccountStatusResolver,
   type InventoryProposal,
 } from './inventory';
-import { missingSaleFields, parseSaleExtraction, extractNameRemainder } from './saleParser';
+import { missingSaleFields, parseSaleExtraction, extractNameRemainder, isNameLikeRemainder, unconsumedTurnFragments } from './saleParser';
 import type { SaleExtraction } from './saleParser';
 
 export interface SaleActor extends DraftOwner {
@@ -83,6 +84,12 @@ export interface SaleDeps {
   capacityOverrides?: Record<string, number>;
   /** Resolved holder set; defaults to the documented pair. */
   cashHolders?: string[];
+  /**
+   * Scoped remainder interpreter (opt-in, at most once per turn — see
+   * `ScopedRemainderInterpreter`). Undefined (default) = deterministic
+   * only; leftovers fall through to the settle clarification.
+   */
+  scopedRemainder?: ScopedRemainderInterpreter;
   /**
    * Slice B execution seam (opt-in): when present, `confirm-sale` runs
    * the atomic `confirmNewSale` service against this MockStore.
@@ -104,6 +111,39 @@ export interface SaleExecDeps {
   costTable?: import('./pricePolicy').CostTable;
   failAt?: ConfirmFailAt;
   onAlert?: (alert: { title: string; summary: string }) => void;
+}
+
+/**
+ * Scoped remainder interpreter (genuinely-ambiguous leftovers ONLY —
+ * deterministic first, always). Fires at most once per turn, only when
+ * missing fields AND unconsumed current-turn fragments both remain.
+ *
+ * Contract: `operation` + known safe refs + `missing` + `unconsumed` +
+ * `allowed` fields, `currentTurnOnly` (never prior turns, never the
+ * global intent, never credentials). Absent (default) → the settle
+ * clarification asks instead. Fail-closed application at the call site:
+ * deterministic-only fields (service/modality/phone/months/amount)
+ * are NEVER accepted from the interpreter.
+ */
+export interface ScopedRemainderArgs {
+  operation: 'NEW_SALE';
+  /** Safe refs only — no phones-as-secrets, no names beyond the draft. */
+  known: {
+    service?: string;
+    modality?: string;
+    months?: number;
+    method?: string;
+    amount?: number;
+    currency?: string;
+  };
+  missing: string[];
+  unconsumed: string[];
+  allowed: string[];
+  currentTurnOnly: true;
+}
+
+export interface ScopedRemainderInterpreter {
+  interpretRemainder(args: ScopedRemainderArgs): Promise<{ field: string; value: string } | null>;
 }
 
 /**
@@ -482,33 +522,6 @@ export async function prepareNewSaleFromText(
   const currency =
     extraction.amountCurrency ?? (method !== undefined ? currencyForMethod(method) : undefined);
 
-  // Scoped name remainder (multifield answers): when the open draft
-  // already holds the phone but no customer, leftover name-like text
-  // fills the proposed name in the SAME parse (`Gabriel Juan lo
-  // recibió Edward` → name + receiver together). Name-vs-holder
-  // collision: an EXACT holder-identity match wins for receiver;
-  // remaining text becomes the customer name (never naive contains() —
-  // `Eduardo` never matches holder `Edward`).
-  let remainderName: string | undefined;
-  if (
-    base.phone !== null &&
-    base.customer.existingCustomerId === undefined &&
-    base.customer.proposedCustomer === undefined &&
-    extraction.phoneRaw === undefined
-  ) {
-    const remainder = extractNameRemainder(text, extraction);
-    if (remainder !== undefined) {
-      const holderHit = matchCashHolder(remainder, holders);
-      if (holderHit !== undefined) {
-        if (receiver === undefined) {
-          receiver = holderHit;
-        }
-      } else {
-        remainderName = remainder;
-      }
-    }
-  }
-
   // Bare holder word scoped to an open draft (`Edward` answering the
   // receiver question): exact holder-identity match fills the receiver
   // (the webhook maps it to `lo recibió …` first; this covers direct
@@ -521,6 +534,10 @@ export async function prepareNewSaleFromText(
     }
   }
 
+  // Pass 1 — deterministic fold (service/modality/months/amount/
+  // currency/method/receiver/reference). The customer name is NOT folded
+  // here: it resolves in the fixed-point pass below, once dependent
+  // state (phone lookup → customerName required) is known.
   const patch: SalePatch = {
     ...(extraction.service !== undefined ? { service: extraction.service } : {}),
     ...(extraction.modality !== undefined ? { modality: extraction.modality } : {}),
@@ -530,9 +547,6 @@ export async function prepareNewSaleFromText(
     ...(method !== undefined ? { method } : {}),
     ...(receiver !== undefined ? { receivedBy: receiver } : {}),
     ...(extraction.referenceRaw !== undefined ? { reference: extraction.referenceRaw } : {}),
-    ...(remainderName !== undefined && base.phone !== null
-      ? { proposedCustomer: { name: remainderName, phone: base.phone } }
-      : {}),
   };
   let { draft } = applySalePatch(base, patch);
 
@@ -556,6 +570,126 @@ export async function prepareNewSaleFromText(
     const resolved = await resolvePhone(draft, extraction.phoneRaw, deps);
     draft = resolved.draft;
     linkedCustomers = resolved.customers;
+  }
+
+  // Pass 2 — fixed-point extraction (root fix for name-before-needed):
+  // parse → fold (above) → resolve dependent state (phone lookup makes
+  // customerName required) → recompute missing → re-evaluate UNCONSUMED
+  // current-turn fragments against the newly-known missing → apply →
+  // recompute. The raw turn text + fragments live ONLY in this call
+  // (never prior interactions, never persisted). Stops on no-progress |
+  // READY | genuine ambiguity; MAX_FIXED_POINT_PASSES bounds it.
+  // Zero business mutation: only the in-memory draft is patched —
+  // ledger/customer writes happen exclusively at confirm.
+  //
+  // Receiver comes ONLY from explicit holder evidence (exact identity —
+  // `Eduardo` never matches `Edward`; the operator is never defaulted):
+  // the recibió-family clause, the resumed bare-holder answer, or an
+  // exact holder hiding in the leftovers (`Zelle, Edward` → Edward).
+  const consumedFragments: string[] = [];
+  if (draft.payment.receivedBy === null) {
+    for (const segment of unconsumedTurnFragments(text, extraction)) {
+      const hit = matchCashHolder(segment, holders);
+      if (hit !== undefined) {
+        ({ draft } = applySalePatch(draft, { receivedBy: hit }));
+        consumedFragments.push(segment);
+        break;
+      }
+    }
+  }
+  const MAX_FIXED_POINT_PASSES = 3;
+  for (let pass = 0; pass < MAX_FIXED_POINT_PASSES; pass += 1) {
+    if (
+      draft.customer.existingCustomerId !== undefined ||
+      draft.customer.proposedCustomer !== undefined ||
+      draft.phone === null
+    ) {
+      break;
+    }
+    const remainder = extractNameRemainder(text, extraction);
+    if (remainder === undefined) {
+      break;
+    }
+    // Name-vs-holder collision: an EXACT holder-identity match already
+    // resolved to receiver above; it never becomes the customer name
+    // (never naive contains() — `Eduardo` never matches `Edward`).
+    if (matchCashHolder(remainder, holders) !== undefined) {
+      break;
+    }
+    ({ draft } = applySalePatch(draft, {
+      proposedCustomer: { name: remainder, phone: draft.phone },
+    }));
+    consumedFragments.push(remainder);
+  }
+
+  // Pass 3 — scoped remainder (genuinely-ambiguous leftovers ONLY, at
+  // most ONE interpreter call per turn): deterministic extractors +
+  // the fixed-point pass ran first; this fires only when missing fields
+  // AND unconsumed current-turn fragments both remain. Fail-closed:
+  // deterministic-only fields (service/modality/phone/months/amount)
+  // are never accepted, receiver/method face their exact native checks,
+  // and anything else is ignored (settle asks instead).
+  if (deps.scopedRemainder !== undefined) {
+    const missingNow = missingSaleFieldList(draft);
+    // Genuinely unconsumed: fragments NOT already consumed by the
+    // deterministic fold or the fixed-point pass (a resolved `Juan Diaz`
+    // never re-enters as ambiguity; inert-by-policy already dropped).
+    const consumed = new Set(consumedFragments.map((part) => part.trim()));
+    const consumedList = [...consumed];
+    const unconsumed = unconsumedTurnFragments(text, extraction).filter(
+      (part) =>
+        !consumed.has(part.trim()) &&
+        !consumedList.some((used) => used !== '' && part.trim().startsWith(`${used} `)),
+    );
+    if (missingNow.length > 0 && unconsumed.length > 0) {
+      const decided = await deps.scopedRemainder.interpretRemainder({
+        operation: 'NEW_SALE',
+        known: {
+          ...(draft.service !== null ? { service: draft.service } : {}),
+          ...(draft.modality !== null ? { modality: draft.modality } : {}),
+          ...(draft.duration.requestedMonths !== null
+            ? { months: draft.duration.requestedMonths }
+            : {}),
+          ...(draft.payment.method !== null ? { method: draft.payment.method } : {}),
+          ...(draft.payment.actualAmount !== null ? { amount: draft.payment.actualAmount } : {}),
+          ...(draft.payment.currency !== null ? { currency: draft.payment.currency } : {}),
+        },
+        missing: missingNow,
+        unconsumed,
+        allowed: ['customer', 'method', 'receiver', 'reference'],
+        currentTurnOnly: true,
+      });
+      if (decided !== null && missingNow.includes(decided.field)) {
+        if (
+          decided.field === 'customer' &&
+          draft.phone !== null &&
+          draft.customer.existingCustomerId === undefined &&
+          draft.customer.proposedCustomer === undefined &&
+          isNameLikeRemainder(decided.value) &&
+          matchCashHolder(decided.value, holders) === undefined
+        ) {
+          ({ draft } = applySalePatch(draft, {
+            proposedCustomer: { name: decided.value.trim(), phone: draft.phone },
+          }));
+        } else if (
+          decided.field === 'receiver' &&
+          matchCashHolder(decided.value, holders) !== undefined
+        ) {
+          ({ draft } = applySalePatch(draft, {
+            receivedBy: matchCashHolder(decided.value, holders) ?? draft.payment.receivedBy,
+          }));
+        } else if (
+          decided.field === 'method' &&
+          parsePaymentMethod(decided.value) !== undefined
+        ) {
+          ({ draft } = applySalePatch(draft, {
+            method: parsePaymentMethod(decided.value) ?? draft.payment.method,
+          }));
+        } else if (decided.field === 'reference' && decided.value.trim() !== '') {
+          ({ draft } = applySalePatch(draft, { reference: decided.value.trim() }));
+        }
+      }
+    }
   }
   // Early inventory precheck: the moment service+modality resolve, the
   // deterministic precheck runs BEFORE any customer/payment question.

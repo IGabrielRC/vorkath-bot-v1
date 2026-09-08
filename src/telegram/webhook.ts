@@ -1002,6 +1002,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       replyMarkup: InlineKeyboardMarkup,
       threadOverride?: number,
     ): Promise<void> {
+      await ackOwnedReceipt();
       const labeled = withOperator(resultText, targetActorName);
       if (fromCallback && callbackMessageId !== undefined) {
         await deps.client.editMessageText({
@@ -1036,9 +1037,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           }
         }
       }
-      if (callbackId !== undefined) {
-        await deps.client.answerCallbackQuery(callbackId);
-      }
+      await ackOwnedReceipt();
     }
 
     /**
@@ -1447,6 +1446,33 @@ export function createWebhookHandler(deps: WebhookDeps) {
     const fromCallback = callback !== undefined;
     const callbackId = callback?.id;
     const callbackMessageId = callback?.message?.message_id;
+    /**
+     * Callback ack discipline (latency root fix): ownership/auth-minimal
+     * checks run first, then `ackOwnedReceipt()` fires BEFORE any state
+     * recompute, render, or edit — the ack is pure receipt, never a
+     * mutation promise (validate→draft→confirm→atomic still govern every
+     * mutation). Idempotent: exactly one answer per callback, never a
+     * double-answer. The `callback-ack` log line (ids only, zero
+     * payloads) separates ack latency from recompute/edit latency, so
+     * future slowness is attributable (network vs ack vs recompute vs
+     * edit).
+     */
+    let callbackAcked = false;
+    async function ackOwnedReceipt(opts?: { text?: string }): Promise<void> {
+      if (callbackId === undefined || callbackAcked) {
+        return;
+      }
+      callbackAcked = true;
+      logger.info(
+        { userId: actorId, chatId, updateId, stage: 'callback-ack' },
+        'Answered Telegram callback',
+      );
+      if (opts?.text !== undefined) {
+        await deps.client.answerCallbackQuery(callbackId, { text: opts.text });
+      } else {
+        await deps.client.answerCallbackQuery(callbackId);
+      }
+    }
     deps.interactions.rememberOperator(targetChatId, targetActorId, targetActorName);
 
     /**
@@ -1758,9 +1784,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
             )
           : undefined;
       if (callbackId !== undefined) {
-        await deps.client.answerCallbackQuery(callbackId, {
-          text: crossActionText(ownerName),
-        });
+        await ackOwnedReceipt({ text: crossActionText(ownerName) });
       }
       if (interaction !== undefined) {
         auditInteraction('interaction.blocked_cross_actor', interaction, {
@@ -1780,9 +1804,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
 
     /** Plain ack for stale callbacks: safe no-op, zero state change. */
     async function ackStale(requestedAction?: string): Promise<void> {
-      if (callbackId !== undefined) {
-        await deps.client.answerCallbackQuery(callbackId);
-      }
+      await ackOwnedReceipt();
       auditor.record({
         chatId: targetChatId,
         actorTelegramUserId: targetActorId,
@@ -1805,6 +1827,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       replyMarkup: InlineKeyboardMarkup,
       threadOverride?: number,
     ): Promise<void> {
+      await ackOwnedReceipt();
       const labeled = withOperator(responseText, targetActorName);
       if (fromCallback && callbackMessageId !== undefined) {
         await deps.client.editMessageText({
@@ -1822,13 +1845,12 @@ export function createWebhookHandler(deps: WebhookDeps) {
           ...(thread !== undefined ? { messageThreadId: thread } : {}),
         });
       }
-      if (callbackId !== undefined) {
-        await deps.client.answerCallbackQuery(callbackId);
-      }
+      await ackOwnedReceipt();
     }
 
     /** Reply in place (edit) for button taps, fresh message otherwise. */
     async function respond(responseText: string, section?: string): Promise<void> {
+      await ackOwnedReceipt();
       const interaction = createInteraction(
         section === undefined ? 'HOME' : sectionInteractionType(section),
       );
@@ -1852,9 +1874,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
         });
       }
-      if (callbackId !== undefined) {
-        await deps.client.answerCallbackQuery(callbackId);
-      }
+      await ackOwnedReceipt();
     }
 
     /**
@@ -3876,17 +3896,15 @@ export function createWebhookHandler(deps: WebhookDeps) {
           // Owner already matches, so this is forged/stale — reject with
           // the toast and mutate NOTHING. Legacy thread-less
           // interactions stay usable (migration-safe).
-          if (callbackId !== undefined) {
-            await deps.client.answerCallbackQuery(callbackId, {
-              text: crossActionText(
-                deps.interactions.resolveOwnerLabelSync(
-                  targetChatId,
-                  interaction.ownerTelegramUserId,
-                  interaction.ownerName,
-                ),
+          await ackOwnedReceipt({
+            text: crossActionText(
+              deps.interactions.resolveOwnerLabelSync(
+                targetChatId,
+                interaction.ownerTelegramUserId,
+                interaction.ownerName,
               ),
-            });
-          }
+            ),
+          });
           auditInteraction('interaction.blocked_cross_thread', interaction, {
             requestedAction: action,
             threadId: targetThreadId,
@@ -3894,6 +3912,12 @@ export function createWebhookHandler(deps: WebhookDeps) {
           });
           return { ok: true };
         }
+        // Ownership verified above (interaction → chat → owner →
+        // thread, all sync and mutation-free): ack the receipt FIRST, so
+        // the spinner dies before any DB recompute, render, or edit.
+        // Every renderer below ends in the idempotent ack as well, so
+        // exactly one answer ever leaves per callback.
+        await ackOwnedReceipt();
         await executeOwned(action, interaction);
         return { ok: true };
       }
