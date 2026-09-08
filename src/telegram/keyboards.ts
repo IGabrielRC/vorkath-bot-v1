@@ -482,6 +482,46 @@ export function saleProgressKeyboard(
 }
 
 /**
+ * GLOBAL BUTTON VOCABULARY (transversal convention — HOTFIX 2, Part C).
+ *
+ * One meaning per label everywhere (recognition > memory):
+ * - `✅Confirmar` — executes the ready operation (positive, terminal).
+ *   Shown ONLY on ready drafts; never on incomplete or frozen cards.
+ * - `❌Cancelar` — drops the open draft, persists nothing (destructive).
+ *   Always beside a safe alternative (`←Volver` / `▶️ Continuar`).
+ * - `←Volver` — pops the SAME interaction's nav stack (never Home
+ *   except from an explicit root view; never resurrects terminal cards).
+ * - `✏️Corregir` — asks for the correction text (never executes).
+ * - `▶️ Continuar venta` — re-renders the intact draft (retry-safe).
+ * - `💬 Abrir WhatsApp` — EXTERNAL url button (no callback, no state):
+ *   the ONLY button a frozen confirmed card keeps.
+ * - `🔎Buscar otr…` / option buttons (`1️⃣…`) / `←Anterior|Siguiente→`
+ *   — list/pagination/empty-state pattern: options carry stable keys in
+ *   interaction state (numbering is UX only); empty states name the
+ *   retry explicitly (`Escribe otro… o pulsa Volver`) — no dead ends.
+ *
+ * Destructive/positive consistency: destructive (`❌Cancelar`, `⚠️ Usar
+ * emergencia`) never shares a row with the positive `✅Confirmar`;
+ * frozen terminal cards carry zero callbacks (WhatsApp URL excepted).
+ * The renderer (`render.ts`) stays the single copy boundary — keyboards
+ * own labels, never message text.
+ */
+
+/**
+ * Frozen terminal card keyboard (HOTFIX 2 — ONE ACTIVE CARD):
+ * terminal CONFIRMED/CANCELLED cards are never edited again, so they
+ * carry zero tappable callbacks. A confirmed card keeps ONLY the
+ * still-valid external action (the `💬 Abrir WhatsApp` URL button —
+ * no callback fires, nothing mutates); a cancelled card carries no
+ * buttons at all. Continuation lives on the fresh Home card below.
+ */
+export function saleFrozenKeyboard(whatsappUrl?: string): InlineKeyboardMarkup {
+  if (whatsappUrl !== undefined) {
+    return { inline_keyboard: [[whatsappUrlButton(whatsappUrl)]] };
+  }
+  return { inline_keyboard: [] };
+}
+/**
  * Pending-management keyboard (second operation while one is open):
  * [Continuar venta] re-renders the in-progress draft on the SAME card;
  * [❌Cancelar venta] drops it. Never a parallel operational card.

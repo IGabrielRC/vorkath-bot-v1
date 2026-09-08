@@ -94,6 +94,12 @@ class StubTelegramClient implements TelegramClient {
       .map((entry) => entry.payload as SentPayload);
   }
 
+  edits(): Array<SentPayload & { messageId: number }> {
+    return this.sent
+      .filter((entry) => entry.kind === 'edit')
+      .map((entry) => entry.payload as SentPayload & { messageId: number });
+  }
+
   texts(): string[] {
     return this.sends().map((entry) => entry.text);
   }
@@ -295,8 +301,12 @@ describe('sale topics (64–69)', () => {
 
     await world.post(saleCallback(world.nextUpdateId(), GABRIEL, confirmData as string));
     expect(world.mockStore.saleOperations).toHaveLength(1);
+    // HOTFIX 2: terminal freeze (in-place edit) + fresh Home below.
+    expect(world.client.texts()).toContainEqual(
+      expect.stringContaining('✅ VENTA CONFIRMADA'),
+    );
     const last = world.client.sends().at(-1);
-    expect(last?.text).toContain('✅ VENTA CONFIRMADA');
+    expect(last?.text).toContain('Vokath');
     await world.app.close();
   });
 
@@ -331,15 +341,21 @@ describe('sale topics (64–69)', () => {
     const tail = world.client.sends().slice(sendsBefore);
     expect(tail.length).toBeGreaterThan(0);
     expect(tail.every((send) => send.text.includes('Operador: Gabriel'))).toBe(true);
-    const confirmed = tail.at(-1);
-    expect(confirmed?.text).toContain('✅ VENTA CONFIRMADA');
-    expect(confirmed?.text).toContain('🔐 DATOS DE ACCESO');
-    expect(confirmed?.text).toContain('🔒 PIN: 0657');
-    expect(confirmed?.text).toContain('💬 WhatsApp preparado.');
-    const whatsapp = confirmed?.replyMarkup?.inline_keyboard
+    // HOTFIX 2: the confirmed result renders on the frozen card (edit);
+    // the sends tail carries the fresh Home below.
+    const events = world.client.texts();
+    expect(events).toContainEqual(expect.stringContaining('✅ VENTA CONFIRMADA'));
+    const confirmedEdit = world.client.edits().at(-1);
+    expect(confirmedEdit?.text).toContain('✅ VENTA CONFIRMADA');
+    expect(confirmedEdit?.text).toContain('🔐 DATOS DE ACCESO');
+    expect(confirmedEdit?.text).toContain('🔒 PIN: 0657');
+    expect(confirmedEdit?.text).toContain('💬 WhatsApp preparado.');
+    const whatsapp = confirmedEdit?.replyMarkup?.inline_keyboard
       .flat()
       .find((button) => button.text === '💬 Abrir WhatsApp');
     expect(whatsapp?.url).toMatch(/^https:\/\/wa\.me\/584145460657\?text=/);
+    const confirmed = tail.at(-1);
+    expect(confirmed?.text).toContain('Vokath');
     expect(world.mockStore.saleOperations).toHaveLength(1);
     await world.app.close();
   });

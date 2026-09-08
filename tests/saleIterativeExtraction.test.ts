@@ -255,29 +255,46 @@ describe('iterative tool: current-turn conservation', () => {
 });
 
 // ---------------------------------------------------------------------------
-// T7: caracas inert — never fills, never blocks, never persists
+// T7: lowercase location (HOTFIX 1 — supersedes lowercase-inert for
+// LOCATION ONLY): a trailing `caracas` fills ONLY CUSTOMER_LOCATION —
+// never name/method/receiver/amount, never blocking, never an extra
+// turn. Non-location inert behavior is unchanged.
 // ---------------------------------------------------------------------------
 
-describe('iterative tool: location fragment stays inert', () => {
-  it('(T7) trailing "caracas" changes nothing and persists nowhere', async () => {
+describe('iterative tool: lowercase location captured as place only', () => {
+  it('(T7) trailing "caracas" fills ONLY the location, same missing, zero extra turns', async () => {
     const { repos, rows } = await fixtureWorld();
     const saleStore = new NewSaleDraftStore();
     const deps = toolDeps(saleStore, rows, (raw) => repos.searchCustomersByPhone(raw));
     const plain = await prepareNewSaleFromText(GABRIEL_ACTOR, SMOKE, deps);
     await prepareNewSaleFromAction(GABRIEL_ACTOR, { type: 'cancel-sale' }, deps);
     const withCity = await prepareNewSaleFromText(GABRIEL_ACTOR, `${SMOKE} caracas`, deps);
+    // Zero extra turns: the same fields are still missing (location is
+    // never a missing field, never asked).
     expect(withCity.missingFields).toEqual(plain.missingFields);
+    expect(withCity.missingFields).toEqual(['method', 'receiver']);
     expect(withCity.draft?.customer.proposedCustomer).toMatchObject({
       name: 'Juan Diaz',
       phone: SMOKE_PHONE,
     });
-    expect(withCity.draft?.customer.proposedCustomer).toEqual({
-      name: 'Juan Diaz',
-      phone: SMOKE_PHONE,
-    });
-    const serialized = JSON.stringify(withCity.draft).toLowerCase();
-    expect(serialized).not.toContain('caracas');
-    expect(serialized).not.toContain('location');
+    // Case-insensitive classification, same semantic result as `Caracas`.
+    expect(withCity.draft?.customer.proposedCustomer?.location?.city?.toLowerCase()).toBe(
+      'caracas',
+    );
+    // Non-location contract holds: nothing else filled from the place.
+    expect(withCity.draft?.customer.proposedCustomer?.name).toBe('Juan Diaz');
+    expect(withCity.draft?.payment.receivedBy).toBeNull();
+    expect(withCity.draft?.payment.actualAmount).toBe(4);
+    expect(withCity.draft?.duration.requestedMonths).toBe(1);
+    // The held location surfaces on the summary once the draft is ready
+    // (ask-missing cards never display it — location adds zero turns).
+    const done = await prepareNewSaleFromText(
+      GABRIEL_ACTOR,
+      'Zelle, 4 dólares, lo recibió Edward',
+      deps,
+    );
+    expect(done.kind).toBe('summary');
+    expect(done.text).toContain('📍 Ubicación: caracas');
   });
 
   it('(T7b) combined smoke + redundant duration + caracas in ONE message', async () => {
@@ -289,14 +306,16 @@ describe('iterative tool: location fragment stays inert', () => {
       `${SMOKE} 1 mes caracas`,
       deps,
     );
-    expect(combined.draft?.customer.proposedCustomer).toEqual({
+    expect(combined.draft?.customer.proposedCustomer).toMatchObject({
       name: 'Juan Diaz',
       phone: SMOKE_PHONE,
     });
+    expect(combined.draft?.customer.proposedCustomer?.location?.city?.toLowerCase()).toBe(
+      'caracas',
+    );
     expect(combined.draft?.duration.requestedMonths).toBe(1);
     expect(combined.draft?.payment.actualAmount).toBe(4);
     expect(combined.missingFields).toEqual(['method', 'receiver']);
-    expect(JSON.stringify(combined.draft).toLowerCase()).not.toContain('caracas');
   });
 });
 

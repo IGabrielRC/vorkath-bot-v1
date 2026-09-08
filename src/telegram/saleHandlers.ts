@@ -36,9 +36,9 @@ import type { SaleClock } from '../sale/newSaleConfirm';
 import { extractCustomerLocation, isRenewalText, parseSaleExtraction } from '../sale/saleParser';
 import type { SaleResult } from '../sale/newSaleTool';
 import {
-  credentialCardKeyboard,
   draftKeyboard,
   saleEmergencyKeyboard,
+  saleFrozenKeyboard,
   salePendingKeyboard,
   saleProgressKeyboard,
   type InlineKeyboardMarkup,
@@ -163,9 +163,12 @@ export function saleTextContinues(text: string): boolean {
  * Single-card keyboard per sale result kind. Confirmar/Corregir appear
  * ONLY on the ready summary; every incomplete state gets the contextual
  * progress keyboard (Volver/Cancelar + valid next actions, never
- * Confirmar). Confirmed cards reuse the Fase 3 credential keyboard
- * EXACTLY (wa.me URL button when prepared); the emergency card never
- * offers Confirmar.
+ * Confirmar). HOTFIX 2 (ONE ACTIVE CARD): terminal CONFIRMED cards keep
+ * ONLY the still-valid external action (the wa.me URL button — zero
+ * callbacks); terminal CANCELLED cards carry no buttons at all. Both
+ * are frozen: never edited again — continuation lives on the fresh Home
+ * card the webhook sends below. The emergency card never offers
+ * Confirmar.
  */
 export function keyboardForSaleResult(
   result: SaleResult,
@@ -177,7 +180,9 @@ export function keyboardForSaleResult(
       return saleEmergencyKeyboard(interactionId);
     case 'confirmed':
     case 'already-confirmed':
-      return credentialCardKeyboard(interactionId, whatsappUrl, { showServices: false });
+      return saleFrozenKeyboard(whatsappUrl ?? result.whatsappUrl);
+    case 'cancelled':
+      return saleFrozenKeyboard();
     case 'summary':
       return draftKeyboard(interactionId);
     case 'pending':
@@ -185,6 +190,15 @@ export function keyboardForSaleResult(
     default:
       return saleProgressKeyboard(interactionId, result.missing);
   }
+}
+
+/** True for terminal sale results (frozen cards — never edited again). */
+export function isSaleTerminalResult(result: SaleResult): boolean {
+  return (
+    result.kind === 'confirmed' ||
+    result.kind === 'already-confirmed' ||
+    result.kind === 'cancelled'
+  );
 }
 
 /**

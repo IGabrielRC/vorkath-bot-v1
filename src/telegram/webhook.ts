@@ -32,6 +32,7 @@ import {
   SALE_ENTRY_TEXT,
   isFreshSaleCue,
   isSaleCue,
+  isSaleTerminalResult,
   keyboardForSaleResult,
   renderSalePendingManagement,
   saleTextContinues,
@@ -50,6 +51,7 @@ import {
   type SaleDeps,
   type SaleResult,
 } from '../sale/newSaleTool';
+import { SaleMetrics } from '../sale/saleMetrics';
 import { resolveCashHolders, matchCashHolder } from '../sale/payments';
 import { isRenewalText, parseSaleExtraction, extractCustomerLocation } from '../sale/saleParser';
 import {
@@ -107,8 +109,11 @@ import {
   renderLegacyNotFound,
   renderOwnershipWarning,
   renderPhoneNotFound,
+  renderRecoverableSaleError,
   renderSaleAskMissing,
   renderSaleAskMissingBatch,
+  SALE_CONFIRMING_TEXT,
+  SALE_TERMINAL_STALE_TEXT,
   unesc,
 } from './render';
 import {
@@ -323,6 +328,22 @@ function viewIndexFor(action: string): number | null {
  */
 export function createWebhookHandler(deps: WebhookDeps) {
   const auditor = deps.auditor ?? createAuditor();
+  /**
+   * HOTFIX 2 transversal infra (handler scope — shared across updates):
+   * - `saleMetrics`: safe UX counters per operationId (sends/edits/
+   *   callbacks/turns/backs/corrections/retries/recoveries/
+   *   parse-vs-Gemini/outcome/duration — never raw text, phones,
+   *   wa.me URLs, or secrets). Shared with the tool layer via
+   *   `SaleDeps.metrics`.
+   * - `actorSaleQueue`: per-actor update serialization (no global
+   *   lock): same chat+thread+actor sale updates never concurrently
+   *   mutate one draft; different actors stay concurrent.
+   * - `confirmInFlight`: UX-level confirm double-tap prevention
+   *   (idempotency lives underneath in the atomic service).
+   */
+  const saleMetrics = new SaleMetrics();
+  const actorSaleQueue = new Map<string, Promise<void>>();
+  const confirmInFlight = new Set<string>();
   return async function handleTelegramWebhook(
     request: FastifyRequest,
     reply: FastifyReply,
@@ -706,6 +727,28 @@ export function createWebhookHandler(deps: WebhookDeps) {
     };
 
     /**
+     * Per-update sale key (chat+thread+actor): serializes one actor's
+     * sale updates; different actors stay concurrent.
+     */
+    function actorSaleKey(): string {
+      return `${targetChatId}:${targetThreadId ?? 0}:${targetActorId}`;
+    }
+
+    function enqueueActorSale<T>(run: () => Promise<T>): Promise<T> {
+      const key = actorSaleKey();
+      const prev = actorSaleQueue.get(key) ?? Promise.resolve();
+      const next = prev.then(run, run);
+      actorSaleQueue.set(
+        key,
+        next.then(
+          () => undefined,
+          () => undefined,
+        ),
+      );
+      return next;
+    }
+
+    /**
      * Slice B sale deps (additive): the SAME draft core serves button
      * taps and sale NL (button≡NL). Undefined = legacy behavior
      * (generic demo drafts only) — every existing test runs this way.
@@ -718,6 +761,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
             findCustomersByPhone: (raw: string) =>
               deps.repos.searchCustomersByPhone(raw),
             inventoryRows: deps.sale.mockStore.accounts,
+            metrics: saleMetrics,
             ...(deps.sale.statusOf !== undefined ? { statusOf: deps.sale.statusOf } : {}),
             ...(deps.sale.capacityOverrides !== undefined
               ? { capacityOverrides: deps.sale.capacityOverrides }
@@ -996,6 +1040,101 @@ export function createWebhookHandler(deps: WebhookDeps) {
       return updated ?? fresh;
     }
 
+    /**
+     * Card-lost classifier: the message was deleted / not found (recover
+     * by rendering current state into a NEW replacement card — the draft
+     * is the source of truth, never the message). `message is not
+     * modified` is NOT lost (same content — success, no resend, no
+     * duplicate card).
+     */
+    function isCardLostError(error: unknown): boolean {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === 'string'
+            ? error
+            : JSON.stringify(error ?? '');
+      if (/message is not modified/i.test(message)) {
+        return false;
+      }
+      return /not found|to edit not found|can't be edited|cannot be edited|deleted|message_id_invalid|MESSAGE_ID_INVALID|message to edit/i.test(
+        message,
+      );
+    }
+
+    /** Idempotent re-render of identical content: success, never a duplicate card. */
+    function isNotModifiedError(error: unknown): boolean {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === 'string'
+            ? error
+            : JSON.stringify(error ?? '');
+      return /message is not modified/i.test(message);
+    }
+
+    function operationIdOf(interaction: Interaction): string | undefined {
+      const stored = (deps.interactions.get(interaction.id) ?? interaction).state['operationId'];
+      return typeof stored === 'string' ? stored : undefined;
+    }
+
+    /**
+     * Deactivates one stale card's keyboard in place (text untouched).
+     * Best-effort: card-lost and missing-method cases resolve to silence
+     * (the card is already harmless or the stub cannot edit markup).
+     */
+    function deactivateCardButtons(messageId: number): void {
+      const edit = deps.client.editMessageReplyMarkup;
+      if (edit === undefined) {
+        return;
+      }
+      void edit
+        .call(deps.client, {
+          chatId: targetChatId,
+          messageId,
+          replyMarkup: { inline_keyboard: [] },
+        })
+        .catch(() => undefined);
+    }
+
+    /**
+     * Single-ACTIVE-card enforcement: when a new foreground card
+     * activates, the prior Home/operational cards of the same actor in
+     * the same thread lose their keyboards (old buttons are not
+     * tappable). Terminal cards are already frozen (zero callbacks), so
+     * they need no deactivation. Fire-and-forget: no latency added to
+     * the ack/edit path.
+     */
+    function deactivateStaleForegroundCards(exceptInteractionId: string): void {
+      for (const candidate of deps.interactions.snapshot()) {
+        if (candidate.id === exceptInteractionId) {
+          continue;
+        }
+        if (
+          candidate.chatId !== targetChatId ||
+          candidate.ownerTelegramUserId !== targetActorId ||
+          candidate.status !== 'PENDING'
+        ) {
+          continue;
+        }
+        if (candidate.type !== 'OPERATION' && candidate.type !== 'HOME') {
+          continue;
+        }
+        if (
+          targetThreadId !== undefined &&
+          candidate.messageThreadId !== undefined &&
+          candidate.messageThreadId !== targetThreadId
+        ) {
+          continue;
+        }
+        const stored = candidate.state['cardMessageId'];
+        if (typeof stored !== 'number') {
+          continue;
+        }
+        deactivateCardButtons(stored);
+      }
+    }
+
     async function sendSaleCard(
       interaction: Interaction,
       resultText: string,
@@ -1004,24 +1143,78 @@ export function createWebhookHandler(deps: WebhookDeps) {
     ): Promise<void> {
       await ackOwnedReceipt();
       const labeled = withOperator(resultText, targetActorName);
-      if (fromCallback && callbackMessageId !== undefined) {
-        await deps.client.editMessageText({
+      const operationId = operationIdOf(interaction);
+      const track = (event: 'send' | 'edit' | 'resend' | 'recovery'): void => {
+        if (operationId !== undefined) {
+          saleMetrics.record(operationId, event);
+          if (event === 'resend') {
+            saleMetrics.record(operationId, 'recovery');
+          }
+        }
+      };
+      /** Card-lost recovery: render current state into a NEW card, adopt it, continue. */
+      const resendFresh = async (): Promise<void> => {
+        const thread = threadOverride ?? replyCtx.messageThreadId;
+        const response = await deps.client.sendMessage({
           chatId: targetChatId,
-          messageId: callbackMessageId,
           text: labeled,
           replyMarkup,
+          ...(thread !== undefined ? { messageThreadId: thread } : {}),
         });
-        deps.interactions.touch(interaction.id, { cardMessageId: callbackMessageId });
-        persistAll();
-      } else {
-        const cardId = cardMessageIdOf(interaction);
-        if (cardId !== undefined) {
+        const sentId = extractSentMessageId(response);
+        if (sentId !== undefined) {
+          deps.interactions.touch(interaction.id, { cardMessageId: sentId });
+          persistAll();
+        }
+        track('resend');
+      };
+      if (fromCallback && callbackMessageId !== undefined) {
+        try {
           await deps.client.editMessageText({
             chatId: targetChatId,
-            messageId: cardId,
+            messageId: callbackMessageId,
             text: labeled,
             replyMarkup,
           });
+          track('edit');
+          deps.interactions.touch(interaction.id, { cardMessageId: callbackMessageId });
+          persistAll();
+        } catch (error) {
+          if (isNotModifiedError(error)) {
+            track('edit');
+            deps.interactions.touch(interaction.id, { cardMessageId: callbackMessageId });
+            persistAll();
+          } else {
+            if (!isCardLostError(error)) {
+              throw error;
+            }
+            // Tapped message is gone: the replacement card (adopted inside
+            // resendFresh) becomes the foreground card — never re-adopt
+            // the dead id.
+            await resendFresh();
+          }
+        }
+      } else {
+        const cardId = cardMessageIdOf(interaction);
+        if (cardId !== undefined) {
+          try {
+            await deps.client.editMessageText({
+              chatId: targetChatId,
+              messageId: cardId,
+              text: labeled,
+              replyMarkup,
+            });
+            track('edit');
+          } catch (error) {
+            if (isNotModifiedError(error)) {
+              track('edit');
+            } else {
+              if (!isCardLostError(error)) {
+                throw error;
+              }
+              await resendFresh();
+            }
+          }
         } else {
           const thread = threadOverride ?? replyCtx.messageThreadId;
           const response = await deps.client.sendMessage({
@@ -1035,6 +1228,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
             deps.interactions.touch(interaction.id, { cardMessageId: sentId });
             persistAll();
           }
+          track('send');
         }
       }
       await ackOwnedReceipt();
@@ -1052,6 +1246,35 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * identifier folded by `prepareNewSale*` (explicit > nothing;
      * stored context never fills critical fields across operations).
      */
+    /**
+     * Fresh Home AFTER terminal (HOTFIX 2): a NEW Home card is sent
+     * BELOW the frozen terminal card — own actor topic only (never
+     * General/Alertas: the origin interaction's thread wins), with its
+     * own messageId on its own HOME interaction + NavStack. It becomes
+     * the foreground root: new operations use/adopt it, never the
+     * terminal card.
+     */
+    async function sendFreshHomeBelow(origin: Interaction): Promise<void> {
+      const home = createInteraction('HOME');
+      const thread = origin.messageThreadId ?? replyCtx.messageThreadId;
+      const response = await deps.client.sendMessage({
+        chatId: targetChatId,
+        text: withOperator(HOME_TEXT, targetActorName),
+        replyMarkup: homeKeyboard(home.id),
+        ...(thread !== undefined ? { messageThreadId: thread } : {}),
+      });
+      const sentId = extractSentMessageId(response);
+      if (sentId !== undefined) {
+        deps.interactions.touch(home.id, { cardMessageId: sentId });
+      }
+      persistAll();
+      auditInteraction('interaction.home_after_terminal', home, {
+        ...(typeof origin.state['operationId'] === 'string'
+          ? { terminalOperationId: origin.state['operationId'] }
+          : {}),
+      });
+    }
+
     async function sendSaleResult(
       interaction: Interaction,
       result: SaleResult,
@@ -1060,32 +1283,77 @@ export function createWebhookHandler(deps: WebhookDeps) {
     ): Promise<void> {
       const seeded = seedSaleNavParent(interaction, 'sale-entry');
       const navigated = transitionTo(seeded, saleViewForResult(result));
+      // Operation/version gate for stale-callback validation (safe
+      // refs only — never phones, names, or secrets).
+      if (result.draft !== null) {
+        deps.interactions.touch(navigated.id, {
+          operationId: result.draft.operationId,
+          operationVersion: result.draft.version,
+        });
+      }
       persistAll();
+      if (isSaleTerminalResult(result)) {
+        // Terminal states freeze: the card renders its final result
+        // (CONFIRMED keeps the WhatsApp URL; CANCELLED is compact) with
+        // a zero-callback frozen keyboard, then the interaction closes.
+        // Frozen cards are never edited again by any future operation.
+        await sendSaleCard(
+          navigated,
+          result.text,
+          keyboardOverride ?? keyboardForSaleResult(result, navigated.id, result.whatsappUrl),
+          threadOverride ?? navigated.messageThreadId,
+        );
+        if (result.kind === 'cancelled') {
+          // The draft is already dropped (nothing persists) — outcome
+          // attribution happened at the cancel entry; closing the card
+          // here only freezes it.
+          deps.interactions.cancel(navigated.id);
+        } else {
+          deps.interactions.confirm(navigated.id);
+          if (result.draft !== null) {
+            saleMetrics.finish(result.draft.operationId, 'confirmed');
+          }
+        }
+        persistAll();
+        await sendFreshHomeBelow(navigated);
+        return;
+      }
+      // New foreground card: deactivate stale keyboards of the prior
+      // Home/operational cards so old buttons are not tappable.
+      deactivateStaleForegroundCards(navigated.id);
       await sendSaleCard(
         navigated,
         result.text,
         keyboardOverride ?? keyboardForSaleResult(result, navigated.id, result.whatsappUrl),
         threadOverride ?? navigated.messageThreadId,
       );
-      if (result.kind === 'confirmed' || result.kind === 'already-confirmed') {
-        deps.interactions.confirm(navigated.id);
-        persistAll();
-      }
     }
 
     /**
-     * Sale NL entry: folds one operator sentence into the actor's sale
-     * draft (full-sentence → single summary + Confirm; partial →
-     * ask-only-missing; corrections recalc the SAME draft). Single-card:
-     * every continuation edits the stored card.
+     * Recoverable failure card (HOTFIX 2, Part C): human language, no
+     * codes/stacks (technical detail stays in logs). The draft is kept;
+     * [Reintentar → saleKeep][←Volver][❌Cancelar] preserve continuation
+     * (recognition > memory, progressive disclosure, no dead ends).
      */
-    async function runSaleText(input: string, threadOverride?: number): Promise<void> {
+    async function sendSaleRecoverable(
+      origin: Interaction | undefined,
+      threadOverride?: number,
+    ): Promise<void> {
       if (saleToolDeps === undefined) {
         return;
       }
-      const result = await prepareNewSaleFromText(saleActor(), input, saleToolDeps);
+      const open = saleToolDeps.store.get(owner) ?? null;
+      if (open !== null) {
+        saleMetrics.record(open.operationId, 'retry');
+      }
+      const interaction =
+        origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
+      const result: SaleResult = {
+        kind: 'clarification',
+        draft: open,
+        text: renderRecoverableSaleError(),
+      };
       auditSaleResult(result);
-      const interaction = activeOperationInteraction() ?? createInteraction('OPERATION');
       await sendSaleResult(
         interaction,
         result,
@@ -1094,10 +1362,46 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
 
     /**
+     * Sale NL entry: folds one operator sentence into the actor's sale
+     * draft (full-sentence → single summary + Confirm; partial →
+     * ask-only-missing; corrections recalc the SAME draft). Single-card:
+     * every continuation edits the stored card. Serialized per actor (no
+     * global lock); technical failures keep the draft and answer the
+     * recoverable card (never codes/stacks in UX).
+     */
+    async function runSaleText(input: string, threadOverride?: number): Promise<void> {
+      if (saleToolDeps === undefined) {
+        return;
+      }
+      return enqueueActorSale(async () => {
+        if (saleToolDeps === undefined) {
+          return;
+        }
+        try {
+          const result = await prepareNewSaleFromText(saleActor(), input, saleToolDeps);
+          auditSaleResult(result);
+          const interaction = activeOperationInteraction() ?? createInteraction('OPERATION');
+          await sendSaleResult(
+            interaction,
+            result,
+            threadOverride ?? interaction.messageThreadId,
+          );
+        } catch (error) {
+          logger.warn({ error }, 'Sale text flow failed');
+          await sendSaleRecoverable(undefined, threadOverride);
+        }
+      });
+    }
+
+    /**
      * Sale Confirm entry (button tap or NL `confirmar`): executes the
      * atomic service when a sale draft is open, answers `already
      * confirmed` on repeats (zero new rows). Confirm transforms the SAME
-     * card in place.
+     * card in place, then freezes it + sends the fresh Home below.
+     * UX-level double-tap prevention: the transient `⏳ Confirmando…`
+     * shows ONLY when the op takes perceptibly long (never a flicker on
+     * instant ops); concurrent taps for the same actor collapse into one
+     * execution (idempotency underneath is untouched).
      */
     async function runSaleConfirmFlow(
       origin: Interaction | undefined,
@@ -1106,24 +1410,67 @@ export function createWebhookHandler(deps: WebhookDeps) {
       if (saleToolDeps === undefined) {
         return;
       }
-      const result = await prepareNewSaleFromAction(
-        saleActor(),
-        { type: 'confirm-sale' },
-        saleToolDeps,
-      );
-      auditSaleResult(result);
-      const interaction =
-        origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
-      await sendSaleResult(
-        interaction,
-        result,
-        threadOverride ?? interaction.messageThreadId,
-      );
+      return enqueueActorSale(async () => {
+        if (saleToolDeps === undefined) {
+          return;
+        }
+        const key = actorSaleKey();
+        if (confirmInFlight.has(key)) {
+          await ackOwnedReceipt();
+          return;
+        }
+        confirmInFlight.add(key);
+        let slowTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const interaction =
+            origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
+          slowTimer = setTimeout(() => {
+            void (async () => {
+              try {
+                const cardId = cardMessageIdOf(interaction);
+                if (cardId !== undefined) {
+                  await deps.client.editMessageText({
+                    chatId: targetChatId,
+                    messageId: cardId,
+                    text: withOperator(SALE_CONFIRMING_TEXT, targetActorName),
+                    replyMarkup: { inline_keyboard: [] },
+                  });
+                }
+              } catch {
+                // Best-effort transient — never breaks the confirm path.
+              }
+            })();
+          }, 800);
+          if (slowTimer.unref !== undefined) {
+            slowTimer.unref();
+          }
+          const result = await prepareNewSaleFromAction(
+            saleActor(),
+            { type: 'confirm-sale' },
+            saleToolDeps,
+          );
+          auditSaleResult(result);
+          await sendSaleResult(
+            interaction,
+            result,
+            threadOverride ?? interaction.messageThreadId,
+          );
+        } catch (error) {
+          logger.warn({ error }, 'Sale confirm flow failed');
+          await sendSaleRecoverable(origin, threadOverride);
+        } finally {
+          if (slowTimer !== undefined) {
+            clearTimeout(slowTimer);
+          }
+          confirmInFlight.delete(key);
+        }
+      });
     }
 
     /**
-     * Sale Cancel entry: drops the open draft and transforms the SAME
-     * card (never a fresh card, never Home navigation).
+     * Sale Cancel entry: drops the open draft, freezes the SAME card to
+     * its compact result (zero callbacks), then sends the fresh Home
+     * below. Serialized per actor; failures answer the recoverable card.
      */
     async function runSaleCancelFlow(
       origin: Interaction | undefined,
@@ -1132,21 +1479,35 @@ export function createWebhookHandler(deps: WebhookDeps) {
       if (saleToolDeps === undefined) {
         return;
       }
-      const result = await prepareNewSaleFromAction(
-        saleActor(),
-        { type: 'cancel-sale' },
-        saleToolDeps,
-      );
-      auditSaleResult(result);
-      const interaction =
-        origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
-      const home = createInteraction('HOME');
-      await sendSaleResult(
-        interaction,
-        result,
-        threadOverride ?? interaction.messageThreadId,
-        homeKeyboard(home.id),
-      );
+      return enqueueActorSale(async () => {
+        if (saleToolDeps === undefined) {
+          return;
+        }
+        try {
+          // Outcome attribution BEFORE the drop: `cancel-sale` returns a
+          // null draft (nothing persists), so the id is captured here.
+          const openBefore = saleToolDeps.store.get(owner) ?? null;
+          const result = await prepareNewSaleFromAction(
+            saleActor(),
+            { type: 'cancel-sale' },
+            saleToolDeps,
+          );
+          auditSaleResult(result);
+          if (result.kind === 'cancelled' && openBefore !== null) {
+            saleMetrics.finish(openBefore.operationId, 'cancelled');
+          }
+          const interaction =
+            origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
+          await sendSaleResult(
+            interaction,
+            result,
+            threadOverride ?? interaction.messageThreadId,
+          );
+        } catch (error) {
+          logger.warn({ error }, 'Sale cancel flow failed');
+          await sendSaleRecoverable(origin, threadOverride);
+        }
+      });
     }
 
     /** Sale emergency-auth entry: explicit, separate from confirmation. */
@@ -1311,6 +1672,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
 
       const substantive = isSubstantiveSaleDraft(open);
       const extraction = parseSaleExtraction(trimmed);
+      if (extraction.isCorrection) {
+        saleMetrics.record(open.operationId, 'correction');
+      }
       if (substantive && isFreshSaleCue(trimmed) && !extraction.isCorrection) {
         await runSalePendingFlow(interaction, interaction.messageThreadId);
         return true;
@@ -3541,8 +3905,14 @@ export function createWebhookHandler(deps: WebhookDeps) {
           // current draft (recompute → expectedSaleFields) and show it
           // on the SAME card. Navigation restores no business field —
           // phones are never swapped, drafts never dropped/cancelled.
-          // No open draft → the honest empty notice, never a guess.
+          // HOTFIX 2: no open draft (terminal/frozen card) → safe no-op,
+          // never a re-render, never a resurrection — the fresh Home
+          // below owns continuation.
           if (view.startsWith('sale-') && saleToolDeps !== undefined) {
+            if (saleToolDeps.store.get(owner) === undefined) {
+              await ackStale('back');
+              return;
+            }
             const result = await refreshCurrentSale(saleActor(), saleToolDeps);
             auditSaleResult(result);
             deps.interactions.touch(target.id, { view: saleViewForResult(result) });
@@ -3581,6 +3951,28 @@ export function createWebhookHandler(deps: WebhookDeps) {
      */
     async function handleBack(interaction: Interaction): Promise<void> {
       const fresh = deps.interactions.get(interaction.id) ?? interaction;
+      // HOTFIX 2: Back never resurrects a frozen SALE card — safe no-op
+      // (brief note, zero mutation, zero render). Scoped to sale-managed
+      // cards (stored operationId/sale view); legacy flows keep their
+      // approved behavior.
+      {
+        const view = fresh.state['view'];
+        const isSaleManaged =
+          typeof fresh.state['operationId'] === 'string' ||
+          (typeof view === 'string' && (view as string).startsWith('sale-'));
+        if (fresh.status !== 'PENDING' && isSaleManaged) {
+          await ackOwnedReceipt({ text: SALE_TERMINAL_STALE_TEXT });
+          auditInteraction('interaction.stale_terminal_back', fresh, {});
+          return;
+        }
+      }
+      if (
+        typeof fresh.state['view'] === 'string' &&
+        (fresh.state['view'] as string).startsWith('sale-') &&
+        typeof fresh.state['operationId'] === 'string'
+      ) {
+        saleMetrics.record(fresh.state['operationId'] as string, 'back');
+      }
       const nav = navEntriesOf(fresh);
       if (nav.length === 0) {
         const current =
@@ -3615,6 +4007,46 @@ export function createWebhookHandler(deps: WebhookDeps) {
       action: string,
       interaction: Interaction,
     ): Promise<void> {
+      /**
+       * HOTFIX 2 operation gate: the tap names an operation (stored
+       * `operationId`) that is no longer the actor's current one — a new
+       * operation already owns the foreground. Mutate nothing; refresh
+       * the CURRENT card so the operator sees live state (never delete,
+       * cancel, or resurrect via the stale tap).
+       */
+      if (
+        saleToolDeps !== undefined &&
+        interaction.type === 'OPERATION' &&
+        (action === 'confirm' ||
+          action === 'cancel' ||
+          action === 'correct' ||
+          action === 'saleNew' ||
+          action === 'saleEmergency' ||
+          action === 'saleKeep' ||
+          action === 'saleModNetflix' ||
+          action === 'saleModFlujoShared' ||
+          action === 'saleModFlujoComplete')
+      ) {
+        const open = saleToolDeps.store.get(owner);
+        const gated = interaction.state['operationId'];
+        if (
+          open !== undefined &&
+          typeof gated === 'string' &&
+          gated !== open.operationId
+        ) {
+          auditInteraction('interaction.stale_operation', interaction, {
+            requestedAction: action,
+            expectedOperationId: open.operationId,
+          });
+          const current = activeOperationInteraction();
+          if (current !== undefined) {
+            const result = await refreshCurrentSale(saleActor(), saleToolDeps);
+            auditSaleResult(result);
+            await sendSaleResult(current, result, current.messageThreadId);
+            return;
+          }
+        }
+      }
       if (action === 'home') {
         // Explicit root action only — never a navigation fallback.
         await handleHome(interaction);
@@ -3948,7 +4380,37 @@ export function createWebhookHandler(deps: WebhookDeps) {
           return { ok: true };
         }
         // Ownership verified above (interaction → chat → owner →
-        // thread, all sync and mutation-free): ack the receipt FIRST, so
+        // thread, all sync and mutation-free).
+        //
+        // HOTFIX 2 stale-callback protection (SALE cards only — legacy
+        // demo flows keep their approved idempotent-repeat behavior): a
+        // tap on a NON-PENDING sale card (frozen terminal: the stored
+        // operationId/sale view marks it sale-managed) is a safe no-op —
+        // ack fast with the brief "gestión terminada" note, mutate
+        // nothing, refresh nothing, resurrect nothing. The WhatsApp URL
+        // button still works (it fires no callback at all). Stale taps
+        // on an operation that is still current refresh the current card
+        // instead (handled inside executeOwned via the operation gate).
+        {
+          const view = interaction.state['view'];
+          const isSaleManaged =
+            typeof interaction.state['operationId'] === 'string' ||
+            (typeof view === 'string' && (view as string).startsWith('sale-'));
+          if (interaction.status !== 'PENDING' && isSaleManaged) {
+            await ackOwnedReceipt({ text: SALE_TERMINAL_STALE_TEXT });
+            auditInteraction('interaction.stale_terminal', interaction, {
+              requestedAction: action,
+            });
+            return { ok: true };
+          }
+        }
+        if (interaction.type === 'OPERATION') {
+          const gated = operationIdOf(interaction);
+          if (gated !== undefined) {
+            saleMetrics.record(gated, 'callback');
+          }
+        }
+        // Ack the receipt FIRST, so
         // the spinner dies before any DB recompute, render, or edit.
         // Every renderer below ends in the idempotent ack as well, so
         // exactly one answer ever leaves per callback.

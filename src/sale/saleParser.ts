@@ -332,13 +332,14 @@ export function isNameLikeRemainder(value: string): boolean {
 }
 
 /**
- * Location-inert tokens (domain rule, NARROWED by Part A): lowercase or
- * unanchored city noise stays unused — stripped from remainder edges,
- * never filling fields, never blocking, never persisting. CAPITALIZED
- * evident forms (`Caracas`, `de Caracas`, `vive en Caracas`,
- * `Valencia, Carabobo`…) are captured by `extractCustomerLocation`
- * instead (capture-if-provided, never asked). Extend ONLY via an
- * approved domain rule — never by guessing cities.
+ * Location-inert tokens (domain rule, NARROWED by Part A + HOTFIX 1):
+ * these tokens stay unused for NON-location fields — stripped from
+ * remainder edges, never filling name/method/receiver, never blocking,
+ * never persisting as anything but a place. Case-insensitive location
+ * classification (HOTFIX 1) captures them as CUSTOMER_LOCATION instead:
+ * `caracas`/`Caracas`/`CARACAS` share one semantic result (capitalization
+ * is presentation, never intent). Extend ONLY via an approved domain
+ * rule — never by guessing cities.
  */
 const LOCATION_INERT_TOKENS: ReadonlySet<string> = new Set(['caracas']);
 
@@ -373,6 +374,7 @@ export function unconsumedTurnFragments(
   text: string,
   _extraction: SaleExtraction,
   excludedSpans: string[] = [],
+  opts: { keepInertEdges?: boolean } = {},
 ): string[] {
   let rest = ` ${text} `;
   const receiverMatch = RECEIVER_RE.exec(text);
@@ -402,27 +404,55 @@ export function unconsumedTurnFragments(
   );
   rest = rest.replace(/\d+/g, ' ');
   const excluded = new Set(excludedSpans.map((span) => fold(span)));
-  return rest
+  const parts = rest
     .split(/[,;|\n]+/)
     .map((part) => part.replace(/^[.\s:—-]+|[.\s:—-]+$/g, '').trim())
     .filter((part) => part.length > 0)
-    .map((part) => dropInertEdges(part.split(/\s+/).filter(Boolean)).join(' '))
+    .map((part) => {
+      // HOTFIX 1: the location pass evaluates post-consume fragments with
+      // inert edges KEPT (`SMOKE caracas` → tail `caracas` is a place
+      // candidate); the name pass keeps the default (inert dropped) so
+      // non-location fields never fill from place noise.
+      if (opts.keepInertEdges === true) {
+        return part;
+      }
+      return dropInertEdges(part.split(/\s+/).filter(Boolean)).join(' ');
+    })
     .filter((part) => part.length > 0)
     .filter((part) => !excluded.has(fold(part)));
+  return parts;
+}
+
+/**
+ * Removes already-consumed spans (name/receiver/structural-location…)
+ * from a leftover fragment, case-insensitively. Powers the open-world
+ * tail evaluation (`Juan Diaz caracas` − `Juan Diaz` → `caracas`).
+ */
+export function subtractConsumedSpans(fragment: string, consumedSpans: string[]): string {
+  let rest = ` ${fragment} `;
+  for (const span of consumedSpans) {
+    const trimmed = span.trim();
+    if (trimmed === '') {
+      continue;
+    }
+    rest = rest.replace(new RegExp(`\\s+${trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+`, 'gi'), ' ');
+  }
+  return rest.replace(/^[.\s:—-]+|[.\s:—-]+$/g, '').trim();
 }
 
 /**
  * Customer-name remainder scoped to the draft: the leading two-word
- * unit of each unconsumed segment, when name-like. Lowercase trailing
- * noise stays inert (`Juan Diaz caracas` → `Juan Diaz`; a lone
- * `caracas` → unused). CAPITALIZED evident locations (`Juan Diaz,
- * Caracas`) are claimed by `extractCustomerLocation` BEFORE this runs
- * (the caller strips the location span from the text first), so they
- * never reach this function. Comma-separated answers (`Zelle,
- * 4 dólares, lo recibió Edward`) collapse to nothing when no name was
- * stated; `Gabriel Juan lo recibió Edward` yields `Gabriel Juan`.
- * Never a naive `contains()`: holder matching stays exact
- * (case-insensitive) at the call site.
+ * unit of each unconsumed segment, when name-like. Inert-edge noise
+ * stays out (`Juan Diaz caracas` → `Juan Diaz`; HOTFIX 1: the
+ * `caracas` tail is claimed as CUSTOMER_LOCATION by the location pass,
+ * never as a name field). Structural locations (`Juan Diaz, Caracas`)
+ * are claimed by `extractCustomerLocation` BEFORE this runs (the caller
+ * strips the location span from the text first), so they never reach
+ * this function. Comma-separated answers (`Zelle, 4 dólares, lo recibió
+ * Edward`) collapse to nothing when no name was stated;
+ * `Gabriel Juan lo recibió Edward` yields `Gabriel Juan`. Never a naive
+ * `contains()`: holder matching stays exact (case-insensitive) at the
+ * call site.
  *
  * Trade-off (documented): 3+-word names keep their first two words
  * (`Juan Carlos Pérez` → `Juan Carlos`); single-word fragments inside
@@ -452,22 +482,33 @@ export function extractNameRemainder(
  * Optional CUSTOMER_LOCATION extraction — deterministic, evident forms
  * first (Part A: capture-if-provided, NEVER asked, never blocking).
  *
+ * HOTFIX 1 (open-world, case-insensitive — LOCATION ONLY): classification
+ * ignores case (`caracas`/`Caracas`/`CARACAS` share one semantic result;
+ * raw/display preserve the original typing verbatim) and capture is NOT
+ * whitelist-bound: after the caller consumes intent/service/duration/
+ * name/phone/amount/currency/method/receiver, remaining current-turn
+ * fragments are evaluated as location candidates. Structural evidence
+ * (prepositions, comma pairs) resolves BEFORE the name pass; bare
+ * single tokens resolve AFTER it (post-consume, anchor-required), so a
+ * name answer is never stolen as a place. No confidence → undefined
+ * (leave uncaptured, NEVER ask).
+ *
  * Capture order (first hit wins, caller strips `span` before the name
  * pass so places never become names):
  * - L1 strong prepositions (`vive en`, `reside en`, `radicado en`,
  *   `ubicado en`, `está en`, `soy de`, `es de`, `desde`): the value is
  *   always a place (single token, `Ciudad, Región` pair, or a
- *   multi-word place like `San Juan de los Morros`).
- * - L2 weak preposition + pair (`de Valencia, Carabobo`).
- * - L3 bare pair with a single-token left side (`Valencia, Carabobo`,
- *   `Miami, Florida`, `Bogotá, Colombia`). A two-word left side
- *   (`Juan Diaz, Caracas`) is NOT a pair — the right side falls to L5.
- * - L4 weak preposition + single token (`de Caracas`, `en Caracas`).
- * - L5 single capitalized token (`Caracas`, `Chile`): a one-word
- *   comma segment that is location-like. The caller gates this on
- *   anchor context (phone/method/amount/receiver in the turn or a
- *   customer already on the draft) — a bare `Caracas` answering the
- *   name question stays a NAME.
+ *   multi-word place like `San Juan de los Morros`). Case-insensitive.
+ * - L2 weak preposition + pair (`de Valencia, Carabobo`, `de caracas`).
+ * - L3 bare pair with single-token sides anywhere in the turn
+ *   (`Valencia, Carabobo`, `Miami, Florida`, `Bogotá, Colombia`,
+ *   lowercase `miami, florida` included). A left side that is the tail
+ *   of a multi-word name (`Juan Diaz, Caracas` → `Diaz` preceded by
+ *   `Juan`) is NOT a pair — the right side falls through.
+ * - L4 weak preposition + single token (`de Caracas`, `en caracas`).
+ * - L5 bare single token, post-consume only (`caracas` in
+ *   `Caracas, Zelle, 4 dólares, Edward` — method/amount/receiver
+ *   already stripped, name already claimed, anchor required).
  *
  * Conservative by construction (never hallucinated hierarchy):
  * - A single token sets ONLY `city` (`Caracas` never implies a
@@ -475,16 +516,14 @@ export function extractNameRemainder(
  * - A pair sets `city` + (`country` when the right side names a known
  *   country, else `stateRegion`). `KNOWN_COUNTRIES` is a display-mapping
  *   aid ONLY — capture never depends on it (no whitelist).
- * - Values must start uppercase in the ORIGINAL text: lowercase noise
- *   (`caracas`) stays inert (the T7/T9 contract holds).
- * - Service words (`Netflix`), sale/payment words and digits are never
- *   places. Cash-holder collisions (`de Edward`) are dropped by the
- *   caller (it owns the holder set) — never here.
+ * - Service/sale/noise words (`Netflix`, `precio`, `cuenta`, `zelle`…)
+ *   and digits are never places. Cash-holder collisions (`de Edward`)
+ *   are dropped by the caller (it owns the holder set) — never here.
  *
  * Trade-off (documented): inside payment-context turns a one-word
- * fragment reads as a place even if it could be a first name (`Ana,
- * Zelle, 4 dólares, Edward` → location Ana). Two-word names are never
- * affected (`Juan Pérez, Zelle, …` → name). PAIS_CUENTA is never
+ * leftover fragment reads as a place even if it could be a first name
+ * (`Ana, Zelle, 4 dólares, Edward` → location Ana). Two-word names are
+ * never affected (`Juan Pérez, Zelle, …` → name). PAIS_CUENTA is never
  * touched: this function has no pais parameter, no pais return, and no
  * caller may map its output into a pais field.
  */
@@ -566,6 +605,27 @@ const LOCATION_BLOCKED_FOLDED: ReadonlySet<string> = new Set([
   'recibio',
   'recibido',
   'recibir',
+  // Sale/noise words (HOTFIX 1 open-world guard): generic turn noise is
+  // never a place, in any casing (`precio`, `nombre`, `cliente`…).
+  'precio',
+  'precios',
+  'tasa',
+  'tasas',
+  'codigo',
+  'codigos',
+  'nombre',
+  'nombres',
+  'cliente',
+  'clientes',
+  'telefono',
+  'numero',
+  'numeros',
+  'datos',
+  'venta',
+  'ventas',
+  'vende',
+  'vender',
+  'vendo',
 ]);
 
 const GEO_WORD_RE = /^[A-Za-zÁÉÍÓÚÑáéíóúñ][A-Za-zÁÉÍÓÚÑáéíóúñ.\-]*$/;
@@ -580,11 +640,10 @@ function isGeoPart(value: string, maxWords: number): boolean {
   if (first === undefined || !GEO_WORD_RE.test(first)) {
     return false;
   }
-  // Uppercase start REQUIRED in the original text (lowercase noise
-  // stays inert).
-  if (first[0] !== first[0]?.toUpperCase()) {
-    return false;
-  }
+  // HOTFIX 1: classification is case-insensitive — capitalization is
+  // presentation, never intent (`caracas` ≡ `Caracas` ≡ `CARACAS`).
+  // The old uppercase-first gate (lowercase stays inert) is superseded
+  // for LOCATION ONLY; non-location behavior keeps its inert contract.
   for (const word of words) {
     if (GEO_CONNECTOR_RE.test(fold(word))) {
       continue;
@@ -664,83 +723,159 @@ function buildSingleLocation(raw: string, value: string, maxWords: number): Pars
 
 const PREP_STRONG =
   'vive\\s+en|vivo\\s+en|reside\\s+en|radicad[oa]\\s+en|ubicad[oa]\\s+en|est[aá]\\s+en|soy\\s+de|es\\s+de|desde';
-const GEO_ONE = '[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ.\\-]*';
+const GEO_ONE = '[A-Za-zÁÉÍÓÚÑáéíóúñ][A-Za-zÁÉÍÓÚÑáéíóúñ.\\-]*';
 const GEO_WORD = `(?:${GEO_ONE}|de|del|la|el|los|las|y)`;
 const PAIR_END = '(?=\\s*[,;]|\\s*$)';
 /** L1a: strong prep + pair (`vive en Bogotá, Colombia`; right side ALWAYS single). */
 const STRONG_PREP_PAIR_RE = new RegExp(
   `\\b(${PREP_STRONG})\\s+(${GEO_ONE}(?:\\s+${GEO_WORD}){0,4})\\s*,\\s*(${GEO_ONE})${PAIR_END}`,
+  'i',
 );
 /** L1b: strong prep + place without comma (`vive en Caracas`, `reside en San Juan de los Morros`). */
 const STRONG_PREP_SINGLE_RE = new RegExp(
   `\\b(${PREP_STRONG})\\s+(${GEO_ONE}(?:\\s+${GEO_WORD}){0,4})${PAIR_END}`,
+  'i',
 );
 /** L2: weak prep + single-single pair (`de Valencia, Carabobo` — never `de Caracas, Juan Diaz`). */
-const WEAK_PREP_PAIR_RE = new RegExp(`\\b(de|en)\\s+(${GEO_ONE})\\s*,\\s*(${GEO_ONE})${PAIR_END}`);
-/** L3: bare single-single pair (`Miami, Florida` — never `Juan Diaz, Caracas`). */
-const BARE_PAIR_RE = new RegExp(`(^|[,;])\\s*(${GEO_ONE})\\s*,\\s*(${GEO_ONE})${PAIR_END}`, 'g');
-/** L4: weak prep + single token (`de Caracas`). */
-const WEAK_PREP_SINGLE_RE = new RegExp(`\\b(de|en)\\s+(${GEO_ONE})${PAIR_END}`);
+const WEAK_PREP_PAIR_RE = new RegExp(`\\b(de|en)\\s+(${GEO_ONE})\\s*,\\s*(${GEO_ONE})${PAIR_END}`, 'i');
+/** L4: weak prep + single token (`de Caracas`, `en caracas`). */
+const WEAK_PREP_SINGLE_RE = new RegExp(`\\b(de|en)\\s+(${GEO_ONE})${PAIR_END}`, 'i');
+
+const WORD_TOKEN_RE = /[A-Za-zÁÉÍÓÚÑáéíóúñ.\-]+/g;
+
+/**
+ * L3 bare-pair scan (HOTFIX 1 — replaces the position-anchored
+ * `BARE_PAIR_RE`, which missed mid-sentence pairs like `… por 1 mes,
+ * Miami, Florida, zelle …` and therefore rendered only `Miami`): every
+ * adjacent comma-segment pair is tried with ORIGINAL casing — left is
+ * the last word before the comma, right the first word after it. The
+ * left is rejected when it is the tail of a multi-word name
+ * (`Juan Diaz, Caracas`: `Diaz` preceded by `Juan`, a non-connector
+ * word) — the right side then falls through to the single pass.
+ */
+function scanBarePairs(clean: string): Array<{ raw: string; left: string; right: string }> {
+  const out: Array<{ raw: string; left: string; right: string }> = [];
+  const segments = clean.split(/[,;]/);
+  for (let index = 0; index + 1 < segments.length; index += 1) {
+    const leftSeg = segments[index] ?? '';
+    const rightSeg = segments[index + 1] ?? '';
+    const leftTokens = leftSeg.match(WORD_TOKEN_RE) ?? [];
+    const rightTokens = rightSeg.match(WORD_TOKEN_RE) ?? [];
+    // The right side must BE the whole next segment (single token):
+    // `Juan Diaz, Caracas` is name + place, never `Caracas, Juan`;
+    // `por, de` is residue, never a pair. (Mirrors the old `PAIR_END`
+    // comma-or-end requirement.) The LEFT side may be segment-final
+    // (`… por 1 mes Miami, Florida, …` — the truncation root fix: the
+    // old anchor required the pair at segment start).
+    if (rightTokens.length !== 1) {
+      continue;
+    }
+    const left = leftTokens[leftTokens.length - 1];
+    const right = rightTokens[0];
+    if (left === undefined || right === undefined) {
+      continue;
+    }
+    // Name-tail guard: the left is rejected ONLY when it ends a
+    // capitalized multi-word run (`Juan Diaz, Caracas` — `Diaz`
+    // preceded by `Juan`). Lowercase sale residue (`por 1 mes Miami,
+    // Florida`) and connectors (`de`) never block the pair.
+    const before = leftTokens[leftTokens.length - 2];
+    if (
+      before !== undefined &&
+      !GEO_CONNECTOR_RE.test(fold(before)) &&
+      /^[A-ZÁÉÍÓÚÑ]/.test(before)
+    ) {
+      continue;
+    }
+    out.push({ raw: `${left}, ${right}`, left, right });
+  }
+  return out;
+}
+
+export interface CustomerLocationExtractOpts {
+  /**
+   * Structural evidence only (L1–L4 + bare pairs): resolves BEFORE the
+   * name pass, so captured places never become names. The caller runs
+   * the bare-single pass (L5) separately AFTER name consumption.
+   */
+  structuralOnly?: boolean;
+  /**
+   * Bare single tokens only (L5, post-consume): resolves AFTER the
+   * caller consumed name/phone/amount/method/receiver — remaining
+   * current-turn fragments evaluated as optional location candidates.
+   */
+  bareSingleOnly?: boolean;
+}
 
 export function extractCustomerLocation(
   text: string,
   _extraction: SaleExtraction,
+  opts: CustomerLocationExtractOpts = {},
+  excludedSpans: string[] = [],
 ): ParsedCustomerLocation | undefined {
   const clean = stripForLocation(text);
-  // L1a: strong preposition + pair (multi-word left allowed ONLY here).
-  const strongPair = STRONG_PREP_PAIR_RE.exec(clean);
-  if (strongPair?.[0] !== undefined && strongPair?.[2] !== undefined && strongPair?.[3] !== undefined) {
-    const pair = buildPairLocation(strongPair[0], strongPair[2], strongPair[3], 5);
-    if (pair !== undefined) {
-      return pair;
+  const excluded = new Set(excludedSpans.map((span) => fold(span)));
+  const isExcluded = (value: string): boolean => excluded.has(fold(value));
+  if (opts.bareSingleOnly !== true) {
+    // L1a: strong preposition + pair (multi-word left allowed ONLY here).
+    const strongPair = STRONG_PREP_PAIR_RE.exec(clean);
+    if (strongPair?.[0] !== undefined && strongPair?.[2] !== undefined && strongPair?.[3] !== undefined) {
+      const pair = buildPairLocation(strongPair[0], strongPair[2], strongPair[3], 5);
+      if (pair !== undefined && !isExcluded(pair.span)) {
+        return pair;
+      }
+    }
+    // L1b: strong preposition + comma-less place.
+    const strong = STRONG_PREP_SINGLE_RE.exec(clean);
+    if (strong?.[0] !== undefined && strong?.[2] !== undefined) {
+      const single = buildSingleLocation(strong[0], strong[2], 5);
+      if (single !== undefined && !isExcluded(single.span)) {
+        return single;
+      }
+    }
+    // L2: weak preposition + pair (`de Valencia, Carabobo`).
+    const weakPair = WEAK_PREP_PAIR_RE.exec(clean);
+    if (weakPair?.[0] !== undefined && weakPair?.[2] !== undefined && weakPair?.[3] !== undefined) {
+      const pair = buildPairLocation(weakPair[0], weakPair[2], weakPair[3]);
+      if (pair !== undefined && !isExcluded(pair.span)) {
+        return pair;
+      }
+    }
+    // L3: bare pair anywhere in the turn (`Miami, Florida` mid-sentence;
+    // never `Juan Diaz, Caracas`, whose left side is a name tail).
+    for (const candidate of scanBarePairs(clean)) {
+      const pair = buildPairLocation(candidate.raw, candidate.left, candidate.right);
+      if (pair !== undefined && !isExcluded(pair.span)) {
+        return pair;
+      }
+    }
+    // L4: weak preposition + single token (`de Caracas`, `en caracas`).
+    const weakSingle = WEAK_PREP_SINGLE_RE.exec(clean);
+    if (weakSingle?.[0] !== undefined && weakSingle?.[2] !== undefined) {
+      const single = buildSingleLocation(weakSingle[0], weakSingle[2], 1);
+      if (single !== undefined && !isExcluded(single.span)) {
+        return single;
+      }
+    }
+    if (opts.structuralOnly === true) {
+      return undefined;
     }
   }
-  // L1b: strong preposition + comma-less place.
-  const strong = STRONG_PREP_SINGLE_RE.exec(clean);
-  if (strong?.[0] !== undefined && strong?.[2] !== undefined) {
-    const single = buildSingleLocation(strong[0], strong[2], 5);
-    if (single !== undefined) {
-      return single;
-    }
-  }
-  // L2: weak preposition + pair (`de Valencia, Carabobo`).
-  const weakPair = WEAK_PREP_PAIR_RE.exec(clean);
-  if (weakPair?.[0] !== undefined && weakPair?.[2] !== undefined && weakPair?.[3] !== undefined) {
-    const pair = buildPairLocation(weakPair[0], weakPair[2], weakPair[3]);
-    if (pair !== undefined) {
-      return pair;
-    }
-  }
-  // L3: bare pair with single-token sides (`Miami, Florida` —
-  // never `Juan Diaz, Caracas`, whose left side is a name).
-  for (const match of clean.matchAll(BARE_PAIR_RE)) {
-    const left = match[2] ?? '';
-    const right = match[3] ?? '';
-    if (left.split(/\s+/).filter(Boolean).length !== 1) {
-      continue;
-    }
-    const pair = buildPairLocation(`${left}, ${right}`, left, right);
-    if (pair !== undefined) {
-      return pair;
-    }
-  }
-  // L4: weak preposition + single token (`de Caracas`).
-  const weakSingle = WEAK_PREP_SINGLE_RE.exec(clean);
-  if (weakSingle?.[0] !== undefined && weakSingle?.[2] !== undefined) {
-    const single = buildSingleLocation(weakSingle[0], weakSingle[2], 1);
-    if (single !== undefined) {
-      return single;
-    }
-  }
-  // L5: single capitalized token among the comma segments (`Caracas`
-  // in `Caracas, Zelle, 4 dólares, Edward` — method/amount/receiver
+  // L5: bare single token among the comma segments (`caracas` in
+  // `caracas, Zelle, 4 dólares, Edward` — method/amount/receiver
   // already stripped above, so only true leftovers are scanned).
+  // Case-insensitive (HOTFIX 1); the caller gates anchoring
+  // (attachSaleLocation drops anchor-less mentions) and holder
+  // collisions.
   for (const segment of clean
     .split(/[,;|\n]+/)
     .map((part) => part.replace(/^[.\s:—-]+|[.\s:—-]+$/g, '').trim())
     .filter((part) => part.length > 0)) {
     const tokens = segment.split(/\s+/).filter(Boolean);
     if (tokens.length !== 1 || tokens[0] === undefined) {
+      continue;
+    }
+    if (isExcluded(tokens[0])) {
       continue;
     }
     const single = buildSingleLocation(tokens[0], tokens[0], 1);
@@ -752,10 +887,10 @@ export function extractCustomerLocation(
 }
 
 /**
- * True when a fragment is location-shaped (capitalized, geo-like):
- * the gate for the OPTIONAL_CUSTOMER_LOCATION_EXTRACTION scoped call
- * (genuinely-needed only — lowercase noise like `precio` never fires
- * it) and for location-aware sale continuation.
+ * True when a fragment is location-shaped (geo-like, any casing —
+ * HOTFIX 1): the gate for the OPTIONAL_CUSTOMER_LOCATION_EXTRACTION
+ * scoped call (genuinely-needed only — blocked noise like `precio`
+ * never fires it) and for location-aware sale continuation.
  */
 export function isLocationLikeFragment(value: string): boolean {
   const trimmed = value.trim().replace(/^[.\s:—-]+|[.\s:—-]+$/g, '');
@@ -771,9 +906,9 @@ export function isLocationLikeFragment(value: string): boolean {
 
 /**
  * True when a leftover fragment is shaped like an unparsed place the
- * deterministic pass could not claim: single capitalized tokens (rare
- * — L5 usually claims them) or multi-word capitalized phrases with
- * only geo connectors (`San Juan de los Morros`). Lowercase noise,
+ * deterministic pass could not claim: single geo-like tokens (any
+ * casing — rare, L5 usually claims them) or multi-word geo phrases
+ * with only geo connectors (`San Juan de los Morros`). Blocked noise,
  * digits, sale/service words and holder-like collisions never qualify
  * (the caller additionally drops exact holder matches — it owns the
  * holder set). The caller fires the scoped call for multi-word phrases

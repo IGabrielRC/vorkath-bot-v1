@@ -420,7 +420,10 @@ describe('smoke webhook: previous context never fills a fresh sale', () => {
     const confirmData = world.client.findButton('✅Confirmar');
     expect(confirmData).toBeDefined();
     await world.post(tap(world.nextUpdateId(), EDWARD, confirmData as string));
-    expect(world.client.lastText()).toContain('VENTA CONFIRMADA');
+    // HOTFIX 2 terminal lifecycle: the card freezes on VENTA CONFIRMADA
+    // (in-place edit) and a fresh Home lands BELOW it (new send).
+    expect(world.client.texts()).toContainEqual(expect.stringContaining('VENTA CONFIRMADA'));
+    expect(world.client.lastText()).toContain('Vokath');
 
     // Gabriel's fresh sale starts clean despite Edward's confirmed sale
     // and his own (nonexistent) history.

@@ -20,6 +20,12 @@ export interface EditMessageOpts {
   replyMarkup?: InlineKeyboardMarkup;
 }
 
+export interface EditReplyMarkupOpts {
+  chatId: number;
+  messageId: number;
+  replyMarkup?: InlineKeyboardMarkup;
+}
+
 export interface AnswerCallbackOpts {
   /** Shown as a toast on ownership rejections (e.g. cross-actor taps). */
   text?: string;
@@ -77,6 +83,17 @@ export interface ChatMember {
 export interface TelegramClient {
   sendMessage(opts: SendMessageOpts): Promise<unknown>;
   editMessageText(opts: EditMessageOpts): Promise<unknown>;
+  /**
+   * Removes/disables a card's buttons in place (single-ACTIVE-card
+   * enforcement: when a new foreground card activates, the prior
+   * Home/operational card's keyboard is removed so old buttons are not
+   * tappable — the card text is never touched). OPTIONAL on purpose:
+   * offline test stubs omit it and the caller falls back to a
+   * best-effort text-preserving path. Never throws for missing
+   * messages — the caller swallows card-lost errors.
+   * See: https://core.telegram.org/bots/api#editmessagereplymarkup
+   */
+  editMessageReplyMarkup?(opts: EditReplyMarkupOpts): Promise<unknown>;
   answerCallbackQuery(callbackQueryId: string, opts?: AnswerCallbackOpts): Promise<unknown>;
   getChatMember?(chatId: number, userId: number): Promise<ChatMember | undefined>;
 }
@@ -109,6 +126,16 @@ export class HttpTelegramClient implements TelegramClient {
       text: opts.text,
       parse_mode: TELEGRAM_PARSE_MODE,
       ...(opts.replyMarkup !== undefined ? { reply_markup: opts.replyMarkup } : {}),
+    });
+  }
+
+  async editMessageReplyMarkup(opts: EditReplyMarkupOpts): Promise<unknown> {
+    return this.call('editMessageReplyMarkup', {
+      chat_id: opts.chatId,
+      message_id: opts.messageId,
+      ...(opts.replyMarkup !== undefined
+        ? { reply_markup: opts.replyMarkup }
+        : { reply_markup: { inline_keyboard: [] } }),
     });
   }
 

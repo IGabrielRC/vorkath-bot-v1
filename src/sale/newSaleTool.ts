@@ -78,6 +78,7 @@ import {
   isLocationLikeFragment,
   isLocationShapedLeftover,
   isNameLikeRemainder,
+  subtractConsumedSpans,
   unconsumedTurnFragments,
 } from './saleParser';
 import type { SaleExtraction } from './saleParser';
@@ -108,6 +109,12 @@ export interface SaleDeps {
    * Absent → Slice A refusal (`confirm-refused`, zero side-effects).
    */
   saleExec?: SaleExecDeps;
+  /**
+   * Safe UX metrics sink (opt-in, HOTFIX 2 Part C): per-operation
+   * counters only (turns, parse-vs-Gemini attribution, outcome) — never
+   * raw text, phones, or secrets. Undefined = no telemetry.
+   */
+  metrics?: import('./saleMetrics').SaleMetrics;
 }
 
 /**
@@ -603,6 +610,10 @@ export async function prepareNewSaleFromText(
     { chatId: actor.chatId, userId: actor.userId, ...(actor.name !== '' ? { name: actor.name } : {}) },
     actor.name,
   );
+  // Safe UX metrics (counters only — never raw text or secrets): every
+  // tool turn counts once as deterministic unless a scoped call fires.
+  deps.metrics?.record(base.operationId, 'turn');
+  deps.metrics?.record(base.operationId, 'parse_only');
   const extraction: SaleExtraction = parseSaleExtraction(text);
 
   if (extraction.renewalHint === true) {
@@ -692,13 +703,15 @@ export async function prepareNewSaleFromText(
     linkedCustomers = resolved.customers;
   }
 
-  // Pass 1b — optional CUSTOMER_LOCATION (capture-if-provided, never
-  // asked, never blocking): deterministic evident forms first (`de
-  // Caracas`, `Valencia, Carabobo`, `Caracas`…). The claimed span is
-  // stripped from the remainder text so a captured place never becomes
-  // the customer name (`Juan Diaz, Caracas` → name + location).
-  // Holder collisions and anchor-less mentions attach nothing (the
-  // remainder text is then left intact).
+  // Pass 1b — optional CUSTOMER_LOCATION, deterministic evident forms
+  // first (HOTFIX 1 open-world, case-insensitive: prepositions, comma
+  // pairs anywhere in the turn, and bare singles — `caracas` ≡
+  // `Caracas`, `Miami, Florida` mid-sentence included). Evident runs
+  // BEFORE the name pass so a captured place never becomes the customer
+  // name (`Juan Diaz, Caracas` → name + location); comma-less tails
+  // resolve AFTER name consumption (Pass 2b) so a name answer is never
+  // stolen as a place. Holder collisions and anchor-less mentions
+  // attach nothing (the remainder text is then left intact).
   let remainderText = text;
   const detectedLocation = extractCustomerLocation(text, extraction);
   if (detectedLocation !== undefined) {
@@ -770,6 +783,48 @@ export async function prepareNewSaleFromText(
     consumedFragments.push(remainder);
   }
 
+  // Pass 2b — open-world comma-less tails (HOTFIX 1): after consuming
+  // intent/service/duration/name/phone/amount/currency/method/receiver,
+  // a single-token tail left in the fragments is an optional location
+  // candidate (`SMOKE caracas` − name/phone/amount → `caracas`;
+  // `caracas`/`CARACAS` ≡ `Caracas` — casing never matters). Comma
+  // singles and pairs already resolved in Pass 1b. Deterministic only;
+  // the scoped Gemini call (Pass 3b) stays the genuinely-needed
+  // fallback. Anchor-required (phone/customer on the draft),
+  // holder-safe, zero extra turns, never asked: no confidence →
+  // uncaptured, never a question. Name/method/receiver spans already
+  // consumed above never re-enter (`Juan Diaz` ≠ location,
+  // `Edward` ≠ location).
+  {
+    const locationAbsent =
+      draft.customer.proposedCustomer?.location === undefined &&
+      draft.customer.locationUpdate === undefined &&
+      draft.customer.pendingLocation === undefined;
+    if (locationAbsent) {
+      for (const fragment of unconsumedTurnFragments(remainderText, extraction, [], {
+        keepInertEdges: true,
+      })) {
+        const tail = subtractConsumedSpans(fragment, consumedFragments);
+        if (tail === '' || tail.split(/\s+/).filter(Boolean).length !== 1) {
+          continue;
+        }
+        if (matchCashHolder(tail, holders) !== undefined) {
+          continue;
+        }
+        const mapped = buildLocationFromDisplay(tail);
+        if (mapped === undefined || matchCashHolder(mapped.display, holders) !== undefined) {
+          continue;
+        }
+        const before = draft;
+        draft = await attachSaleLocation(draft, mapped, deps);
+        if (draft !== before) {
+          consumedFragments.push(tail);
+          break;
+        }
+      }
+    }
+  }
+
   // Pass 3 — scoped remainder (genuinely-ambiguous leftovers ONLY, at
   // most ONE interpreter call per turn): deterministic extractors +
   // the fixed-point pass ran first; this fires only when missing fields
@@ -807,6 +862,9 @@ export async function prepareNewSaleFromText(
         allowed: ['customer', 'method', 'receiver', 'reference'],
         currentTurnOnly: true,
       });
+      if (decided !== null) {
+        deps.metrics?.record(draft.operationId, 'gemini assist');
+      }
       if (decided !== null && missingNow.includes(decided.field)) {
         if (
           decided.field === 'customer' &&
@@ -892,6 +950,9 @@ export async function prepareNewSaleFromText(
           allowed: ['location'],
           currentTurnOnly: true,
         });
+        if (located !== null) {
+          deps.metrics?.record(draft.operationId, 'gemini assist');
+        }
         if (located !== null && located.field === 'location') {
           const mapped = buildLocationFromDisplay(located.value);
           if (

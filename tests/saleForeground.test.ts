@@ -359,7 +359,7 @@ describe('single-card 7–16 (1 send + N edits, 1 foreground max)', () => {
     await world.app.close();
   });
 
-  it('(8) Confirm tap transforms the SAME card to VENTA CONFIRMADA (ledger 1)', async () => {
+  it('(8) Confirm tap freezes the card on VENTA CONFIRMADA + fresh Home below (ledger 1)', async () => {
     const world = await createForegroundWorld();
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, FULL_COMBO));
     const confirmData = world.client.findButton('✅Confirmar');
@@ -367,19 +367,28 @@ describe('single-card 7–16 (1 send + N edits, 1 foreground max)', () => {
     const sendsBefore = world.client.sends().length;
     await world.post(tap(world.nextUpdateId(), GABRIEL, confirmData as string));
     expect(world.mockStore.saleOperations).toHaveLength(1);
-    expect(world.client.sends()).toHaveLength(sendsBefore);
-    expect(world.client.texts().at(-1)).toContain('✅ VENTA CONFIRMADA');
+    // HOTFIX 2 terminal lifecycle: the SAME card carries the final
+    // result (frozen, zero callbacks except WhatsApp) and exactly ONE
+    // fresh Home send lands below it.
+    expect(world.client.sends()).toHaveLength(sendsBefore + 1);
+    expect(world.client.texts()).toContainEqual(expect.stringContaining('✅ VENTA CONFIRMADA'));
+    expect(world.client.texts().at(-1)).toContain('🏠 Vokath');
+    // Frozen confirmed card keeps ONLY the external WhatsApp action.
+    const frozenButtons = world.client.edits().at(-1)?.replyMarkup?.inline_keyboard.flat() ?? [];
+    expect(frozenButtons.some((button) => button.text === '💬 Abrir WhatsApp')).toBe(true);
+    expect(frozenButtons.every((button) => button.callback_data === undefined)).toBe(true);
     await world.app.close();
   });
 
-  it('(9) NL cancelar transforms the SAME card, draft dropped, ledger 0', async () => {
+  it('(9) NL cancelar freezes the SAME card compact + fresh Home below, draft dropped, ledger 0', async () => {
     const world = await createForegroundWorld();
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'dame una cuenta nueva netflix'));
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'cancelar'));
     expect(world.saleDrafts.get(ownerOf(world, GABRIEL))).toBeUndefined();
-    expect(world.client.sends()).toHaveLength(1);
+    expect(world.client.sends()).toHaveLength(2);
     expect(world.client.edits()).toHaveLength(1);
-    expect(world.client.texts().at(-1)).toContain('cancelada');
+    expect(world.client.texts()).toContainEqual(expect.stringContaining('cancelada'));
+    expect(world.client.texts().at(-1)).toContain('🏠 Vokath');
     expect(world.mockStore.saleOperations).toHaveLength(0);
     await world.app.close();
   });
@@ -446,13 +455,16 @@ describe('single-card 7–16 (1 send + N edits, 1 foreground max)', () => {
     await world.app.close();
   });
 
-  it('(16) confirmed card keeps the single message lineage (send once, edits after)', async () => {
+  it('(16) confirmed card freezes the result + fresh Home below (send once for the card, one Home send)', async () => {
     const world = await createForegroundWorld();
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, FULL_COMBO));
     const confirmData = world.client.findButton('✅Confirmar');
     await world.post(tap(world.nextUpdateId(), GABRIEL, confirmData as string));
-    expect(world.client.sends()).toHaveLength(1);
-    expect(world.client.texts().at(-1)).toContain('💬 WhatsApp preparado.');
+    // HOTFIX 2: the card send + its terminal edit keep one lineage; the
+    // fresh Home is the only second send.
+    expect(world.client.sends()).toHaveLength(2);
+    expect(world.client.texts()).toContainEqual(expect.stringContaining('💬 WhatsApp preparado.'));
+    expect(world.client.texts().at(-1)).toContain('🏠 Vokath');
     await world.app.close();
   });
 });
@@ -485,7 +497,9 @@ describe('routing 17–22 (active-first priorities)', () => {
     await walkToNameQuestion(world);
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'cancelar'));
     expect(world.saleDrafts.get(ownerOf(world, GABRIEL))).toBeUndefined();
-    expect(world.client.texts().at(-1)).toContain('cancelada');
+    // HOTFIX 2: the SAME card freezes compact, the fresh Home lands below.
+    expect(world.client.texts()).toContainEqual(expect.stringContaining('cancelada'));
+    expect(world.client.texts().at(-1)).toContain('🏠 Vokath');
     await world.app.close();
   });
 
@@ -831,7 +845,7 @@ describe('buttons 38–41 (contextual gating)', () => {
     await world.app.close();
   });
 
-  it('(41) pending card: Cancelar venta drops the draft on the SAME card', async () => {
+  it('(41) pending card: Cancelar venta freezes the SAME card compact + fresh Home below', async () => {
     const world = await createForegroundWorld();
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, FULL_COMBO));
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'vende otra cuenta netflix'));
@@ -839,8 +853,10 @@ describe('buttons 38–41 (contextual gating)', () => {
     const cancel = world.client.findButton('❌Cancelar venta');
     await world.post(tap(world.nextUpdateId(), GABRIEL, cancel as string));
     expect(world.saleDrafts.get(ownerOf(world, GABRIEL))).toBeUndefined();
-    expect(world.client.texts().at(-1)).toContain('cancelada');
-    expect(world.client.sends()).toHaveLength(1);
+    // HOTFIX 2: the pending card itself freezes compact; Home below.
+    expect(world.client.texts()).toContainEqual(expect.stringContaining('cancelada'));
+    expect(world.client.texts().at(-1)).toContain('🏠 Vokath');
+    expect(world.client.sends()).toHaveLength(2);
     expect(world.mockStore.saleOperations).toHaveLength(0);
     await world.app.close();
   });

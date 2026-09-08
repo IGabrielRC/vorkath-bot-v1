@@ -947,3 +947,31 @@ export function renderSaleConfirmed(
   const head = alreadyConfirmed ? '✅ VENTA CONFIRMADA (ya registrada)' : '✅ VENTA CONFIRMADA';
   return `${title(head)}\n\n${summary}\n\n${datos}`;
 }
+
+/**
+ * Terminal card lifecycle (HOTFIX 2 — ONE ACTIVE CARD, presentation
+ * only, no business logic):
+ * - `SALE_CONFIRMING_TEXT`: transient confirm-gate copy, shown ONLY when
+ *   the confirm operation takes perceptibly long (no flicker on instant
+ *   ops). UX-level double-tap prevention; idempotency lives underneath.
+ * - `SALE_TERMINAL_STALE_TEXT`: the brief toast/note for taps on a
+ *   frozen card (confirm/cancel/Volver after terminal). Terminal cards
+ *   are never edited, never resurrected — the fresh Home below owns the
+ *   next operation.
+ * - `renderRecoverableSaleError()`: human-language recoverable failure
+ *   (no codes, no stacks — technical detail stays in logs). The draft is
+ *   kept; the card carries [Reintentar][Volver][Cancelar] continuation
+ *   (mapped to saleKeep/back/cancel), so no dead ends.
+ */
+export const SALE_CONFIRMING_TEXT = '⏳ Confirmando…';
+
+export const SALE_TERMINAL_STALE_TEXT =
+  'Esta gestión ya terminó — sigue en el Home de abajo para una nueva operación.';
+
+export function renderRecoverableSaleError(): string {
+  return (
+    `${title('⚠️ No pude completar ese paso')}\n\n` +
+    `${esc('El borrador sigue intacto — no se perdió nada.')}\n` +
+    `${esc('Puedes reintentar, volver o cancelar.')}`
+  );
+}

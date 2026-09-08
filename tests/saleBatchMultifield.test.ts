@@ -798,26 +798,32 @@ describe('sale one-card batch lineage (31–37)', () => {
     await world.app.close();
   });
 
-  it('(34) confirm transforms the SAME batch card (ledger 1)', async () => {
+  it('(34) confirm freezes the batch card + fresh Home below (ledger 1)', async () => {
     const world = await createBatchWorld();
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, FULL_COMBO));
     const confirmData = world.client.findButton('✅Confirmar');
     expect(confirmData).toBeDefined();
     await world.post(tap(world.nextUpdateId(), GABRIEL, confirmData as string));
     expect(world.mockStore.saleOperations).toHaveLength(1);
-    expect(world.client.sends()).toHaveLength(1);
-    expect(world.client.lastText()).toContain('✅ VENTA CONFIRMADA');
+    // HOTFIX 2: terminal freeze (in-place edit) + exactly one fresh
+    // Home send below — the confirmed result is on the frozen card.
+    expect(world.client.sends()).toHaveLength(2);
+    expect(world.client.lastText()).toContain('🏠 Vokath');
+    expect(world.client.texts()).toContainEqual(
+      expect.stringContaining('✅ VENTA CONFIRMADA'),
+    );
     await world.app.close();
   });
 
-  it('(35) cancel transforms the SAME batch card (draft dropped, ledger 0)', async () => {
+  it('(35) cancel freezes the batch card compact + fresh Home below (draft dropped, ledger 0)', async () => {
     const world = await createBatchWorld();
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'vende netflix para 4145460657'));
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, 'cancelar'));
     expect(world.saleDrafts.get({ chatId: GROUP_CHAT_ID, userId: GABRIEL })).toBeUndefined();
-    expect(world.client.sends()).toHaveLength(1);
+    expect(world.client.sends()).toHaveLength(2);
     expect(world.client.edits()).toHaveLength(1);
-    expect(world.client.lastText()).toContain('cancelada');
+    expect(world.client.texts()).toContainEqual(expect.stringContaining('cancelada'));
+    expect(world.client.lastText()).toContain('🏠 Vokath');
     expect(world.mockStore.saleOperations).toHaveLength(0);
     await world.app.close();
   });
@@ -831,7 +837,7 @@ describe('sale one-card batch lineage (31–37)', () => {
     await world.app.close();
   });
 
-  it('(37) summary → confirm → final keep the single message lineage', async () => {
+  it('(37) summary → confirm freezes the card + fresh Home below (lineage split at terminal)', async () => {
     const world = await createBatchWorld();
     await world.post(textMessage(world.nextUpdateId(), GABRIEL, FULL_COMBO));
     const confirmData = world.client.findButton('✅Confirmar');
@@ -847,14 +853,18 @@ describe('sale one-card batch lineage (31–37)', () => {
         data: confirmData,
       },
     });
-    expect(world.client.sends()).toHaveLength(1);
+    // HOTFIX 2: the frozen terminal edit keeps the single lineage
+    // (send id + edit id are one), the fresh Home is a NEW send below.
+    expect(world.client.sends()).toHaveLength(2);
     expect(world.client.edits()).toHaveLength(1);
     const ids = new Set([
       world.client.sends()[0]?.messageId,
       ...world.client.edits().map((edit) => edit.messageId),
     ]);
     expect(ids.size).toBe(1);
-    expect(world.client.lastText()).toContain('💬 WhatsApp preparado.');
+    expect(world.client.sends()[1]?.messageId).not.toBe(world.client.sends()[0]?.messageId);
+    expect(world.client.texts()).toContainEqual(expect.stringContaining('💬 WhatsApp preparado.'));
+    expect(world.client.lastText()).toContain('🏠 Vokath');
     await world.app.close();
   });
 });
