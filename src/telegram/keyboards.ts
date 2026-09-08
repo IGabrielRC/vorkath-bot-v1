@@ -327,28 +327,16 @@ export function accountDisambiguationKeyboard(
   accounts: Array<{ servicio: string; identifier: string }>,
   opts?: { interactionId?: string },
 ): InlineKeyboardMarkup {
-  const interactionId = opts?.interactionId;
-  const numerals = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
-  const rows: InlineKeyboardButton[][] = [];
-  const choiceRow: InlineKeyboardButton[] = [];
   const shown = Math.min(accounts.length, VIEW_ACTIONS.length);
+  const labels: string[] = [];
   for (let index = 0; index < shown; index += 1) {
     const account = accounts[index];
-    const action = VIEW_ACTIONS[index];
-    if (account === undefined || action === undefined) {
+    if (account === undefined) {
       continue;
     }
-    const label = `${numerals[index] ?? '•'} ${prettyService(account.servicio)} · ${shortAccountIdentifier(account.identifier)}`;
-    choiceRow.push(ownedButton(label, action, interactionId));
-    if (choiceRow.length === 2) {
-      rows.push(choiceRow.splice(0, 2));
-    }
+    labels.push(`${prettyService(account.servicio)} · ${shortAccountIdentifier(account.identifier)}`);
   }
-  if (choiceRow.length > 0) {
-    rows.push(choiceRow.splice(0, 2));
-  }
-  rows.push([backButton(interactionId)]);
-  return { inline_keyboard: rows };
+  return listView(labels, { ...opts });
 }
 
 /**
@@ -362,27 +350,7 @@ export function credentialDisambiguationKeyboard(
   labels: string[],
   opts?: { interactionId?: string },
 ): InlineKeyboardMarkup {
-  const interactionId = opts?.interactionId;
-  const numerals = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
-  const rows: InlineKeyboardButton[][] = [];
-  const choiceRow: InlineKeyboardButton[] = [];
-  const shown = Math.min(labels.length, VIEW_ACTIONS.length);
-  for (let index = 0; index < shown; index += 1) {
-    const label = labels[index];
-    const action = VIEW_ACTIONS[index];
-    if (label === undefined || action === undefined) {
-      continue;
-    }
-    choiceRow.push(ownedButton(`${numerals[index] ?? '•'} ${label}`, action, interactionId));
-    if (choiceRow.length === 2) {
-      rows.push(choiceRow.splice(0, 2));
-    }
-  }
-  if (choiceRow.length > 0) {
-    rows.push(choiceRow.splice(0, 2));
-  }
-  rows.push([backButton(interactionId)]);
-  return { inline_keyboard: rows };
+  return listView(labels.slice(0, VIEW_ACTIONS.length), { ...opts });
 }
 
 /** Draft actions: Confirmar / Corregir / Cancelar + ←Volver (nav-stack pop). */
@@ -400,32 +368,42 @@ export function draftKeyboard(interactionId?: string): InlineKeyboardMarkup {
 
 const VIEW_ACTIONS: CallbackAction[] = ['view0', 'view1', 'view2', 'view3', 'view4'];
 
+/** UX numerals for ListView options (numbering is UX only — resolution uses stable keys). */
+const LIST_NUMERALS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+
+export interface ListViewOpts {
+  interactionId?: string;
+  hasNext?: boolean;
+  hasPrev?: boolean;
+}
+
 /**
- * Search-result keyboard: one owned "Ver cliente" button per shown row
- * (index within the page), plus Siguiente/Anterior pagination when the
- * interaction has more pages, plus ←Volver. Every button carries the
- * SEARCH interaction id — a peer tapping them is rejected by owner.
+ * ONE generic disambiguation/list view (transversal): numeral-prefixed
+ * option buttons (2 per row, `view0–4` actions so ownership,
+ * stale-callback and cross-thread guards apply unchanged), optional
+ * Siguiente/Anterior pagination, plus ←Volver. Every button carries
+ * the interaction id (stable keys — the numeral is UX only, resolution
+ * uses stored state). The three legacy builders below delegate here —
+ * same output, one layout to maintain.
  */
-export function searchResultsKeyboard(
-  shown: number,
-  opts?: { interactionId?: string; hasNext?: boolean; hasPrev?: boolean },
-): InlineKeyboardMarkup {
+export function listView(labels: string[], opts?: ListViewOpts): InlineKeyboardMarkup {
   const interactionId = opts?.interactionId;
   const rows: InlineKeyboardButton[][] = [];
-  const numerals = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
-  const viewRow: InlineKeyboardButton[] = [];
-  for (let index = 0; index < shown && index < VIEW_ACTIONS.length; index += 1) {
+  const choiceRow: InlineKeyboardButton[] = [];
+  const shown = Math.min(labels.length, VIEW_ACTIONS.length);
+  for (let index = 0; index < shown; index += 1) {
+    const label = labels[index];
     const action = VIEW_ACTIONS[index];
-    if (action === undefined) {
+    if (label === undefined || action === undefined) {
       continue;
     }
-    viewRow.push(ownedButton(`${numerals[index] ?? '•'} Ver cliente`, action, interactionId));
-    if (viewRow.length === 2) {
-      rows.push(viewRow.splice(0, 2));
+    choiceRow.push(ownedButton(`${LIST_NUMERALS[index] ?? '•'} ${label}`, action, interactionId));
+    if (choiceRow.length === 2) {
+      rows.push(choiceRow.splice(0, 2));
     }
   }
-  if (viewRow.length > 0) {
-    rows.push(viewRow.splice(0, 2));
+  if (choiceRow.length > 0) {
+    rows.push(choiceRow.splice(0, 2));
   }
   const navRow: InlineKeyboardButton[] = [];
   if (opts?.hasPrev === true) {
@@ -439,6 +417,20 @@ export function searchResultsKeyboard(
   }
   rows.push([backButton(interactionId)]);
   return { inline_keyboard: rows };
+}
+
+/**
+ * Search-result keyboard: one owned "Ver cliente" button per shown row
+ * (index within the page), plus Siguiente/Anterior pagination when the
+ * interaction has more pages, plus ←Volver. Every button carries the
+ * SEARCH interaction id — a peer tapping them is rejected by owner.
+ */
+export function searchResultsKeyboard(
+  shown: number,
+  opts?: { interactionId?: string; hasNext?: boolean; hasPrev?: boolean },
+): InlineKeyboardMarkup {
+  const count = Math.max(0, Math.min(shown, VIEW_ACTIONS.length));
+  return listView(Array.from({ length: count }, () => 'Ver cliente'), { ...opts });
 }
 
 /**

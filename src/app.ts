@@ -93,6 +93,8 @@ export interface AppDeps {
   interactionsStatePath?: string;
   /** OperatorProfile snapshot path; undefined disables best-effort persist (tests). */
   operatorProfilesStatePath?: string;
+  /** NewSale draft snapshot path; undefined disables best-effort persist (tests). */
+  saleDraftsStatePath?: string;
 }
 
 export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInstance {
@@ -136,6 +138,9 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
       : {}),
     ...(deps.operatorProfilesStatePath !== undefined
       ? { operatorProfilesStatePath: deps.operatorProfilesStatePath }
+      : {}),
+    ...(deps.saleDraftsStatePath !== undefined
+      ? { saleDraftsStatePath: deps.saleDraftsStatePath }
       : {}),
   });
 
@@ -220,6 +225,16 @@ export async function startApp(): Promise<void> {
     logger.error(error, 'Failed to load OperatorProfile snapshot — booting with empty profiles');
   }
 
+  // NewSale drafts survive redeploys via their own snapshot: a restart
+  // keeps every open sale draft. Missing file = first boot.
+  const saleDrafts = new NewSaleDraftStore();
+  try {
+    await saleDrafts.loadFromFile(env.SALE_DRAFTS_STATE_PATH);
+    logger.info({ saleDrafts: saleDrafts.snapshot().length }, 'SaleDraft snapshot loaded');
+  } catch (error) {
+    logger.error(error, 'Failed to load SaleDraft snapshot — booting with empty sale drafts');
+  }
+
   const app = buildApp(env, {
     repos,
     drafts,
@@ -227,8 +242,9 @@ export async function startApp(): Promise<void> {
     draftsStatePath: env.DRAFTS_STATE_PATH,
     interactionsStatePath: env.INTERACTIONS_STATE_PATH,
     operatorProfilesStatePath: env.OPERATOR_PROFILES_STATE_PATH,
+    saleDraftsStatePath: env.SALE_DRAFTS_STATE_PATH,
     ...(saleMockStore !== undefined
-      ? { sale: { saleDrafts: new NewSaleDraftStore(), mockStore: saleMockStore } }
+      ? { sale: { saleDrafts: saleDrafts, mockStore: saleMockStore } }
       : {}),
   });
   await app.listen({ host: '0.0.0.0', port: env.PORT });

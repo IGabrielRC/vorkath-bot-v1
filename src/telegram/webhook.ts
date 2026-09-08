@@ -88,6 +88,7 @@ import {
   type InlineKeyboardMarkup,
 } from './keyboards';
 import type { TelegramClient, TelegramContext } from './client';
+import { splitTelegramText } from './lengthGuard';
 import {
   esc,
   expiredRow,
@@ -227,6 +228,8 @@ export interface WebhookDeps {
   interactionsStatePath?: string;
   /** File path for best-effort OperatorProfile persistence; undefined disables it. */
   operatorProfilesStatePath?: string;
+  /** File path for best-effort NewSale draft persistence; undefined disables it. */
+  saleDraftsStatePath?: string;
   /**
    * Slice B NewSale wiring (opt-in): per-operator sale drafts + the live
    * MOCK store (inventory rows + atomic sale ledger seam). Absent =
@@ -1104,8 +1107,19 @@ export function createWebhookHandler(deps: WebhookDeps) {
      * tappable). Terminal cards are already frozen (zero callbacks), so
      * they need no deactivation. Fire-and-forget: no latency added to
      * the ack/edit path.
+     *
+     * The legacy path (search/Home/expired/inventory/cash/more) passes
+     * its own interaction: OPERATION/HOME keep the core behavior above;
+     * any other type additionally deactivates PENDING siblings of that
+     * SAME type only (an old search list dies when a new search lands —
+     * an open sale draft's keyboard is never touched from a search).
      */
-    function deactivateStaleForegroundCards(exceptInteractionId: string): void {
+    function deactivateStaleForegroundCards(
+      exceptInteractionId: string,
+      sameType?: InteractionType,
+    ): void {
+      const coreOnly =
+        sameType === undefined || sameType === 'OPERATION' || sameType === 'HOME';
       for (const candidate of deps.interactions.snapshot()) {
         if (candidate.id === exceptInteractionId) {
           continue;
@@ -1117,7 +1131,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
         ) {
           continue;
         }
-        if (candidate.type !== 'OPERATION' && candidate.type !== 'HOME') {
+        if (coreOnly) {
+          if (candidate.type !== 'OPERATION' && candidate.type !== 'HOME') {
+            continue;
+          }
+        } else if (candidate.type !== sameType) {
           continue;
         }
         if (
@@ -1142,7 +1160,24 @@ export function createWebhookHandler(deps: WebhookDeps) {
       threadOverride?: number,
     ): Promise<void> {
       await ackOwnedReceipt();
-      const labeled = withOperator(resultText, targetActorName);
+      // Central pre-send length guard (same as the legacy path):
+      // the first part keeps the edit/replacement path + keyboard,
+      // the remainder travels as same-thread follow-ups.
+      const saleParts = splitTelegramText(resultText).map((part) =>
+        withOperator(part, targetActorName),
+      );
+      const labeled = saleParts[0] ?? withOperator(resultText, targetActorName);
+      const saleFollowUps = saleParts.slice(1);
+      const sendSaleFollowUps = async (): Promise<void> => {
+        const thread = threadOverride ?? replyCtx.messageThreadId;
+        for (const extra of saleFollowUps) {
+          await deps.client.sendMessage({
+            chatId: targetChatId,
+            text: extra,
+            ...(thread !== undefined ? { messageThreadId: thread } : {}),
+          });
+        }
+      };
       const operationId = operationIdOf(interaction);
       const track = (event: 'send' | 'edit' | 'resend' | 'recovery'): void => {
         if (operationId !== undefined) {
@@ -1231,6 +1266,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           track('send');
         }
       }
+      await sendSaleFollowUps();
       await ackOwnedReceipt();
     }
 
@@ -1841,6 +1877,30 @@ export function createWebhookHandler(deps: WebhookDeps) {
           return 'un dato pendiente';
       }
     }
+    /**
+     * Contextual UNKNOWN (never bare): keeps the stable UNKNOWN_TEXT
+     * prefix and appends WHAT was expected — the open sale draft's
+     * missing fields (via expected-field knowledge), a caller hint
+     * naming the expected identifier or section, or the available
+     * sections otherwise — so the operator always sees the next step.
+     */
+    function unknownHelpText(hint?: string): string {
+      const lines = [UNKNOWN_TEXT];
+      if (hint !== undefined && hint !== '') {
+        lines.push(hint);
+      } else if (saleToolDeps !== undefined) {
+        const open = saleToolDeps.store.get(owner);
+        if (open !== undefined) {
+          const missing = expectedSaleFields(open);
+          if (missing.length > 0) {
+            const names = missing.map((field) => saleFieldLabel(open, field)).join(', ');
+            lines.push(`🧾 Venta en curso: sigo esperando ${names}.`);
+          }
+        }
+      }
+      lines.push('Secciones: Operar, Buscar, Vencidos, Inventario, Caja, Más.');
+      return lines.join('\n');
+    }
     const draftEntity = `draft:${targetChatId}:${targetActorId}`;
     const fromCallback = callback !== undefined;
     const callbackId = callback?.id;
@@ -1983,6 +2043,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
       if (deps.operatorProfilesStatePath !== undefined) {
         deps.interactions.saveProfilesToFile(deps.operatorProfilesStatePath).catch((error) => {
           logger.warn({ error }, 'OperatorProfile persist failed');
+        });
+      }
+      if (deps.saleDraftsStatePath !== undefined && deps.sale !== undefined) {
+        deps.sale.saleDrafts.saveToFile(deps.saleDraftsStatePath).catch((error) => {
+          logger.warn({ error }, 'SaleDraft persist failed');
         });
       }
     }
@@ -2214,33 +2279,89 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
 
     /**
-     * Labeled send-or-edit: every interactive message shows its operator.
-     * Fresh messages return to the origin topic through the centralized
-     * context; `threadOverride` (the owning interaction's stored thread)
-     * wins when given, so callback-derived messages keep the
-     * interaction's topic even if the tap carried no thread. Edits stay
-     * in place (Telegram keeps the edited message in its topic).
+     * Labeled send-or-edit (legacy path: search/Home/expired/inventory/
+     * cash/more and every other non-sale card): every interactive
+     * message shows its operator. Fresh messages return to the origin
+     * topic through the centralized context; `threadOverride` (the
+     * owning interaction's stored thread) wins when given, so
+     * callback-derived messages keep the interaction's topic even if
+     * the tap carried no thread. Edits stay in place (Telegram keeps
+     * the edited message in its topic).
+     *
+     * Transversal hardening (shared with the sale path):
+     * - Card-lost recovery: a dead tapped message NEVER throws away
+     *   state — drafts/interactions are already persisted, so the
+     *   current content is rendered into a NEW replacement card which
+     *   is adopted (`cardMessageId`) when `own` is given. `message is
+     *   not modified` is success (no duplicate card).
+     * - Single-ACTIVE-card: the new foreground card deactivates stale
+     *   sibling keyboards (same actor, same thread) when `own` is given.
+     * - Length guard: over-long cards travel as same-thread follow-ups
+     *   (first part keeps the edit/replacement path + keyboard).
      */
     async function sendLabeled(
       responseText: string,
       replyMarkup: InlineKeyboardMarkup,
       threadOverride?: number,
+      own?: Interaction,
     ): Promise<void> {
       await ackOwnedReceipt();
-      const labeled = withOperator(responseText, targetActorName);
+      if (own !== undefined) {
+        deactivateStaleForegroundCards(own.id, own.type);
+      }
+      const parts = splitTelegramText(responseText).map((part) =>
+        withOperator(part, targetActorName),
+      );
+      const labeled = parts[0] ?? withOperator(responseText, targetActorName);
+      const followUps = parts.slice(1);
+      const thread = threadOverride ?? replyCtx.messageThreadId;
+      const adopt = (response: unknown): void => {
+        if (own === undefined) {
+          return;
+        }
+        const sentId = extractSentMessageId(response);
+        if (sentId !== undefined) {
+          deps.interactions.touch(own.id, { cardMessageId: sentId });
+          persistAll();
+        }
+      };
       if (fromCallback && callbackMessageId !== undefined) {
-        await deps.client.editMessageText({
-          chatId: targetChatId,
-          messageId: callbackMessageId,
-          text: labeled,
-          replyMarkup,
-        });
+        try {
+          await deps.client.editMessageText({
+            chatId: targetChatId,
+            messageId: callbackMessageId,
+            text: labeled,
+            replyMarkup,
+          });
+        } catch (error) {
+          if (!isNotModifiedError(error)) {
+            if (!isCardLostError(error)) {
+              throw error;
+            }
+            adopt(
+              await deps.client.sendMessage({
+                chatId: targetChatId,
+                text: labeled,
+                replyMarkup,
+                ...(thread !== undefined ? { messageThreadId: thread } : {}),
+              }),
+            );
+          }
+        }
       } else {
-        const thread = threadOverride ?? replyCtx.messageThreadId;
+        adopt(
+          await deps.client.sendMessage({
+            chatId: targetChatId,
+            text: labeled,
+            replyMarkup,
+            ...(thread !== undefined ? { messageThreadId: thread } : {}),
+          }),
+        );
+      }
+      for (const extra of followUps) {
         await deps.client.sendMessage({
           chatId: targetChatId,
-          text: labeled,
-          replyMarkup,
+          text: extra,
           ...(thread !== undefined ? { messageThreadId: thread } : {}),
         });
       }
@@ -2258,21 +2379,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
           ? sectionKeyboard(section, interaction.id)
           : homeKeyboard(interaction.id);
       persistAll();
-      if (fromCallback && callbackMessageId !== undefined) {
-        await deps.client.editMessageText({
-          chatId: targetChatId,
-          messageId: callbackMessageId,
-          text: withOperator(responseText, targetActorName),
-          replyMarkup: markup,
-        });
-      } else {
-        await deps.client.sendMessage({
-          chatId: targetChatId,
-          text: withOperator(responseText, targetActorName),
-          replyMarkup: markup,
-          ...(targetThreadId !== undefined ? { messageThreadId: targetThreadId } : {}),
-        });
-      }
+      // Same transport as every other legacy card (recovery + adoption
+      // + deactivation + length guard ride sendLabeled).
+      await sendLabeled(responseText, markup, targetThreadId, interaction);
       await ackOwnedReceipt();
     }
 
@@ -2287,12 +2396,12 @@ export function createWebhookHandler(deps: WebhookDeps) {
       if (terminal) {
         const home = createInteraction('HOME');
         persistAll();
-        await sendLabeled(responseText, homeKeyboard(home.id));
+        await sendLabeled(responseText, homeKeyboard(home.id), undefined, home);
         return;
       }
       const interaction = activeOperationInteraction() ?? createInteraction('OPERATION');
       persistAll();
-      await sendLabeled(responseText, draftKeyboard(interaction.id));
+      await sendLabeled(responseText, draftKeyboard(interaction.id), undefined, interaction);
     }
 
     /** Actor's latest PENDING OPERATION/DRAFT interaction in this thread, if any. */
@@ -2407,6 +2516,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           ACCOUNT_NOT_FOUND_TEXT,
           accountSearchKeyboard(interaction.id),
           interaction.messageThreadId,
+          interaction,
         );
         return;
       }
@@ -2427,6 +2537,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           formatAccountCard(only),
           accountSearchKeyboard(interaction.id),
           interaction.messageThreadId,
+          interaction,
         );
         return;
       }
@@ -2449,6 +2560,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           { interactionId: interaction.id },
         ),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -2479,6 +2591,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         formatAccountCard(account),
         accountSearchKeyboard(interaction.id),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -2498,6 +2611,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           PHONE_NOT_FOUND_TEXT,
           phoneSearchKeyboard(interaction.id),
           interaction.messageThreadId,
+          interaction,
         );
         return;
       }
@@ -2514,6 +2628,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           formatCustomerCard(only),
           phoneSearchKeyboard(interaction.id),
           interaction.messageThreadId,
+          interaction,
         );
         return;
       }
@@ -2541,6 +2656,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           hasPrev: safeOffset > 0,
         }),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -2567,6 +2683,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         formatCustomerCard(customer),
         phoneSearchKeyboard(interaction.id),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -2923,6 +3040,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           showServices: refs.total > 1,
         }),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -2980,6 +3098,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         ),
         credentialDisambiguationKeyboard(labels, { interactionId: interaction.id }),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -3050,6 +3169,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           renderCredentialNoContext(),
           sectionKeyboard('buscar', view.id),
           view.messageThreadId,
+          view,
         );
         return;
       }
@@ -3076,6 +3196,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         renderCredentialNoContext(),
         sectionKeyboard('buscar', interaction.id),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -3107,6 +3228,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           renderCredentialNoContext(),
           sectionKeyboard('buscar', view.id),
           view.messageThreadId,
+          view,
         );
         return;
       }
@@ -3156,6 +3278,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         renderCredentialNoContext(),
         sectionKeyboard('buscar', touched.id),
         touched.messageThreadId,
+        touched,
       );
     }
 
@@ -3305,6 +3428,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         renderCredentialNoContext(),
         sectionKeyboard('buscar', interaction.id),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -3382,6 +3506,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
             showServices: refs.total > 1,
           }),
           interaction.messageThreadId,
+          interaction,
         );
         return;
       }
@@ -3401,6 +3526,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           WHATSAPP_ASK_PHONE_TEXT,
           credentialDisambiguationKeyboard(phones, { interactionId: interaction.id }),
           interaction.messageThreadId,
+          interaction,
         );
         return;
       }
@@ -3416,6 +3542,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         `${WHATSAPP_NO_NUMBER_TEXT}${others}`,
         credentialCardKeyboard(interaction.id),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -3482,6 +3609,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         renderCredentialNoContext(),
         sectionKeyboard('buscar', interaction.id),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -3544,6 +3672,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR',
         sectionKeyboard('buscar', view.id),
         thread ?? view.messageThreadId,
+        view,
       );
     }
 
@@ -3591,6 +3720,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           SALE_ENTRY_TEXT,
           saleEntryKeyboard(entered.id),
           thread ?? entered.messageThreadId,
+          entered,
         );
         return;
       }
@@ -3605,6 +3735,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         resumed ? renderDraftResumed(draft.months) : renderDraftOpened(),
         draftKeyboard(operation.id),
         thread ?? operation.messageThreadId,
+        operation,
       );
     }
 
@@ -3616,6 +3747,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         renderExpired(expired.slice(0, 5), expired.length),
         sectionKeyboard('vencidos', view.id),
         thread ?? view.messageThreadId,
+        view,
       );
     }
 
@@ -3627,6 +3759,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         renderInventory(summary),
         sectionKeyboard('inventario', view.id),
         thread ?? view.messageThreadId,
+        view,
       );
     }
 
@@ -3638,6 +3771,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         SECTION_TEXTS['caja'] ?? '💰 CAJA',
         sectionKeyboard('caja', view.id),
         thread ?? view.messageThreadId,
+        view,
       );
     }
 
@@ -3649,6 +3783,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         SECTION_TEXTS['mas'] ?? '⋯ MÁS',
         sectionKeyboard('mas', view.id),
         thread ?? view.messageThreadId,
+        view,
       );
     }
 
@@ -3670,6 +3805,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           renderLegacyNotFound(query),
           sectionKeyboard('buscar', interaction.id),
           interaction.messageThreadId,
+          interaction,
         );
         return;
       }
@@ -3689,6 +3825,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           hasPrev: safeOffset > 0,
         }),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -3713,6 +3850,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         renderLegacyDetail(row, globalIndex, rows.length),
         sectionKeyboard('buscar', interaction.id),
         interaction.messageThreadId,
+        interaction,
       );
     }
 
@@ -3747,6 +3885,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
             SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR',
             sectionKeyboard('buscar', target.id),
             target.messageThreadId,
+            target,
           );
           return;
         }
@@ -3892,6 +4031,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
             WHATSAPP_ASK_PHONE_TEXT,
             credentialDisambiguationKeyboard(phones, { interactionId: target.id }),
             target.messageThreadId,
+            target,
           );
           return;
         }
@@ -3936,7 +4076,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
     async function handleHome(interaction: Interaction): Promise<void> {
       const home = createInteraction('HOME');
       persistAll();
-      await sendLabeled(HOME_TEXT, homeKeyboard(home.id), interaction.messageThreadId);
+      await sendLabeled(HOME_TEXT, homeKeyboard(home.id), interaction.messageThreadId, home);
     }
 
     /**
@@ -4067,6 +4207,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           SECTION_TEXTS['buscar'] ?? '🔎 BUSCAR',
           sectionKeyboard('buscar', view.id),
           interaction.messageThreadId,
+          view,
         );
         return;
       }
@@ -4150,7 +4291,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
                 : 'Sin borrador abierto que cancelar.';
           const home = createInteraction('HOME');
           persistAll();
-          await sendLabeled(text, homeKeyboard(home.id), interaction.messageThreadId);
+          await sendLabeled(text, homeKeyboard(home.id), interaction.messageThreadId, home);
           return;
         }
         const result = kind === 'confirm' ? await confirmWithActivity() : cancelWithIdempotency();
@@ -4164,7 +4305,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         persistAll();
         const home = createInteraction('HOME');
         persistAll();
-        await sendLabeled(result.text, homeKeyboard(home.id), interaction.messageThreadId);
+        await sendLabeled(result.text, homeKeyboard(home.id), interaction.messageThreadId, home);
         return;
       }
       if (action === 'correct') {
@@ -4177,6 +4318,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
             CORRECTION_PROMPT_TEXT,
             draftKeyboard(interaction.id),
             interaction.messageThreadId,
+            interaction,
           );
           return;
         }
@@ -4184,7 +4326,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         if (blocked !== null) {
           const home = createInteraction('HOME');
           persistAll();
-          await sendLabeled(blocked.text, homeKeyboard(home.id), interaction.messageThreadId);
+          await sendLabeled(blocked.text, homeKeyboard(home.id), interaction.messageThreadId, home);
           return;
         }
         deps.interactions.touch(interaction.id, { view: 'correct' });
@@ -4193,6 +4335,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           CORRECTION_PROMPT_TEXT,
           draftKeyboard(interaction.id),
           interaction.messageThreadId,
+          interaction,
         );
         return;
       }
@@ -4324,7 +4467,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const sectionText = SECTION_TEXTS[action] ?? SECTION_TEXTS['mas'] ?? '⋯ MÁS';
       const view = createInteraction('MORE');
       persistAll();
-      await sendLabeled(sectionText, sectionKeyboard(action, view.id), interaction.messageThreadId);
+      await sendLabeled(sectionText, sectionKeyboard(action, view.id), interaction.messageThreadId, view);
     }
 
     if (decision.layer === 'noop') {
@@ -4638,7 +4781,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
         await respondDraft(renderDraftUpdated(updated.months));
         return { ok: true };
       }
-      await respond(UNKNOWN_TEXT);
+      await respond(
+        unknownHelpText('Se esperaba un teléfono, nombre o cuenta para buscar.'),
+      );
       return { ok: true };
     }
 
@@ -4694,6 +4839,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           ASK_ACCOUNT_TEXT,
           sectionKeyboard('buscar', interaction.id),
           interaction.messageThreadId,
+          interaction,
         );
         return { ok: true };
       }
@@ -4715,7 +4861,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
           await runDirectSearch(fallbackIdentifier);
           return { ok: true };
         }
-        await respond(UNKNOWN_TEXT);
+        await respond(
+          unknownHelpText(
+            'Para crear una operación dilo explícito (ej. «crea una operación de prueba de 2 meses»).',
+          ),
+        );
         return { ok: true };
       }
       const months =
@@ -4789,7 +4939,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
       await respondDraft(renderDraftUpdated(updated.months));
       return { ok: true };
     }
-    await respond(UNKNOWN_TEXT);
+    await respond(unknownHelpText());
     return { ok: true };
   };
 }

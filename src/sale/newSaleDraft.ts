@@ -24,6 +24,8 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import { dirname, join } from 'node:path';
 import type { CustomerLocation } from '../mock/customers';
 import type { PaymentCurrency, PaymentMethod } from './payments';
 import type { CostSnapshot, PriceSnapshot, SaleModality } from './pricePolicy';
@@ -410,5 +412,59 @@ export class NewSaleDraftStore {
         this.drafts.set(keyOf(draft.owner), { ...draft });
       }
     }
+  }
+
+  private writeQueue: Promise<void> = Promise.resolve();
+
+  /**
+   * Atomic persist (tmp + rename, same-device tmp so rename() never
+   * hits EXDEV — same pattern as DraftEngine/InteractionStore).
+   * The queue self-heals: a failed write rejects only its own caller
+   * and never poisons later saves, so sale drafts are never silently
+   * lost after one bad write. Called best-effort by the webhook after
+   * every mutation and once at boot — real sale drafts survive
+   * EasyPanel redeploys.
+   */
+  saveToFile(filePath: string): Promise<void> {
+    const run = async (): Promise<void> => {
+      const dir = dirname(filePath);
+      await fs.mkdir(dir, { recursive: true });
+      const tmpPath = join(dir, `.vokath-sale-drafts-${process.pid}-${Date.now()}.tmp`);
+      try {
+        await fs.writeFile(tmpPath, JSON.stringify(this.snapshot(), null, 2), 'utf8');
+        await fs.rename(tmpPath, filePath);
+      } catch (error) {
+        await fs.unlink(tmpPath).catch(() => undefined);
+        throw error;
+      }
+    };
+    this.writeQueue = this.writeQueue.then(run, run);
+    return this.writeQueue;
+  }
+
+  /** Best-effort load: missing file means first boot — start empty. */
+  async loadFromFile(filePath: string): Promise<void> {
+    let raw: string;
+    try {
+      raw = await fs.readFile(filePath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return;
+      }
+      throw error;
+    }
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return;
+    }
+    const valid = (parsed as NewSaleDraft[]).filter(
+      (draft) =>
+        typeof draft?.operationId === 'string' &&
+        draft.kind === 'NEW_SALE' &&
+        typeof draft?.owner?.chatId === 'number' &&
+        typeof draft?.owner?.userId === 'number' &&
+        (draft.status === 'DRAFT' || draft.status === 'CONFIRMED' || draft.status === 'CANCELLED'),
+    );
+    this.restore(valid);
   }
 }

@@ -100,6 +100,11 @@ const envSchema = z.object({
    * profiles across redeploys with no new variable.
    */
   OPERATOR_PROFILES_STATE_PATH: z.string().min(1).default('/data/operator-profiles-state.json'),
+  /**
+   * NewSale draft snapshot. Defaults to /data so EasyPanel persists
+   * real sale drafts across redeploys with no new variable.
+   */
+  SALE_DRAFTS_STATE_PATH: z.string().min(1).default('/data/sale-drafts-state.json'),
 });
 
 export type Env = z.infer<typeof envSchema>;
