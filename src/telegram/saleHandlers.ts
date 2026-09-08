@@ -21,10 +21,13 @@
  *   (Venta nueva — no Renovación, no full Vencidos/Inventario/Caja,
  *   no Bolsa/Cierre).
  * - `keyboardForSaleResult`: single-card keyboards per result kind —
- *   summary/ask/disambiguate/new-customer → draftKeyboard (same card,
- *   Confirm/Correct/Cancel/Volver); emergency-auth → saleEmergency
- *   keyboard (explicit auth, never Confirmar); confirmed →
- *   credentialCardKeyboard with the wa.me URL (Fase 3 EXACTLY).
+ *   summary → draftKeyboard (same card, Confirm/Correct/Cancel/Volver);
+ *   pending → salePendingKeyboard ([Continuar venta][Cancelar venta]);
+ *   emergency-auth → saleEmergency keyboard (explicit auth, never
+ *   Confirmar); confirmed → credentialCardKeyboard with the wa.me URL
+ *   (Fase 3 EXACTLY); every other incomplete state → the contextual
+ *   saleProgressKeyboard (Volver/Cancelar + valid next actions, never
+ *   Confirmar).
  */
 
 import type { MockStore } from '../mock/mockStore';
@@ -172,7 +175,36 @@ export function keyboardForSaleResult(
       return credentialCardKeyboard(interactionId, whatsappUrl, { showServices: false });
     case 'summary':
       return draftKeyboard(interactionId);
+    case 'pending':
+      return salePendingKeyboard(interactionId);
     default:
       return saleProgressKeyboard(interactionId, result.missing);
+  }
+}
+
+/**
+ * Sale NavStack view per result kind (text-start and callback-start
+ * share these semantics — both render through the same sale flows).
+ * `sale-entry` is the OPERAR entry card (Volver parent of every sale);
+ * `sale-batch` covers ask-missing/new-customer/disambiguate/clarification
+ * follow-ups (re-settled on Volver against the intact draft).
+ */
+export function saleViewForResult(result: SaleResult): string {
+  switch (result.kind) {
+    case 'summary':
+      return 'sale-summary';
+    case 'confirmed':
+    case 'already-confirmed':
+      return 'sale-confirmed';
+    case 'emergency-auth':
+      return 'sale-emergency';
+    case 'no-inventory':
+      return 'sale-noinventory';
+    case 'pending':
+      return 'sale-pending';
+    case 'cancelled':
+      return 'sale-cancelled';
+    default:
+      return 'sale-batch';
   }
 }

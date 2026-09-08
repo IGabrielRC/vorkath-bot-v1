@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildApp } from '../src/app';
+import { buildApp, resolveAppVersion } from '../src/app';
 import type { Env } from '../src/config/env';
 
 const testEnv: Env = {
@@ -18,15 +18,19 @@ const testEnv: Env = {
 };
 
 describe('GET /health', () => {
-  it('returns exactly the 4 safe fields with no secret substrings', async () => {
+  it('returns exactly the 5 safe fields with no secret substrings', async () => {
     const app = buildApp(testEnv);
     const response = await app.inject({ method: 'GET', url: '/health' });
 
     expect(response.statusCode).toBe(200);
     const body = response.json() as Record<string, unknown>;
     expect(Object.keys(body).sort()).toEqual(
-      ['gemini', 'mockStore', 'status', 'telegram'].sort(),
+      ['gemini', 'mockStore', 'status', 'telegram', 'version'].sort(),
     );
+    // Deployed-build marker: package.json version, never a secret, never
+    // invented infra metadata.
+    expect(body['version']).toBe(resolveAppVersion());
+    expect(typeof body['version']).toBe('string');
     const raw = response.body;
     for (const secret of [
       testEnv.TELEGRAM_BOT_TOKEN,

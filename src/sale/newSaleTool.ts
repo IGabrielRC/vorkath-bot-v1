@@ -117,6 +117,7 @@ export type SaleResultKind =
   | 'summary'
   | 'ask-missing'
   | 'new-customer'
+  | 'pending'
   | 'disambiguate'
   | 'emergency-auth'
   | 'no-inventory'
@@ -281,6 +282,27 @@ export function expectedSaleFields(draft: NewSaleDraft): string[] {
 }
 
 /**
+ * Substantive-draft predicate (second-operation guard, single source of
+ * truth shared by the webhook text path and the [Venta nueva] button
+ * path): a draft carrying ANY business field — service, modality,
+ * phone, duration, payment, or customer linkage. An empty just-created
+ * shell is NOT substantive: folding a fresh intent into it is the same
+ * operation, never a hybrid.
+ */
+export function isSubstantiveSaleDraft(draft: NewSaleDraft): boolean {
+  return (
+    draft.service !== null ||
+    draft.modality !== null ||
+    draft.phone !== null ||
+    draft.duration.requestedMonths !== null ||
+    draft.payment.method !== null ||
+    draft.payment.actualAmount !== null ||
+    draft.customer.existingCustomerId !== undefined ||
+    draft.customer.proposedCustomer !== undefined
+  );
+}
+
+/**
  * Confirmar gating: true only when the draft is fully ready —
  * fields + proposal + price + cost + payment + receiver + customer +
  * duration, with no pending emergency auth. The keyboard layer shows
@@ -333,12 +355,26 @@ function settle(draft: NewSaleDraft, deps: SaleDeps, customers?: Customer[]): Sa
     draft.customer.existingCustomerId === undefined &&
     draft.customer.proposedCustomer === undefined
   ) {
-    // Phone known, customer not: the in-sale new-customer prompt (name),
-    // never the generic phone question — BR-CUS-009, Gabriel Juan class.
+    // Phone known, customer not: converge into the recompute → batch
+    // path (never a divergent single-question renderer). Name-only
+    // remainder → the single name prompt; anything else missing →
+    // ONE batched card (name for this number + every other
+    // independent field) via expectedSaleFields(). BR-CUS-009,
+    // Gabriel Juan class.
+    const missing = missingSaleFieldList(draft);
+    if (missing.length <= 1) {
+      return {
+        kind: 'new-customer',
+        draft,
+        text: renderNewCustomerSalePrompt(draft.phone),
+      };
+    }
     return {
       kind: 'new-customer',
       draft,
-      text: renderNewCustomerSalePrompt(draft.phone),
+      missing: 'customer',
+      missingFields: missing,
+      text: renderSaleAskMissingBatch(missing, { customerNameForPhone: draft.phone }),
     };
   }
   const missing = missingSaleFieldList(draft);
@@ -579,13 +615,9 @@ export async function prepareNewSaleFromText(
   if (extraction.phoneRaw !== undefined) {
     const current = deps.store.get({ chatId: actor.chatId, userId: actor.userId }) ?? draft;
     const customers = linkedCustomers ?? [];
-    if (customers.length === 0) {
-      return {
-        kind: 'new-customer',
-        draft: current,
-        text: renderNewCustomerSalePrompt(extraction.phoneRaw),
-      };
-    }
+    // Unknown OR shared phone flows through settle: unknown converges
+    // to the name batch (or the single name prompt when nothing else
+    // is missing), shared disambiguates — never a divergent renderer.
     return settle(current, deps, customers);
   }
 
@@ -597,9 +629,6 @@ export async function prepareNewSaleFromText(
     current.customer.proposedCustomer === undefined
   ) {
     const customers = await deps.findCustomersByPhone(current.phone);
-    if (customers.length === 0) {
-      return { kind: 'new-customer', draft: current, text: renderNewCustomerSalePrompt(current.phone) };
-    }
     return settle(current, deps, customers);
   }
   return settle(current, deps);

@@ -787,7 +787,10 @@ export function renderSaleAskMissing(fieldName: string): string {
  * modality choice, emergency auth) never batch — they keep their own
  * cards and buttons.
  */
-export function renderSaleAskMissingBatch(fields: string[]): string {
+export function renderSaleAskMissingBatch(
+  fields: string[],
+  opts?: { customerNameForPhone?: string },
+): string {
   const ordered = fields.filter((field, index) => fields.indexOf(field) === index);
   if (ordered.length === 0) {
     return '🧾 Todo listo — preparo el resumen.';
@@ -806,8 +809,19 @@ export function renderSaleAskMissingBatch(fields: string[]): string {
     nouns.push('modalidad');
   }
   if (ordered.includes('customer')) {
-    bullets.push('• Teléfono del cliente: envía el número.');
-    nouns.push('teléfono');
+    // New-customer convergence: phone unknown → ask the phone; phone
+    // known but customer unresolved → ask the NAME for that number
+    // (never the phone again). Both keep the `nombre del cliente`
+    // wording the foreground regression asserts.
+    if (opts?.customerNameForPhone !== undefined && opts.customerNameForPhone !== '') {
+      bullets.push(
+        `• Nombre del cliente para ${opts.customerNameForPhone}: envíalo en un mensaje.`,
+      );
+      nouns.push('nombre del cliente');
+    } else {
+      bullets.push('• Teléfono del cliente: envía el número.');
+      nouns.push('teléfono');
+    }
   }
   if (ordered.includes('months')) {
     bullets.push('• Duración: ej. «2 meses» o «30 días».');

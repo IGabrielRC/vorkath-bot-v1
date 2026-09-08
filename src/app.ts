@@ -1,4 +1,5 @@
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { GenaiIntentInterpreter, type IntentInterpreter } from './ai/intentInterpreter';
 import { parseAuthorizedChatIds, parseAuthorizedIds } from './auth/allowlist';
@@ -31,6 +32,35 @@ export interface HealthStatus {
   telegram: string;
   gemini: string;
   mockStore: string;
+  /**
+   * Deployed-build marker: `package.json` version (ships inside the
+   * Docker image — no manual hardcoding, no invented infra). The image
+   * carries no git metadata (no commit-SHA ARG/ENV anywhere in the
+   * Dockerfile or env config), so this proves the running RELEASE
+   * lineage (bump the version per deploy), not the exact commit.
+   * Never secrets, never internal data. Falls back to `unknown` when
+   * package.json is unreadable (never crashes /health).
+   */
+  version: string;
+}
+
+/**
+ * Reads the app version from the `package.json` next to the working
+ * directory (repo root locally, `/app` in the Docker image — both
+ * ship package.json). Best-effort: `unknown` on any failure.
+ */
+export function resolveAppVersion(): string {
+  try {
+    const raw = readFileSync(join(process.cwd(), 'package.json'), 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    const version =
+      typeof parsed === 'object' && parsed !== null
+        ? (parsed as { version?: unknown }).version
+        : undefined;
+    return typeof version === 'string' && version !== '' ? version : 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }
 
 /** Injectable collaborators — tests override; production wires real ones. */
@@ -115,6 +145,7 @@ export function buildApp(env: Env = loadEnv(), deps: AppDeps = {}): FastifyInsta
       telegram: 'configured',
       gemini: 'configured',
       mockStore: 'ready',
+      version: resolveAppVersion(),
     };
     return body;
   });

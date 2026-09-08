@@ -35,11 +35,13 @@ import {
   keyboardForSaleResult,
   renderSalePendingManagement,
   saleTextContinues,
+  saleViewForResult,
 } from './saleHandlers';
-import { saleEntryKeyboard, salePendingKeyboard } from './keyboards';
+import { saleEntryKeyboard } from './keyboards';
 import {
   expectedSaleField,
   expectedSaleFields,
+  isSubstantiveSaleDraft,
   prepareNewSaleChoice,
   prepareNewSaleFromAction,
   prepareNewSaleFromText,
@@ -853,6 +855,147 @@ export function createWebhookHandler(deps: WebhookDeps) {
       return undefined;
     }
 
+    /**
+     * Per-interaction navigation stack (presentation/navigation only).
+     *
+     * Each SEARCH interaction owns an ordered history of semantic views:
+     * HOME (explicit root only) · SEARCH_INPUT (`prompt`) · SEARCH_RESULTS
+     * (`list`/`customer-list`/`account-list`) · CUSTOMER_CARD
+     * (`customer-detail`) · ACCOUNT_CARD (`account-detail`/`detail`) ·
+     * ASSIGNMENT_SELECTOR (`credentials-list`/`whatsapp-list`) ·
+     * CREDENTIAL_CARD (`credentials-detail`/`whatsapp-detail`) ·
+     * PHONE_SELECTOR (`whatsapp-phones`).
+     *
+     * Sale OPERATION interactions share the SAME stack semantics:
+     * `sale-entry` (the OPERAR card — Volver parent of every sale;
+     * text-started sales seed it without showing it, mirroring the
+     * search `prompt` seed) · `sale-batch` (ask-missing / new-customer /
+     * disambiguate / clarification follow-ups, re-settled on Volver
+     * against the intact draft) · `sale-summary` · `sale-pending` ·
+     * `sale-emergency` · `sale-noinventory` · `sale-note` ·
+     * `sale-confirmed` · `sale-cancelled` · `home` (explicit root only).
+     *
+     * Volver pops the stack and re-renders the exact previous VIEW of
+     * the SAME interaction (same card edit when the tap came from a
+     * callback); Home is NEVER a fallback — it only fires on the
+     * explicit `home` action or from a seeded root parent. Stale
+     * callbacks ack without touching the stack; per-actor isolation
+     * comes free because the stack lives inside the owned interaction
+     * (chat+thread+actor+interactionId).
+     *
+     * NAVIGATION NEVER MUTATES BUSINESS STATE: the stack, view, and
+     * snap touch ONLY `interaction.state` (presentation snapshots —
+     * SNAP_KEYS carry no sale-draft field, and sale views store an
+     * empty snap). Sale drafts (NewSaleDraftStore) change ONLY through
+     * the state machine: `prepareNewSale*` (fold), `confirmNewSale`
+     * (Confirm path), `store.cancel` (Cancel path). External pending
+     * drafts are never touched by navigation.
+     */
+    interface NavEntry {
+      view: string;
+      snap: Record<string, unknown>;
+    }
+    const NAV_KEY = 'nav';
+    const NAV_LIMIT = 20;
+    const SNAP_KEYS = [
+      'query',
+      'offset',
+      'total',
+      'selectedCustomer',
+      'selectedAccount',
+      'selectedIndex',
+      'customerId',
+      'accountId',
+      'serviceFilter',
+      'explicitIdentifier',
+      'assignmentKeys',
+      'selectedAssignmentKey',
+      'phones',
+      'optionIndex',
+      'whatsapp',
+    ];
+    function navEntriesOf(interaction: Interaction): NavEntry[] {
+      const raw = interaction.state[NAV_KEY];
+      if (!Array.isArray(raw)) {
+        return [];
+      }
+      return (raw as unknown[]).filter(
+        (entry): entry is NavEntry =>
+          typeof entry === 'object' &&
+          entry !== null &&
+          typeof (entry as { view?: unknown }).view === 'string',
+      );
+    }
+    function snapOf(state: Record<string, unknown>): Record<string, unknown> {
+      const out: Record<string, unknown> = {};
+      for (const key of SNAP_KEYS) {
+        if (state[key] !== undefined) {
+          out[key] = state[key];
+        }
+      }
+      return out;
+    }
+    /**
+     * Records a forward transition: pushes the current view (when it
+     * differs) then stores the next view. Same-view re-renders never push,
+     * so restores and idempotent repeats keep the stack stable.
+     */
+    function transitionTo(
+      interaction: Interaction,
+      nextView: string,
+      patch: Record<string, unknown> = {},
+    ): Interaction {
+      const current =
+        typeof interaction.state['view'] === 'string'
+          ? (interaction.state['view'] as string)
+          : undefined;
+      const nav = navEntriesOf(interaction);
+      let nextNav = nav;
+      if (current !== undefined && current !== nextView) {
+        nextNav = [...nav, { view: current, snap: snapOf(interaction.state) }];
+        if (nextNav.length > NAV_LIMIT) {
+          nextNav = nextNav.slice(nextNav.length - NAV_LIMIT);
+        }
+      }
+      const updated = deps.interactions.touch(interaction.id, {
+        ...patch,
+        view: nextView,
+        [NAV_KEY]: nextNav,
+      });
+      return updated ?? interaction;
+    }
+    /** Seeds the SEARCH_INPUT parent on a freshly created interaction. */
+    function seedNavParent(interaction: Interaction): Interaction {
+      const nav = navEntriesOf(interaction);
+      if (nav.length > 0) {
+        return interaction;
+      }
+      const updated = deps.interactions.touch(interaction.id, {
+        [NAV_KEY]: [{ view: 'prompt', snap: {} }],
+      });
+      return updated ?? interaction;
+    }
+    /**
+     * Seeds the sale Volver parent on a freshly created OPERATION
+     * interaction (default `sale-entry`, `home` for the OPERAR card
+     * itself). Text-started and callback-started sales share this, so
+     * both get identical NavStack semantics. No-op on interactions
+     * that already carry a view or a stack.
+     */
+    function seedSaleNavParent(interaction: Interaction, parentView: string): Interaction {
+      const fresh = deps.interactions.get(interaction.id) ?? interaction;
+      if (
+        navEntriesOf(fresh).length > 0 ||
+        typeof fresh.state['view'] === 'string'
+      ) {
+        return fresh;
+      }
+      const updated = deps.interactions.touch(fresh.id, {
+        [NAV_KEY]: [{ view: parentView, snap: {} }],
+      });
+      return updated ?? fresh;
+    }
+
     async function sendSaleCard(
       interaction: Interaction,
       resultText: string,
@@ -899,6 +1042,39 @@ export function createWebhookHandler(deps: WebhookDeps) {
     }
 
     /**
+     * Sale single-card render with NavStack recording (shared by
+     * text-start and callback-start — identical semantics): seeds the
+     * Volver parent on fresh OPERATION interactions, sends/edits the
+     * ONE card, then records the rendered sale view so Volver pops to
+     * the exact producing view. Confirm kinds also close the
+     * interaction. Previous-context policy: the sale draft NEVER reads
+     * search queries, selections, or finished-interaction context — the
+     * ONLY phone/customer source is the current turn's explicit
+     * identifier folded by `prepareNewSale*` (explicit > nothing;
+     * stored context never fills critical fields across operations).
+     */
+    async function sendSaleResult(
+      interaction: Interaction,
+      result: SaleResult,
+      threadOverride?: number,
+      keyboardOverride?: InlineKeyboardMarkup,
+    ): Promise<void> {
+      const seeded = seedSaleNavParent(interaction, 'sale-entry');
+      const navigated = transitionTo(seeded, saleViewForResult(result));
+      persistAll();
+      await sendSaleCard(
+        navigated,
+        result.text,
+        keyboardOverride ?? keyboardForSaleResult(result, navigated.id, result.whatsappUrl),
+        threadOverride ?? navigated.messageThreadId,
+      );
+      if (result.kind === 'confirmed' || result.kind === 'already-confirmed') {
+        deps.interactions.confirm(navigated.id);
+        persistAll();
+      }
+    }
+
+    /**
      * Sale NL entry: folds one operator sentence into the actor's sale
      * draft (full-sentence → single summary + Confirm; partial →
      * ask-only-missing; corrections recalc the SAME draft). Single-card:
@@ -911,17 +1087,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const result = await prepareNewSaleFromText(saleActor(), input, saleToolDeps);
       auditSaleResult(result);
       const interaction = activeOperationInteraction() ?? createInteraction('OPERATION');
-      persistAll();
-      await sendSaleCard(
+      await sendSaleResult(
         interaction,
-        result.text,
-        keyboardForSaleResult(result, interaction.id, result.whatsappUrl),
+        result,
         threadOverride ?? interaction.messageThreadId,
       );
-      if (result.kind === 'confirmed' || result.kind === 'already-confirmed') {
-        deps.interactions.confirm(interaction.id);
-        persistAll();
-      }
     }
 
     /**
@@ -945,17 +1115,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
       auditSaleResult(result);
       const interaction =
         origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
-      persistAll();
-      await sendSaleCard(
+      await sendSaleResult(
         interaction,
-        result.text,
-        keyboardForSaleResult(result, interaction.id, result.whatsappUrl),
+        result,
         threadOverride ?? interaction.messageThreadId,
       );
-      if (result.kind === 'confirmed' || result.kind === 'already-confirmed') {
-        deps.interactions.confirm(interaction.id);
-        persistAll();
-      }
     }
 
     /**
@@ -978,12 +1142,11 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const interaction =
         origin ?? activeOperationInteraction() ?? createInteraction('OPERATION');
       const home = createInteraction('HOME');
-      persistAll();
-      await sendSaleCard(
+      await sendSaleResult(
         interaction,
-        result.text,
-        homeKeyboard(home.id),
+        result,
         threadOverride ?? interaction.messageThreadId,
+        homeKeyboard(home.id),
       );
     }
 
@@ -1002,10 +1165,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
       );
       auditSaleResult(result);
       persistAll();
-      await sendSaleCard(
+      await sendSaleResult(
         origin,
-        result.text,
-        keyboardForSaleResult(result, origin.id, result.whatsappUrl),
+        result,
         threadOverride ?? origin.messageThreadId,
       );
     }
@@ -1025,10 +1187,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const result = await prepareNewSaleChoice(saleActor(), choice, saleToolDeps);
       auditSaleResult(result);
       persistAll();
-      await sendSaleCard(
+      await sendSaleResult(
         origin,
-        result.text,
-        keyboardForSaleResult(result, origin.id, result.whatsappUrl),
+        result,
         threadOverride ?? origin.messageThreadId,
       );
     }
@@ -1047,10 +1208,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const result = await refreshCurrentSale(saleActor(), saleToolDeps);
       auditSaleResult(result);
       persistAll();
-      await sendSaleCard(
+      await sendSaleResult(
         origin,
-        result.text,
-        keyboardForSaleResult(result, origin.id, result.whatsappUrl),
+        result,
         threadOverride ?? origin.messageThreadId,
       );
     }
@@ -1065,11 +1225,15 @@ export function createWebhookHandler(deps: WebhookDeps) {
       origin: Interaction,
       threadOverride?: number,
     ): Promise<void> {
-      persistAll();
-      await sendSaleCard(
+      const open = saleToolDeps?.store.get(owner) ?? null;
+      const result: SaleResult = {
+        kind: 'pending',
+        draft: open,
+        text: renderSalePendingManagement(),
+      };
+      await sendSaleResult(
         origin,
-        renderSalePendingManagement(),
-        salePendingKeyboard(origin.id),
+        result,
         threadOverride ?? origin.messageThreadId,
       );
     }
@@ -1112,29 +1276,25 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const n = normalizeText(trimmed);
 
       if (isRenewalText(trimmed)) {
-        persistAll();
-        await sendSaleCard(
+        const renewal: SaleResult = {
+          kind: 'clarification',
+          draft: open,
+          text: RENEWAL_HOLD_TEXT,
+        };
+        await sendSaleResult(
           interaction,
-          RENEWAL_HOLD_TEXT,
-          keyboardForSaleResult(
-            { kind: 'clarification', draft: open, text: RENEWAL_HOLD_TEXT },
-            interaction.id,
-          ),
+          renewal,
           interaction.messageThreadId,
         );
         return true;
       }
 
       if (/^(volver|atras|back)\b/.test(n)) {
-        // Volver inside the sale: back to the entry card on the SAME
-        // message, draft intact (external drafts survive).
-        persistAll();
-        await sendSaleCard(
-          interaction,
-          SALE_ENTRY_TEXT,
-          saleEntryKeyboard(interaction.id),
-          interaction.messageThreadId,
-        );
+        // Volver inside the sale: pop the sale NavStack to the exact
+        // previous view on the SAME message, draft intact (external
+        // drafts survive; phones are never swapped, nothing is
+        // cancelled — navigation only touches interaction.state).
+        await handleBack(interaction);
         return true;
       }
       if (/^cancel(ar|o|ado)?\b/.test(n)) {
@@ -1150,15 +1310,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
         return true;
       }
 
-      const substantive =
-        open.service !== null ||
-        open.modality !== null ||
-        open.phone !== null ||
-        open.duration.requestedMonths !== null ||
-        open.payment.method !== null ||
-        open.payment.actualAmount !== null ||
-        open.customer.existingCustomerId !== undefined ||
-        open.customer.proposedCustomer !== undefined;
+      const substantive = isSubstantiveSaleDraft(open);
       const extraction = parseSaleExtraction(trimmed);
       if (substantive && isFreshSaleCue(trimmed) && !extraction.isCorrection) {
         await runSalePendingFlow(interaction, interaction.messageThreadId);
@@ -1206,11 +1358,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
           saleToolDeps,
         );
         auditSaleResult(result);
-        persistAll();
-        await sendSaleCard(
+        await sendSaleResult(
           interaction,
-          result.text,
-          keyboardForSaleResult(result, interaction.id, result.whatsappUrl),
+          result,
           interaction.messageThreadId,
         );
         return true;
@@ -1219,7 +1369,9 @@ export function createWebhookHandler(deps: WebhookDeps) {
       // Smallest-turns fallback: name every still-missing field (batched
       // card when several independent fields are open), draft intact,
       // never a global jump, never Gemini. Sequential decisions
-      // (service/modality) keep their single-question card.
+      // (service/modality) keep their single-question card. The customer
+      // bullet converges with the batch renderer: phone known asks the
+      // NAME for that number (never the phone again).
       const allMissing = expectedSaleFields(open);
       const sequential = expected === 'service' || expected === 'modality';
       const fallback =
@@ -1227,15 +1379,16 @@ export function createWebhookHandler(deps: WebhookDeps) {
           ? `${renderSaleAskMissing('')} El borrador sigue intacto.`
           : sequential || allMissing.length <= 1
             ? `🧾 Venta nueva — sigo esperando ${saleFieldLabel(open, expected)}: ${renderSaleAskMissing(expected)} El borrador sigue intacto.`
-            : `🧾 Venta nueva — sigo esperando ${allMissing.map((field) => saleFieldLabel(open, field)).join(', ')}: ${renderSaleAskMissingBatch(allMissing)} El borrador sigue intacto.`;
-      persistAll();
-      await sendSaleCard(
+            : `🧾 Venta nueva — sigo esperando ${allMissing.map((field) => saleFieldLabel(open, field)).join(', ')}: ${renderSaleAskMissingBatch(allMissing, { ...(open.phone !== null ? { customerNameForPhone: open.phone } : {}) })} El borrador sigue intacto.`;
+      const fallbackResult: SaleResult = {
+        kind: 'clarification',
+        draft: open,
+        text: fallback,
+        ...(expected !== null ? { missing: expected } : {}),
+      };
+      await sendSaleResult(
         interaction,
-        fallback,
-        keyboardForSaleResult(
-          { kind: 'clarification', draft: open, text: fallback, ...(expected !== null ? { missing: expected } : {}) },
-          interaction.id,
-        ),
+        fallbackResult,
         interaction.messageThreadId,
       );
       return true;
@@ -1637,110 +1790,6 @@ export function createWebhookHandler(deps: WebhookDeps) {
         actionType: 'interaction.stale_callback',
         ...(requestedAction !== undefined ? { metadata: { requestedAction } } : {}),
       });
-    }
-
-    /**
-     * Per-interaction navigation stack (presentation/navigation only).
-     *
-     * Each SEARCH interaction owns an ordered history of semantic views:
-     * HOME (explicit root only) · SEARCH_INPUT (`prompt`) · SEARCH_RESULTS
-     * (`list`/`customer-list`/`account-list`) · CUSTOMER_CARD
-     * (`customer-detail`) · ACCOUNT_CARD (`account-detail`/`detail`) ·
-     * ASSIGNMENT_SELECTOR (`credentials-list`/`whatsapp-list`) ·
-     * CREDENTIAL_CARD (`credentials-detail`/`whatsapp-detail`) ·
-     * PHONE_SELECTOR (`whatsapp-phones`).
-     *
-     * Volver pops the stack and re-renders the exact previous view of the
-     * SAME interaction (same card edit when the tap came from a callback);
-     * Home is NEVER a fallback — it only fires on the explicit `home`
-     * action or from the root SEARCH_INPUT. Stale callbacks ack without
-     * touching the stack; per-actor isolation comes free because the stack
-     * lives inside the owned interaction (chat+thread+actor+interactionId).
-     * External pending drafts are never touched by navigation.
-     */
-    interface NavEntry {
-      view: string;
-      snap: Record<string, unknown>;
-    }
-    const NAV_KEY = 'nav';
-    const NAV_LIMIT = 20;
-    const SNAP_KEYS = [
-      'query',
-      'offset',
-      'total',
-      'selectedCustomer',
-      'selectedAccount',
-      'selectedIndex',
-      'customerId',
-      'accountId',
-      'serviceFilter',
-      'explicitIdentifier',
-      'assignmentKeys',
-      'selectedAssignmentKey',
-      'phones',
-      'optionIndex',
-      'whatsapp',
-    ];
-    function navEntriesOf(interaction: Interaction): NavEntry[] {
-      const raw = interaction.state[NAV_KEY];
-      if (!Array.isArray(raw)) {
-        return [];
-      }
-      return (raw as unknown[]).filter(
-        (entry): entry is NavEntry =>
-          typeof entry === 'object' &&
-          entry !== null &&
-          typeof (entry as { view?: unknown }).view === 'string',
-      );
-    }
-    function snapOf(state: Record<string, unknown>): Record<string, unknown> {
-      const out: Record<string, unknown> = {};
-      for (const key of SNAP_KEYS) {
-        if (state[key] !== undefined) {
-          out[key] = state[key];
-        }
-      }
-      return out;
-    }
-    /**
-     * Records a forward transition: pushes the current view (when it
-     * differs) then stores the next view. Same-view re-renders never push,
-     * so restores and idempotent repeats keep the stack stable.
-     */
-    function transitionTo(
-      interaction: Interaction,
-      nextView: string,
-      patch: Record<string, unknown> = {},
-    ): Interaction {
-      const current =
-        typeof interaction.state['view'] === 'string'
-          ? (interaction.state['view'] as string)
-          : undefined;
-      const nav = navEntriesOf(interaction);
-      let nextNav = nav;
-      if (current !== undefined && current !== nextView) {
-        nextNav = [...nav, { view: current, snap: snapOf(interaction.state) }];
-        if (nextNav.length > NAV_LIMIT) {
-          nextNav = nextNav.slice(nextNav.length - NAV_LIMIT);
-        }
-      }
-      const updated = deps.interactions.touch(interaction.id, {
-        ...patch,
-        view: nextView,
-        [NAV_KEY]: nextNav,
-      });
-      return updated ?? interaction;
-    }
-    /** Seeds the SEARCH_INPUT parent on a freshly created interaction. */
-    function seedNavParent(interaction: Interaction): Interaction {
-      const nav = navEntriesOf(interaction);
-      if (nav.length > 0) {
-        return interaction;
-      }
-      const updated = deps.interactions.touch(interaction.id, {
-        [NAV_KEY]: [{ view: 'prompt', snap: {} }],
-      });
-      return updated ?? interaction;
     }
 
     /**
@@ -3115,12 +3164,14 @@ export function createWebhookHandler(deps: WebhookDeps) {
        */
       if (saleToolDeps !== undefined) {
         const operation = activeOperationInteraction() ?? createInteraction('OPERATION');
+        const seeded = seedSaleNavParent(operation, 'home');
+        const entered = transitionTo(seeded, 'sale-entry');
         persistAll();
         auditDraft('sale.entry', {});
         await sendLabeled(
           SALE_ENTRY_TEXT,
-          saleEntryKeyboard(operation.id),
-          thread ?? operation.messageThreadId,
+          saleEntryKeyboard(entered.id),
+          thread ?? entered.messageThreadId,
         );
         return;
       }
@@ -3255,6 +3306,22 @@ export function createWebhookHandler(deps: WebhookDeps) {
       const state = (deps.interactions.get(target.id) ?? target).state;
       const query = typeof state['query'] === 'string' ? (state['query'] as string) : '';
       switch (view) {
+        case 'home': {
+          await handleHome(target);
+          return;
+        }
+        case 'sale-entry': {
+          // The OPERAR entry card: exact producing view, SAME card,
+          // draft intact (navigation never touches the draft store).
+          persistAll();
+          await sendSaleCard(
+            target,
+            SALE_ENTRY_TEXT,
+            saleEntryKeyboard(target.id),
+            target.messageThreadId,
+          );
+          return;
+        }
         case 'prompt': {
           persistAll();
           await sendLabeled(
@@ -3414,6 +3481,26 @@ export function createWebhookHandler(deps: WebhookDeps) {
           return;
         }
         default: {
+          // Sale views (sale-batch/summary/pending/…) re-render the
+          // producing VIEW against the intact draft: re-settle the
+          // current draft (recompute → expectedSaleFields) and show it
+          // on the SAME card. Navigation restores no business field —
+          // phones are never swapped, drafts never dropped/cancelled.
+          // No open draft → the honest empty notice, never a guess.
+          if (view.startsWith('sale-') && saleToolDeps !== undefined) {
+            const result = await refreshCurrentSale(saleActor(), saleToolDeps);
+            auditSaleResult(result);
+            deps.interactions.touch(target.id, { view: saleViewForResult(result) });
+            persistAll();
+            const freshTarget = deps.interactions.get(target.id) ?? target;
+            await sendSaleCard(
+              freshTarget,
+              result.text,
+              keyboardForSaleResult(result, freshTarget.id, result.whatsappUrl),
+              freshTarget.messageThreadId,
+            );
+            return;
+          }
           await ackStale('back');
           return;
         }
@@ -3430,10 +3517,12 @@ export function createWebhookHandler(deps: WebhookDeps) {
     /**
      * Volver: pops the SAME interaction's nav stack and re-renders the
      * exact previous view (same-card edit when the tap came from a
-     * callback). Empty stack: SEARCH_INPUT's parent is Home (the only
-     * Volver→Home case); any other root view is a safe no-op — never an
-     * arbitrary Home, never a selection change, never stack corruption.
-     * Navigation never touches drafts.
+     * callback). Empty stack: a ROOT view (`prompt` wizard, `sale-entry`,
+     * or unset) renders Home — the single sanctioned Volver→Home case;
+     * any other root view is a safe no-op — never an arbitrary Home,
+     * never a selection change, never stack corruption. Navigation
+     * never touches drafts (business state changes only through the
+     * sale state machine: fold / confirm / cancel).
      */
     async function handleBack(interaction: Interaction): Promise<void> {
       const fresh = deps.interactions.get(interaction.id) ?? interaction;
@@ -3443,7 +3532,7 @@ export function createWebhookHandler(deps: WebhookDeps) {
           typeof fresh.state['view'] === 'string'
             ? (fresh.state['view'] as string)
             : undefined;
-        if (current === 'prompt' || current === undefined) {
+        if (current === 'prompt' || current === 'sale-entry' || current === undefined) {
           await handleHome(fresh);
           return;
         }
@@ -3471,25 +3560,17 @@ export function createWebhookHandler(deps: WebhookDeps) {
       action: string,
       interaction: Interaction,
     ): Promise<void> {
-      if (action === 'home' || action === 'back') {
-        if (
-          action === 'home' ||
-          saleToolDeps === undefined ||
-          interaction.type !== 'OPERATION'
-        ) {
-          if (action === 'home') {
-            // Explicit root action only — never a navigation fallback.
-            await handleHome(interaction);
-            return;
-          }
-          // Volver = exact previous view of the SAME interaction
-          // (Datos→Servicios→Cliente→Buscar→Home chain via the nav stack).
-          await handleBack(interaction);
-          return;
-        }
-        // Slice B: Volver from a sale OPERATION root card returns to the
-        // explicit Home root (sale drafts are single-card — no stack).
+      if (action === 'home') {
+        // Explicit root action only — never a navigation fallback.
         await handleHome(interaction);
+        return;
+      }
+      if (action === 'back') {
+        // Volver = exact previous view of the SAME interaction
+        // (Datos→Servicios→Cliente→Buscar→Home chain via the nav stack;
+        // sale OPERATION cards pop the shared sale stack to the
+        // entry/batch/… view, draft intact — never arbitrary Home).
+        await handleBack(interaction);
         return;
       }
       if (action === 'buscar') {
@@ -3637,6 +3718,14 @@ export function createWebhookHandler(deps: WebhookDeps) {
       if (action === 'saleNew') {
         if (saleToolDeps === undefined) {
           await ackStale('saleNew');
+          return;
+        }
+        // Explicit new intent over a substantive open draft: NO hybrid —
+        // the SAME card shows GESTIÓN PENDIENTE and the old draft stays
+        // byte-intact ([Continuar] resumes it, [Cancelar] drops it).
+        const open = saleToolDeps.store.get(owner);
+        if (open !== undefined && isSubstantiveSaleDraft(open)) {
+          await runSalePendingFlow(interaction, interaction.messageThreadId);
           return;
         }
         await runSaleText('venta nueva', interaction.messageThreadId);
@@ -3916,14 +4005,23 @@ export function createWebhookHandler(deps: WebhookDeps) {
         }
         if (parse.command === 'volver') {
           // NL "volver" = Volver (pop the actor's own nav stack), never an
-          // arbitrary Home. No owned SEARCH context → Home as the honest
-          // root reply.
+          // arbitrary Home. SEARCH and live-sale OPERATION contexts pop;
+          // anything else (or a sale interaction with no open draft)
+          // answers Home as the honest root reply.
           const active = deps.interactions.getActive(
             targetChatId,
             targetActorId,
             targetThreadId,
           );
           if (active !== undefined && active.type === 'SEARCH') {
+            await handleBack(active);
+            return { ok: true };
+          }
+          if (
+            active !== undefined &&
+            active.type === 'OPERATION' &&
+            hasOpenSaleDraft()
+          ) {
             await handleBack(active);
             return { ok: true };
           }
